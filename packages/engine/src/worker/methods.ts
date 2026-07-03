@@ -138,9 +138,8 @@ export function registerWorkerMethods(engine: Engine): void {
       },
     });
 
-    let loopResult;
     try {
-      loopResult = await runWorkerLoop({
+      const loopResult = await runWorkerLoop({
         model: languageModel,
         task: params.task,
         wikiDigest: params.wikiDigest,
@@ -158,6 +157,46 @@ export function registerWorkerMethods(engine: Engine): void {
           });
         },
       });
+
+      const diff = await manager.diff(worktree);
+      const diffStat = await manager.diffStat(worktree);
+
+      const pricing = lookupPricing(kind, params.model);
+      const costUsd = pricing !== null ? estimateCostUsd(pricing, loopResult.usage) : null;
+
+      // Metered under the PROVIDER kind (e.g. "deepseek", "zai"), NOT a
+      // synthetic "worker/..." kind — pricing.ts's table is keyed by provider
+      // kind, and engine.models.usage's byModel breakdown needs to line up
+      // with engine.models.complete's own records for the same provider/model
+      // so totals stay comparable across call sites. UsageRecord (meter.ts)
+      // has no spare field to tag "this record came from a worker run"
+      // without a schema change touching every existing record shape, so
+      // worker vs engine.models.complete vs engine.frontier.* records are NOT
+      // distinguishable in the ledger today — see the task report for the
+      // considered alternatives.
+      engine.models.meter.record({
+        providerId: params.providerId,
+        kind,
+        model: params.model,
+        usage: loopResult.usage,
+        costUsd,
+        at: Date.now(),
+      });
+
+      engine.log(
+        `worker.run ${taskId} ${kind}/${params.model}: ${loopResult.steps} steps, ${loopResult.toolCallCount} tool calls`,
+      );
+
+      return {
+        diff,
+        diffStat,
+        summary: loopResult.summary,
+        steps: loopResult.steps,
+        toolCallCount: loopResult.toolCallCount,
+        usage: loopResult.usage,
+        costUsd,
+        worktree: { path: worktree.path, branch: worktree.branch },
+      };
     } catch (err) {
       // The worktree (and any partial edits already on disk) is
       // DELIBERATELY left in place on failure — see worktree.ts's own
@@ -169,46 +208,6 @@ export function registerWorkerMethods(engine: Engine): void {
         worktree: { path: worktree.path, branch: worktree.branch },
       });
     }
-
-    const diff = await manager.diff(worktree);
-    const diffStat = await manager.diffStat(worktree);
-
-    const pricing = lookupPricing(kind, params.model);
-    const costUsd = pricing !== null ? estimateCostUsd(pricing, loopResult.usage) : null;
-
-    // Metered under the PROVIDER kind (e.g. "deepseek", "zai"), NOT a
-    // synthetic "worker/..." kind — pricing.ts's table is keyed by provider
-    // kind, and engine.models.usage's byModel breakdown needs to line up
-    // with engine.models.complete's own records for the same provider/model
-    // so totals stay comparable across call sites. UsageRecord (meter.ts)
-    // has no spare field to tag "this record came from a worker run"
-    // without a schema change touching every existing record shape, so
-    // worker vs engine.models.complete vs engine.frontier.* records are NOT
-    // distinguishable in the ledger today — see the task report for the
-    // considered alternatives.
-    engine.models.meter.record({
-      providerId: params.providerId,
-      kind,
-      model: params.model,
-      usage: loopResult.usage,
-      costUsd,
-      at: Date.now(),
-    });
-
-    engine.log(
-      `worker.run ${taskId} ${kind}/${params.model}: ${loopResult.steps} steps, ${loopResult.toolCallCount} tool calls`,
-    );
-
-    return {
-      diff,
-      diffStat,
-      summary: loopResult.summary,
-      steps: loopResult.steps,
-      toolCallCount: loopResult.toolCallCount,
-      usage: loopResult.usage,
-      costUsd,
-      worktree: { path: worktree.path, branch: worktree.branch },
-    };
   });
 
   registerMethod(engine.dispatcher, "engine.worker.cleanup", CleanupParamsSchema, async (params) => {

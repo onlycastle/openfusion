@@ -269,4 +269,52 @@ describe("engine.worker.run", () => {
     expect(existsSync(worktreePath)).toBe(true);
     expect(existsSync(path.join(worktreePath, "partial.txt"))).toBe(true);
   });
+
+  it("on a post-loop diff failure, returns SERVER_ERROR with the worktree path in data and leaves it in place", async () => {
+    dir = makeRepo();
+    engine = createEngine();
+    engine.models.registry.configure({ id: "p1", kind: "deepseek", apiKey: TEST_API_KEY });
+    engine.models.registry.setTestModel("p1", makeWorkerMock());
+
+    const res = await call(engine, "engine.worker.run", {
+      projectDir: dir,
+      task: "create hello.txt",
+      providerId: "p1",
+      model: "deepseek-v4-flash",
+    });
+
+    // First verify the run succeeded to get a valid worktree
+    expect(res.result).toBeDefined();
+    const worktreePath = res.result.worktree.path as string;
+    expect(existsSync(worktreePath)).toBe(true);
+
+    // Now simulate a diff failure on a second run by monkeypatching the manager
+    const manager = await engine.worker.getManager(dir);
+    let throwOnDiff = false;
+    const originalDiff = manager.diff.bind(manager);
+    manager.diff = async (worktree) => {
+      if (throwOnDiff) {
+        throw new Error("diff infrastructure failure");
+      }
+      return originalDiff(worktree);
+    };
+
+    throwOnDiff = true;
+
+    const failRes = await call(engine, "engine.worker.run", {
+      projectDir: dir,
+      task: "create another.txt",
+      providerId: "p1",
+      model: "deepseek-v4-flash",
+    });
+
+    expect(failRes.result).toBeUndefined();
+    expect(failRes.error.code).toBe(RpcErrorCodes.SERVER_ERROR);
+    expect(failRes.error.data?.worktree?.path).toBeDefined();
+    expect(failRes.error.data?.worktree?.branch).toBeDefined();
+
+    const failedWorktreePath = failRes.error.data.worktree.path as string;
+    // NOT auto-removed — the worktree is still on disk for inspection.
+    expect(existsSync(failedWorktreePath)).toBe(true);
+  });
 });
