@@ -31,6 +31,7 @@ function buildMcpServer(engine: Engine, projectDir: string): McpServer {
     },
     ({ symbol }) => {
       const store = engine.wiki.getStore(projectDir);
+      if (store.getMeta("head_sha") === null) return notBuiltResult();
       const payload = {
         definitions: store.symbolsByName(symbol),
         references: store.refsByName(symbol),
@@ -48,6 +49,7 @@ function buildMcpServer(engine: Engine, projectDir: string): McpServer {
     },
     ({ budgetTokens }) => {
       const store = engine.wiki.getStore(projectDir);
+      if (store.getMeta("head_sha") === null) return notBuiltResult();
       const ranked = rankFiles(store.allSymbols(), store.allRefs());
       const map = renderRepoMap(ranked, budgetTokens ?? 1024);
       return { content: [{ type: "text", text: map }] };
@@ -55,6 +57,20 @@ function buildMcpServer(engine: Engine, projectDir: string): McpServer {
   );
 
   return mcp;
+}
+
+// Both tools used to read straight from the store and would silently
+// return empty results when the wiki was never built (git guard passes,
+// but no engine.wiki.build has run yet) — indistinguishable from "there's
+// genuinely nothing here." Callers need an explicit signal instead.
+function notBuiltResult(): {
+  content: Array<{ type: "text"; text: string }>;
+  isError: true;
+} {
+  return {
+    content: [{ type: "text", text: "wiki not built — run engine.wiki.build first" }],
+    isError: true,
+  };
 }
 
 export class McpWikiServer {

@@ -170,6 +170,37 @@ describe("MCP wiki server", () => {
     }
   }, 10_000);
 
+  // Fix 3: the tool handlers used to query the store directly and would
+  // silently return empty definitions/refs (or an empty map) when the wiki
+  // was never built, giving callers no signal to distinguish "nothing
+  // found" from "nothing indexed yet". Both tools must guard on
+  // getMeta("head_sha") and surface isError instead.
+  it("wiki_query on a never-built wiki returns isError", async () => {
+    dir = mkdtempSync(path.join(os.tmpdir(), "of-mcp-unbuilt-"));
+    execFileSync("git", ["init", "-q", dir]);
+    execFileSync("git", ["-C", dir, "config", "user.email", "t@t"]);
+    execFileSync("git", ["-C", dir, "config", "user.name", "t"]);
+    writeFileSync(path.join(dir, "u.ts"), "export function unbuilt() {}\n");
+    execFileSync("git", ["-C", dir, "add", "-A"]);
+    execFileSync("git", ["-C", dir, "commit", "-qm", "init"]);
+    engine = createEngine();
+
+    // No engine.wiki.build call — the git guard passes but the wiki is
+    // never indexed.
+    const started = await rpc("engine.mcp.start", { projectDir: dir });
+    expect(started.error).toBeUndefined();
+    const url = started.result.url as string;
+
+    const client = new Client({ name: "test-client", version: "0.0.1" });
+    await client.connect(new StreamableHTTPClientTransport(new URL(url)));
+    const result = await client.callTool({
+      name: "wiki_query",
+      arguments: { symbol: "unbuilt" },
+    });
+    expect(result.isError).toBe(true);
+    await client.close();
+  }, 30_000);
+
   // Finding 3: startMcpServer's check-then-await-then-set was a TOCTOU race
   // — two concurrent engine.mcp.start calls for the same root could both
   // pass the "no existing server" check and start two servers, leaking the

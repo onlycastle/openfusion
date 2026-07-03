@@ -1,9 +1,9 @@
-import { mkdtempSync, readFileSync, rmSync, existsSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, existsSync, mkdirSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import Database from "better-sqlite3";
-import { openWikiStore } from "../src/wiki/store.js";
+import { openWikiStore, wikiDbPath } from "../src/wiki/store.js";
 
 let dir: string;
 afterEach(() => rmSync(dir, { recursive: true, force: true }));
@@ -121,6 +121,60 @@ describe("WikiStore", () => {
     raw.close();
     const reopened = openWikiStore(dir);
     expect(reopened.getMeta("marker")).toBeNull();
+    reopened.close();
+  });
+});
+
+describe("wikiDbPath", () => {
+  it("returns the same path openWikiStore actually creates", () => {
+    dir = mkdtempSync(path.join(os.tmpdir(), "of-store-path-"));
+    const store = openWikiStore(dir);
+    expect(existsSync(wikiDbPath(dir))).toBe(true);
+    expect(wikiDbPath(dir)).toBe(path.join(dir, ".openfusion/cache/wiki.db"));
+    store.close();
+  });
+});
+
+// Fix 1: WAL-open race. busy_timeout does not cover the rollback→WAL
+// journal_mode transition itself, so openWikiStore must retry that specific
+// pragma on SQLITE_BUSY/"database is locked" rather than propagate it.
+// Reproducing the exact cross-process race deterministically in-process is
+// impractical (better-sqlite3 is a single connection per process and the
+// transition is a single synchronous pragma call), so these two tests cover
+// the transition path directly instead:
+//   1. a fresh DELETE-mode db still lands in WAL after openWikiStore.
+//   2. an already-WAL db skips the pragma entirely (no-op, stays WAL).
+describe("openWikiStore WAL transition", () => {
+  it("transitions a fresh DELETE-mode database to WAL", () => {
+    dir = mkdtempSync(path.join(os.tmpdir(), "of-store-wal-"));
+    const cacheDir = path.join(dir, ".openfusion", "cache");
+    mkdirSync(cacheDir, { recursive: true });
+    const dbPath = path.join(cacheDir, "wiki.db");
+    const raw = new Database(dbPath);
+    raw.pragma("journal_mode = DELETE");
+    expect(raw.pragma("journal_mode", { simple: true })).toBe("delete");
+    raw.close();
+
+    const store = openWikiStore(dir);
+    const check = new Database(dbPath);
+    expect(check.pragma("journal_mode", { simple: true })).toBe("wal");
+    check.close();
+    store.close();
+  });
+
+  it("skips the WAL pragma when the database is already in WAL mode", () => {
+    dir = mkdtempSync(path.join(os.tmpdir(), "of-store-wal-skip-"));
+    const store = openWikiStore(dir);
+    const dbPath = wikiDbPath(dir);
+    store.close();
+
+    // Reopen the same already-WAL db through openWikiStore again; the
+    // pragma transition should be skipped (a no-op), and journal_mode must
+    // remain "wal" either way.
+    const reopened = openWikiStore(dir);
+    const check = new Database(dbPath);
+    expect(check.pragma("journal_mode", { simple: true })).toBe("wal");
+    check.close();
     reopened.close();
   });
 });

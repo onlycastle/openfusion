@@ -9,6 +9,11 @@ workers.
 - Roadmap: `docs/superpowers/plans/2026-07-03-roadmap.md`
 - Landscape research: `docs/research/2026-07-03-oss-landscape.md`
 
+Status: the engine indexes TypeScript/JavaScript/Python/Go/Rust/Java git
+repositories into a per-project symbol store, serves a token-budgeted
+PageRank repo map, and exposes `wiki_query`/`wiki_map` to MCP clients over
+loopback HTTP (M1b complete).
+
 ## Development
 
 Requires Node >= 22 and pnpm (via corepack).

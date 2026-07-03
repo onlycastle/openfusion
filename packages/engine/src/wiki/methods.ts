@@ -9,7 +9,7 @@ import { buildIndex, getHeadSha, type IndexStats } from "./indexer.js";
 import { McpWikiServer } from "./mcp.js";
 import { WikiParser } from "./parser.js";
 import { rankFiles, renderRepoMap } from "./rank.js";
-import { openWikiStore, type WikiStore } from "./store.js";
+import { openWikiStore, wikiDbPath, type WikiStore } from "./store.js";
 
 const ProjectParamsSchema = z.object({ projectDir: z.string().min(1) });
 const QueryParamsSchema = ProjectParamsSchema.extend({
@@ -43,6 +43,23 @@ export class WikiService {
   getStore(projectDir: string): WikiStore {
     const key = keyFor(projectDir);
     let store = this.#stores.get(key);
+    if (store !== undefined && !existsSync(wikiDbPath(key))) {
+      // The cached handle's backing file is gone — an external `rm -rf
+      // .openfusion` (user clean, another process's schema-recreate)
+      // unlinked the inode out from under us. The open fd still reads fine
+      // from the unlinked inode, so without this check every subsequent
+      // read would silently serve stale data forever despite
+      // engine.wiki.status correctly reporting built:false. Drop the stale
+      // handle and fall through to open fresh.
+      try {
+        store.close();
+      } catch {
+        // Best-effort: closing an already-broken handle must not block
+        // opening a fresh one.
+      }
+      this.#stores.delete(key);
+      store = undefined;
+    }
     if (store === undefined) {
       store = openWikiStore(key);
       this.#stores.set(key, store);
@@ -173,10 +190,12 @@ export function registerWikiMethods(engine: Engine): void {
     ({ projectDir }) => {
       const currentSha = requireHeadSha(projectDir);
       const resolvedDir = keyFor(projectDir);
-      const dbPath = path.join(resolvedDir, ".openfusion", "cache", "wiki.db");
 
-      // If wiki.db doesn't exist, the wiki hasn't been built yet
-      if (!existsSync(dbPath)) {
+      // If wiki.db doesn't exist, the wiki hasn't been built yet. Consult
+      // the same wikiDbPath() the store itself opens (and getStore's cache
+      // revalidation checks) rather than an inline join, so this gate can't
+      // drift from what's actually on disk.
+      if (!existsSync(wikiDbPath(resolvedDir))) {
         return {
           built: false,
           headSha: null,

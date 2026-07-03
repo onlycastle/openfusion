@@ -110,6 +110,28 @@ describe("wiki RPC methods", () => {
     expect(existsSync(path.join(dir, ".openfusion"))).toBe(false);
   });
 
+  // Fix 2: after external deletion of .openfusion/cache (user `rm -rf`,
+  // another process's schema-recreate), a cached WikiStore handle would
+  // keep serving reads from its now-unlinked inode while engine.wiki.status
+  // reported built:false — a live-vs-cache split brain. getStore must
+  // revalidate the cache entry against the filesystem on every hit.
+  it("query does not serve stale data after external deletion of .openfusion", async () => {
+    makeRepo();
+    await call("engine.wiki.build", { projectDir: dir });
+    const before = await call("engine.wiki.query", { projectDir: dir, symbol: "xray" });
+    expect(before.result.definitions.length).toBeGreaterThanOrEqual(1);
+
+    rmSync(path.join(dir, ".openfusion"), { recursive: true, force: true });
+
+    const stale = await call("engine.wiki.query", { projectDir: dir, symbol: "xray" });
+    expect(stale.error).toBeUndefined();
+    expect(stale.result.definitions.length).toBe(0);
+
+    const rebuild = await call("engine.wiki.build", { projectDir: dir });
+    expect(rebuild.error).toBeUndefined();
+    expect(existsSync(path.join(dir, ".openfusion/cache/wiki.db"))).toBe(true);
+  }, 30_000);
+
   it("map with low budget truncates and reports truncated:true", async () => {
     makeRepo();
     // Create 8+ .ts files with enough content to exceed 64-token budget when ranked
