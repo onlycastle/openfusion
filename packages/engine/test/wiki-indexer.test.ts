@@ -89,6 +89,27 @@ describe("buildIndex", () => {
     expect(store.listFiles()).toContain("a.ts");
     expect(store.symbolsByName("alpha")).toHaveLength(1);
   });
+
+  it("yields the event loop during large builds (concurrent timer fires mid-build)", async () => {
+    dir = mkdtempSync(path.join(os.tmpdir(), "of-idx-big-"));
+    execFileSync("git", ["init", "-q", dir]);
+    execFileSync("git", ["-C", dir, "config", "user.email", "t@t"]);
+    execFileSync("git", ["-C", dir, "config", "user.name", "t"]);
+    for (let i = 0; i < 60; i += 1) {
+      writeFileSync(path.join(dir, `f${i}.ts`), `export function fn${i}() {}\n`);
+    }
+    execFileSync("git", ["-C", dir, "add", "-A"]);
+    execFileSync("git", ["-C", dir, "commit", "-qm", "many"]);
+    store = openWikiStore(dir);
+    let timerFired = false;
+    const timer = setImmediate(() => {
+      timerFired = true;
+    });
+    const stats = await buildIndex(dir, store, parser);
+    clearImmediate(timer);
+    expect(stats.filesIndexed).toBe(60);
+    expect(timerFired).toBe(true);
+  }, 30_000);
 });
 
 describe("getHeadSha", () => {

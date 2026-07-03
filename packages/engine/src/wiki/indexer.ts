@@ -47,6 +47,7 @@ export async function buildIndex(
   let filesIndexed = 0;
   let filesSkipped = 0;
   let filesFailed = 0;
+  let processed = 0;
   const seen = new Set<string>();
   const updates: FileUpdate[] = [];
 
@@ -89,6 +90,10 @@ export async function buildIndex(
       refs: result.refs,
     });
     filesIndexed += 1;
+    processed += 1;
+    if (processed % 25 === 0) {
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    }
   }
 
   const removals = store.listFiles().filter((known) => !seen.has(known));
