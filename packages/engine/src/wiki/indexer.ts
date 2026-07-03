@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import { readFileSync, statSync } from "node:fs";
 import path from "node:path";
 import type { WikiParser } from "./parser.js";
-import type { WikiStore } from "./store.js";
+import type { FileUpdate, WikiStore } from "./store.js";
 
 export interface IndexStats {
   filesSeen: number;
@@ -46,6 +46,7 @@ export async function buildIndex(
   let filesIndexed = 0;
   let filesSkipped = 0;
   const seen = new Set<string>();
+  const updates: FileUpdate[] = [];
 
   for (const relPath of tracked) {
     seen.add(relPath);
@@ -75,33 +76,25 @@ export async function buildIndex(
     }
     const result = parser.parseFile(relPath, source);
     if (result === null) continue;
-    store.upsertFile(
-      relPath,
+    updates.push({
+      path: relPath,
       hash,
-      parser.languageFor(relPath) ?? "unknown",
-      result.symbols,
-      result.refs,
-    );
+      lang: parser.languageFor(relPath) ?? "unknown",
+      symbols: result.symbols,
+      refs: result.refs,
+    });
     filesIndexed += 1;
   }
 
-  let filesRemoved = 0;
-  for (const known of store.listFiles()) {
-    if (!seen.has(known)) {
-      store.removeFile(known);
-      filesRemoved += 1;
-    }
-  }
-
-  store.setMeta("head_sha", headSha);
-  store.setMeta("indexed_at", String(Date.now()));
+  const removals = store.listFiles().filter((known) => !seen.has(known));
+  store.applyBuild(updates, removals, { headSha });
 
   const counts = store.counts();
   return {
     filesSeen: seen.size,
     filesIndexed,
     filesSkipped,
-    filesRemoved,
+    filesRemoved: removals.length,
     symbols: counts.symbols,
     refs: counts.refs,
     headSha,

@@ -76,4 +76,15 @@ describe("wiki RPC methods", () => {
     expect(res.error?.code).toBe(RpcErrorCodes.SERVER_ERROR);
     expect(existsSync(path.join(dir, ".openfusion"))).toBe(false);
   });
+
+  it("coalesces concurrent builds for the same project", async () => {
+    makeRepo();
+    const [a, b] = await Promise.all([
+      call("engine.wiki.build", { projectDir: dir }),
+      call("engine.wiki.build", { projectDir: dir }),
+    ]);
+    expect(a.error).toBeUndefined();
+    expect(b.error).toBeUndefined();
+    expect(a.result.headSha).toBe(b.result.headSha);
+  }, 30_000);
 });

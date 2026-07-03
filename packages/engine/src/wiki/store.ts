@@ -1,5 +1,5 @@
 import Database from "better-sqlite3";
-import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import path from "node:path";
 
 export interface SymbolEntry {
@@ -11,6 +11,14 @@ export interface SymbolEntry {
 
 export interface SymbolHit extends SymbolEntry {
   file: string;
+}
+
+export interface FileUpdate {
+  path: string;
+  hash: string;
+  lang: string;
+  symbols: SymbolEntry[];
+  refs: SymbolEntry[];
 }
 
 const SCHEMA = `
@@ -41,7 +49,7 @@ export class WikiStore {
     this.#db = db;
   }
 
-  upsertFile(
+  #applyFileTx(
     filePath: string,
     hash: string,
     lang: string,
@@ -61,20 +69,49 @@ export class WikiStore {
     const insRef = this.#db.prepare(
       "INSERT INTO refs (file, name, kind, row, col) VALUES (?, ?, ?, ?, ?)",
     );
+    insertFile.run(filePath, hash, lang, Date.now());
+    delSymbols.run(filePath);
+    delRefs.run(filePath);
+    for (const s of symbols) insSymbol.run(filePath, s.name, s.kind, s.row, s.col);
+    for (const r of refs) insRef.run(filePath, r.name, r.kind, r.row, r.col);
+  }
+
+  upsertFile(
+    filePath: string,
+    hash: string,
+    lang: string,
+    symbols: SymbolEntry[],
+    refs: SymbolEntry[],
+  ): void {
     this.#db.transaction(() => {
-      insertFile.run(filePath, hash, lang, Date.now());
-      delSymbols.run(filePath);
-      delRefs.run(filePath);
-      for (const s of symbols) insSymbol.run(filePath, s.name, s.kind, s.row, s.col);
-      for (const r of refs) insRef.run(filePath, r.name, r.kind, r.row, r.col);
+      this.#applyFileTx(filePath, hash, lang, symbols, refs);
     })();
+  }
+
+  #removeFileTx(filePath: string): void {
+    this.#db.prepare("DELETE FROM symbols WHERE file = ?").run(filePath);
+    this.#db.prepare("DELETE FROM refs WHERE file = ?").run(filePath);
+    this.#db.prepare("DELETE FROM files WHERE path = ?").run(filePath);
   }
 
   removeFile(filePath: string): void {
     this.#db.transaction(() => {
-      this.#db.prepare("DELETE FROM symbols WHERE file = ?").run(filePath);
-      this.#db.prepare("DELETE FROM refs WHERE file = ?").run(filePath);
-      this.#db.prepare("DELETE FROM files WHERE path = ?").run(filePath);
+      this.#removeFileTx(filePath);
+    })();
+  }
+
+  applyBuild(
+    updates: FileUpdate[],
+    removals: string[],
+    meta: { headSha: string },
+  ): void {
+    this.#db.transaction(() => {
+      for (const u of updates) {
+        this.#applyFileTx(u.path, u.hash, u.lang, u.symbols, u.refs);
+      }
+      for (const r of removals) this.#removeFileTx(r);
+      this.#setMetaTx("head_sha", meta.headSha);
+      this.#setMetaTx("indexed_at", String(Date.now()));
     })();
   }
 
@@ -118,13 +155,17 @@ export class WikiStore {
     };
   }
 
-  setMeta(key: string, value: string): void {
+  #setMetaTx(key: string, value: string): void {
     this.#db
       .prepare(
         `INSERT INTO meta (key, value) VALUES (?, ?)
          ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
       )
       .run(key, value);
+  }
+
+  setMeta(key: string, value: string): void {
+    this.#setMetaTx(key, value);
   }
 
   getMeta(key: string): string | null {
@@ -147,8 +188,26 @@ export function openWikiStore(projectDir: string): WikiStore {
   if (!existsSync(gitignorePath)) {
     writeFileSync(gitignorePath, "cache/\n");
   }
-  const db = new Database(path.join(cacheDir, "wiki.db"));
+  const dbPath = path.join(cacheDir, "wiki.db");
+  const db = new Database(dbPath);
   db.pragma("journal_mode = WAL");
+  db.pragma("busy_timeout = 5000");
+
+  const currentVersion = db.pragma("user_version", { simple: true }) as number;
+  if (currentVersion !== SCHEMA_VERSION) {
+    const filesTable = db
+      .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'files'")
+      .get();
+    if (filesTable !== undefined) {
+      // Schema drifted from a prior version: drop and rebuild rather than migrate.
+      db.close();
+      rmSync(dbPath, { force: true });
+      rmSync(`${dbPath}-wal`, { force: true });
+      rmSync(`${dbPath}-shm`, { force: true });
+      return openWikiStore(projectDir);
+    }
+  }
+
   db.exec(SCHEMA);
   db.pragma(`user_version = ${SCHEMA_VERSION}`);
   return new WikiStore(db);

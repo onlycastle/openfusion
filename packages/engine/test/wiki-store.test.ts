@@ -86,4 +86,41 @@ describe("WikiStore", () => {
     expect(db.pragma("user_version", { simple: true })).toBe(1);
     db.close();
   });
+
+  it("applyBuild applies updates, removals, and meta in one shot", () => {
+    const store = makeStore();
+    store.upsertFile("old.ts", "h0", "typescript", [
+      { name: "gone", kind: "function", row: 0, col: 0 },
+    ], []);
+    store.applyBuild(
+      [
+        {
+          path: "new.ts",
+          hash: "h1",
+          lang: "typescript",
+          symbols: [{ name: "fresh", kind: "function", row: 1, col: 0 }],
+          refs: [],
+        },
+      ],
+      ["old.ts"],
+      { headSha: "sha-xyz" },
+    );
+    expect(store.listFiles()).toEqual(["new.ts"]);
+    expect(store.symbolsByName("gone")).toEqual([]);
+    expect(store.symbolsByName("fresh")).toHaveLength(1);
+    expect(store.getMeta("head_sha")).toBe("sha-xyz");
+  });
+
+  it("recreates the database when schema version mismatches", () => {
+    const store = makeStore();
+    store.setMeta("marker", "will-vanish");
+    store.close();
+    const dbPath = path.join(dir, ".openfusion/cache/wiki.db");
+    const raw = new Database(dbPath);
+    raw.pragma("user_version = 99");
+    raw.close();
+    const reopened = openWikiStore(dir);
+    expect(reopened.getMeta("marker")).toBeNull();
+    reopened.close();
+  });
 });
