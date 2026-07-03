@@ -30,6 +30,7 @@ export { RpcDispatcher } from "./rpc/dispatcher.js";
 export type { RpcHandler } from "./rpc/dispatcher.js";
 export { NdjsonDecoder, encodeNdjson } from "./rpc/ndjson.js";
 export type { DecodedLine } from "./rpc/ndjson.js";
+export { StdioPipeline } from "./rpc/stdio.js";
 export { ENGINE_VERSION } from "./version.js";
 export { RpcMethodError } from "./rpc/errors.js";
 export { registerMethod } from "./rpc/register.js";
