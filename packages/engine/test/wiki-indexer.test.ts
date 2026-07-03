@@ -72,6 +72,22 @@ describe("buildIndex", () => {
     expect(stats.filesRemoved).toBe(1);
     expect(store.listFiles()).toEqual(["a.ts"]);
   });
+
+  it("keeps entries for tracked files that become oversized (skip, not removal)", async () => {
+    makeRepo();
+    await buildIndex(dir, store, parser);
+    expect(store.symbolsByName("alpha")).toHaveLength(1);
+    writeFileSync(
+      path.join(dir, "a.ts"),
+      `export function alpha() {}\n// ${"x".repeat(1024 * 1024)}\n`,
+    );
+    git("add", "-A");
+    git("commit", "-qm", "grow a");
+    const stats = await buildIndex(dir, store, parser);
+    expect(stats.filesRemoved).toBe(0);
+    expect(store.listFiles()).toContain("a.ts");
+    expect(store.symbolsByName("alpha")).toHaveLength(1);
+  });
 });
 
 describe("getHeadSha", () => {

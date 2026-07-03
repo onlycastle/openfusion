@@ -48,15 +48,19 @@ export async function buildIndex(
   const seen = new Set<string>();
 
   for (const relPath of tracked) {
+    seen.add(relPath);
     const absPath = path.join(projectDir, relPath);
     let size: number;
     try {
       size = statSync(absPath).size;
     } catch {
-      continue; // tracked but missing on disk (mid-operation); skip
+      filesSkipped += 1; // tracked but momentarily unreadable: keep existing entries
+      continue;
     }
-    if (size > MAX_FILE_BYTES) continue;
-    seen.add(relPath);
+    if (size > MAX_FILE_BYTES) {
+      filesSkipped += 1; // too large to parse: keep any existing entries
+      continue;
+    }
     const source = readFileSync(absPath, "utf8");
     const hash = createHash("sha256").update(source).digest("hex");
     if (store.getFileHash(relPath) === hash) {
