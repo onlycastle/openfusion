@@ -115,6 +115,14 @@ describe("engine.models.complete", () => {
       expect(usage.result.calls).toBe(1);
       expect(usage.result.inputTokens).toBe(5);
       expect(usage.result.outputTokens).toBe(5);
+      // M5b Task 1: engine.models.complete records under source "complete",
+      // and engine.models.usage carries that breakdown alongside byModel.
+      expect(usage.result.bySource["complete"]).toEqual({
+        calls: 1,
+        inputTokens: 5,
+        outputTokens: 5,
+        costUsd: 0,
+      });
     } finally {
       await engine.close();
     }

@@ -1,11 +1,11 @@
-import { existsSync, realpathSync } from "node:fs";
-import path from "node:path";
+import { existsSync } from "node:fs";
 import { z } from "zod";
 import { RpcErrorCodes } from "@openfusion/shared";
 import type { Engine } from "../engine.js";
 import { RpcMethodError } from "../rpc/errors.js";
+import { requireGitRepo, resolveProjectKey } from "../rpc/guards.js";
 import { registerMethod } from "../rpc/register.js";
-import { buildIndex, getHeadSha, type IndexStats } from "./indexer.js";
+import { buildIndex, type IndexStats } from "./indexer.js";
 import { McpWikiServer } from "./mcp.js";
 import { WikiParser } from "./parser.js";
 import { rankFiles, renderRepoMap } from "./rank.js";
@@ -20,19 +20,6 @@ const MapParamsSchema = ProjectParamsSchema.extend({
 });
 const EmptyParamsSchema = z.object({});
 
-// Resolve to the canonical, symlink-free path so distinct spellings of the
-// same directory (or a symlinked one) share one store and one in-flight
-// build. If the directory doesn't exist yet, fall back to the resolved
-// (non-canonicalized) path — the git guard in requireHeadSha rejects it anyway.
-function keyFor(projectDir: string): string {
-  const resolved = path.resolve(projectDir);
-  try {
-    return realpathSync(resolved);
-  } catch {
-    return resolved;
-  }
-}
-
 export class WikiService {
   #stores = new Map<string, WikiStore>();
   #parserPromise: Promise<WikiParser> | undefined;
@@ -41,7 +28,7 @@ export class WikiService {
   #mcpStarting = new Map<string, Promise<McpWikiServer>>();
 
   getStore(projectDir: string): WikiStore {
-    const key = keyFor(projectDir);
+    const key = resolveProjectKey(projectDir);
     let store = this.#stores.get(key);
     if (store !== undefined && !existsSync(wikiDbPath(key))) {
       // The cached handle's backing file is gone — an external `rm -rf
@@ -78,7 +65,7 @@ export class WikiService {
   // map below) — otherwise both would pass the "no existing server" check,
   // each start its own server, and leak the first one.
   async startMcpServer(engine: Engine, projectDir: string): Promise<McpWikiServer> {
-    const key = keyFor(projectDir);
+    const key = resolveProjectKey(projectDir);
     const existing = this.#mcpServers.get(key);
     if (existing !== undefined) return existing;
 
@@ -100,7 +87,7 @@ export class WikiService {
   }
 
   async stopMcpServer(projectDir: string): Promise<boolean> {
-    const key = keyFor(projectDir);
+    const key = resolveProjectKey(projectDir);
     const server = this.#mcpServers.get(key);
     if (server === undefined) return false;
     this.#mcpServers.delete(key);
@@ -116,7 +103,7 @@ export class WikiService {
   // Concurrent build() calls for the same project coalesce onto one in-flight
   // promise instead of racing two builds against the same sqlite file.
   build(projectDir: string): Promise<IndexStats> {
-    const key = keyFor(projectDir);
+    const key = resolveProjectKey(projectDir);
     const inFlight = this.#building.get(key);
     if (inFlight !== undefined) return inFlight;
 
@@ -157,24 +144,13 @@ export class WikiService {
   }
 }
 
-function requireHeadSha(projectDir: string): string {
-  try {
-    return getHeadSha(projectDir);
-  } catch {
-    throw new RpcMethodError(
-      RpcErrorCodes.SERVER_ERROR,
-      `not a git repository: ${projectDir}`,
-    );
-  }
-}
-
 export function registerWikiMethods(engine: Engine): void {
   registerMethod(
     engine.dispatcher,
     "engine.wiki.build",
     ProjectParamsSchema,
     async ({ projectDir }) => {
-      requireHeadSha(projectDir);
+      requireGitRepo(projectDir);
       const stats = await engine.wiki.build(projectDir);
       engine.log(
         `wiki.build ${projectDir}: ${stats.filesIndexed} indexed, ${stats.filesSkipped} skipped`,
@@ -188,8 +164,8 @@ export function registerWikiMethods(engine: Engine): void {
     "engine.wiki.status",
     ProjectParamsSchema,
     ({ projectDir }) => {
-      const currentSha = requireHeadSha(projectDir);
-      const resolvedDir = keyFor(projectDir);
+      const currentSha = requireGitRepo(projectDir);
+      const resolvedDir = resolveProjectKey(projectDir);
 
       // If wiki.db doesn't exist, the wiki hasn't been built yet. Consult
       // the same wikiDbPath() the store itself opens (and getStore's cache
@@ -225,7 +201,7 @@ export function registerWikiMethods(engine: Engine): void {
     "engine.wiki.query",
     QueryParamsSchema,
     ({ projectDir, symbol }) => {
-      requireHeadSha(projectDir);
+      requireGitRepo(projectDir);
       const store = engine.wiki.getStore(projectDir);
       return {
         definitions: store.symbolsByName(symbol),
@@ -239,7 +215,7 @@ export function registerWikiMethods(engine: Engine): void {
     "engine.wiki.map",
     MapParamsSchema,
     ({ projectDir, budgetTokens }) => {
-      requireHeadSha(projectDir);
+      requireGitRepo(projectDir);
       const store = engine.wiki.getStore(projectDir);
       if (store.getMeta("head_sha") === null) {
         throw new RpcMethodError(
@@ -261,7 +237,7 @@ export function registerWikiMethods(engine: Engine): void {
     "engine.mcp.start",
     ProjectParamsSchema,
     async ({ projectDir }) => {
-      requireHeadSha(projectDir);
+      requireGitRepo(projectDir);
       const server = await engine.wiki.startMcpServer(engine, projectDir);
       return { url: server.url };
     },

@@ -161,6 +161,15 @@ describe("engine.worker.run", () => {
     expect(usage.result.outputTokens).toBe(80);
     expect(usage.result.byModel["deepseek/deepseek-v4-flash"]).toBeDefined();
     expect(usage.result.byModel["deepseek/deepseek-v4-flash"].calls).toBe(1);
+    // M5b Task 1: engine.worker.run records under source "worker", and
+    // engine.models.usage carries that breakdown alongside byModel — the
+    // same ledger entry, sliced a different way.
+    expect(usage.result.bySource["worker"]).toEqual({
+      calls: 1,
+      inputTokens: 300,
+      outputTokens: 80,
+      costUsd: usage.result.byModel["deepseek/deepseek-v4-flash"].costUsd,
+    });
   });
 
   it("emits worker.progress notifications for both tool and step events", async () => {

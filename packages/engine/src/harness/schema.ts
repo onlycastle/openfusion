@@ -69,7 +69,19 @@ export const WikiPageSchema = z.object({
 export type WikiPage = z.infer<typeof WikiPageSchema>;
 
 const AgentModelSchema = z.union([
-  z.object({ kind: z.string().min(1), model: z.string().min(1) }),
+  z.object({
+    kind: z.string().min(1),
+    model: z.string().min(1),
+    // Which configured provider (models/providers.ts's ProviderRegistry id,
+    // NOT the provider "kind") should serve this agent's model — added in
+    // M5b Task 1 so the routing layer (Task 2) can resolve a specific
+    // registered provider instead of guessing one from `kind` alone.
+    // OPTIONAL for backward compatibility: an agent def written before this
+    // field existed (on disk, or a hand-edited harness) still parses; a
+    // missing providerId is resolved by the routing layer, not rejected
+    // here.
+    providerId: z.string().optional(),
+  }),
   z.literal("frontier"),
 ]);
 

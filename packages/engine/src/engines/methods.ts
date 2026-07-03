@@ -6,7 +6,7 @@ import { RpcErrorCodes } from "@openfusion/shared";
 import type { Engine } from "../engine.js";
 import { RpcMethodError } from "../rpc/errors.js";
 import { registerMethod } from "../rpc/register.js";
-import { getHeadSha } from "../wiki/indexer.js";
+import { requireGitRepo } from "../rpc/guards.js";
 import { wikiDbPath } from "../wiki/store.js";
 import { createClaudeAdapter } from "./claude.js";
 import { isPathContained } from "./path-scope.js";
@@ -73,21 +73,6 @@ const EmptyParamsSchema = z.object({});
 interface SessionEntry {
   session: FrontierSession;
   adapter: FrontierAdapter;
-}
-
-// Mirrors wiki/methods.ts's own (unexported) requireHeadSha guard, including
-// its error shape — engine.frontier.* operates against a project checkout
-// the same way engine.wiki.* does, so "not a git repository" should read
-// identically from either surface. Not imported from wiki/methods.ts because
-// that helper isn't exported there; kept as a narrow, intentional
-// duplication rather than widening wiki's public surface for one shared
-// three-line guard.
-function requireHeadSha(projectDir: string): void {
-  try {
-    getHeadSha(projectDir);
-  } catch {
-    throw new RpcMethodError(RpcErrorCodes.SERVER_ERROR, `not a git repository: ${projectDir}`);
-  }
 }
 
 // Mirrors engine.wiki.status's own built-check: gate on existsSync(wikiDbPath)
@@ -236,6 +221,11 @@ export function registerFrontierMethods(engine: Engine): void {
           usage: result.usage,
           costUsd: result.costUsd,
           at: Date.now(),
+          // Default for now — Task 4's orchestrator distinguishes a
+          // frontier call driving REVIEW from one driving ESCALATION and
+          // will pass the more specific source through; every frontier
+          // record is "frontier-review" until that plumbing lands.
+          source: "frontier-review",
         });
       },
     }),
@@ -243,7 +233,7 @@ export function registerFrontierMethods(engine: Engine): void {
 
   registerMethod(engine.dispatcher, "engine.frontier.start", StartParamsSchema, async (params) => {
     const { projectDir } = params;
-    requireHeadSha(projectDir);
+    requireGitRepo(projectDir);
 
     const kind = params.engine ?? "claude-code";
     const adapter = engine.frontier.getAdapter(kind);

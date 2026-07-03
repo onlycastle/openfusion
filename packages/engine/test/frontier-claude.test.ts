@@ -254,6 +254,7 @@ describe("createClaudeAdapter", () => {
           usage: result.usage,
           costUsd: result.costUsd,
           at: Date.now(),
+          source: "frontier-review",
         });
       },
     });
@@ -263,6 +264,16 @@ describe("createClaudeAdapter", () => {
     const totals = meter.totals();
     expect(totals.calls).toBe(1);
     expect(totals.byModel["frontier-claude/claude-fable-5"]).toEqual({
+      calls: 1,
+      inputTokens: 1000,
+      outputTokens: 200,
+      costUsd: 0.12,
+    });
+    // M5b Task 1: engines/methods.ts's real onResult hook tags every
+    // frontier-claude record "frontier-review" (default until Task 4 wires
+    // a more specific source through) — mirrored here at the same
+    // onResult -> meter.record call shape this test exercises.
+    expect(totals.bySource["frontier-review"]).toEqual({
       calls: 1,
       inputTokens: 1000,
       outputTokens: 200,

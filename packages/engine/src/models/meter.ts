@@ -1,5 +1,16 @@
 import type { NormalizedUsage } from "./pricing.js";
 
+// Which engine.* surface produced this record. Lets engine.models.usage
+// break totals down by call site (Task 4's orchestrator wants to see
+// frontier-review vs frontier-escalate cost separately from plain worker
+// runs) without having to re-derive it from `kind`/`model` after the fact.
+// "frontier-review"/"frontier-escalate" are both produced by the same
+// frontier-claude adapter path (engines/methods.ts's onResult hook) — which
+// one a given call used is a Task 4 concern (the orchestrator decides review
+// vs escalate); today every frontier record is tagged "frontier-review" as
+// the default until that distinction is wired through.
+export type UsageSource = "complete" | "worker" | "frontier-review" | "frontier-escalate";
+
 // One successful `engine.models.complete` attempt. Failed attempts are never
 // recorded here — only what actually consumed tokens (see methods.ts).
 export interface UsageRecord {
@@ -9,6 +20,7 @@ export interface UsageRecord {
   usage: NormalizedUsage;
   costUsd: number | null;
   at: number;
+  source: UsageSource;
 }
 
 export interface ModelTotals {
@@ -26,6 +38,10 @@ export interface MeterTotals {
   costUsd: number;
   unpricedCalls: number;
   byModel: Record<string, ModelTotals>;
+  // Same per-bucket shape as byModel, keyed by UsageRecord.source instead of
+  // "<kind>/<model>" — a per-surface cost breakdown alongside the existing
+  // per-model one.
+  bySource: Record<string, ModelTotals>;
 }
 
 // In-memory cost/usage ledger for the engine process's lifetime. Never
@@ -46,6 +62,7 @@ export class CostMeter {
       costUsd: 0,
       unpricedCalls: 0,
       byModel: {},
+      bySource: {},
     };
 
     for (const r of this.#records) {
@@ -72,6 +89,18 @@ export class CostMeter {
       entry.outputTokens += r.usage.outputTokens;
       if (r.costUsd !== null) entry.costUsd += r.costUsd;
       totals.byModel[key] = entry;
+
+      const sourceEntry = totals.bySource[r.source] ?? {
+        calls: 0,
+        inputTokens: 0,
+        outputTokens: 0,
+        costUsd: 0,
+      };
+      sourceEntry.calls += 1;
+      sourceEntry.inputTokens += r.usage.inputTokens;
+      sourceEntry.outputTokens += r.usage.outputTokens;
+      if (r.costUsd !== null) sourceEntry.costUsd += r.costUsd;
+      totals.bySource[r.source] = sourceEntry;
     }
 
     return totals;

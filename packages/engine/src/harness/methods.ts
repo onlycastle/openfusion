@@ -1,9 +1,8 @@
-import { realpathSync } from "node:fs";
-import path from "node:path";
 import { z } from "zod";
 import { RpcErrorCodes } from "@openfusion/shared";
 import type { Engine } from "../engine.js";
 import { RpcMethodError } from "../rpc/errors.js";
+import { resolveProjectKey } from "../rpc/guards.js";
 import { registerMethod } from "../rpc/register.js";
 import { HarnessGenError } from "./driver.js";
 import { exportHarness } from "./exporters.js";
@@ -18,20 +17,6 @@ const ExportParamsSchema = z.object({
   format: z.enum(["agents-md", "claude-subagents"]),
 });
 
-// Same canonicalization as wiki/methods.ts's own keyFor: resolve to a
-// symlink-free path so distinct spellings of the same directory share one
-// in-flight generation, falling back to the merely-resolved path if the
-// directory doesn't exist yet (generateHarness's own git guard rejects that
-// case with a clear error).
-function keyFor(projectDir: string): string {
-  const resolved = path.resolve(projectDir);
-  try {
-    return realpathSync(resolved);
-  } catch {
-    return resolved;
-  }
-}
-
 // Holds the per-project in-flight generation map. Mirrors WikiService.build's
 // #building coalescing exactly: a second engine.harness.generate call for a
 // project already generating returns the SAME promise instead of racing a
@@ -40,7 +25,7 @@ export class HarnessService {
   #generating = new Map<string, Promise<GenerateHarnessResult>>();
 
   generate(engine: Engine, projectDir: string): Promise<GenerateHarnessResult> {
-    const key = keyFor(projectDir);
+    const key = resolveProjectKey(projectDir);
     const inFlight = this.#generating.get(key);
     if (inFlight !== undefined) return inFlight;
 

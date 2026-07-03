@@ -3,8 +3,8 @@
 // write/edit), and runWorkerLoop (the AI SDK v7 multi-step tool loop) into
 // one metered, reviewable worker run. Mirrors the WikiService/HarnessService
 // sibling-service pattern on Engine: WorkerService itself holds only the
-// per-project WorktreeManager cache (keyed by the base repo's realpath, like
-// WikiService/HarnessService's own keyFor) — everything else (the models
+// per-project WorktreeManager cache (keyed by the base repo's realpath via
+// rpc/guards.js's shared resolveProjectKey) — everything else (the models
 // registry, the cost meter, the notify sink) is read directly off `engine`
 // by the RPC handlers below, the same way engine.frontier.* reads
 // engine.models.meter without owning it.
@@ -19,15 +19,14 @@
 // the CLIENT owns bounding fan-out (M5b's orchestrator is the intended
 // bounding layer).
 import { randomUUID } from "node:crypto";
-import { realpathSync } from "node:fs";
 import path from "node:path";
 import { z } from "zod";
 import { RpcErrorCodes } from "@openfusion/shared";
 import type { Engine } from "../engine.js";
 import { estimateCostUsd, lookupPricing } from "../models/pricing.js";
 import { RpcMethodError } from "../rpc/errors.js";
+import { providerKindOf, requireGitRepo, resolveProjectKey } from "../rpc/guards.js";
 import { registerMethod } from "../rpc/register.js";
-import { getHeadSha } from "../wiki/indexer.js";
 import { runWorkerLoop } from "./loop.js";
 import { createWorkerTools } from "./tools.js";
 import { WorktreeManager, type Worktree } from "./worktree.js";
@@ -57,42 +56,6 @@ const CleanupParamsSchema = z.object({
   deleteBranch: z.boolean().optional(),
 });
 
-// Mirrors wiki/methods.ts's own (unexported) keyFor: resolve to the
-// canonical, symlink-free path so distinct spellings of the same base repo
-// share one WorktreeManager (and thus one prune() / one worktreesDir()).
-function keyFor(projectDir: string): string {
-  const resolved = path.resolve(projectDir);
-  try {
-    return realpathSync(resolved);
-  } catch {
-    return resolved;
-  }
-}
-
-// Mirrors wiki/methods.ts's and engines/methods.ts's own (unexported)
-// requireHeadSha guard, including its error shape — engine.worker.* rejects
-// a non-git projectDir the same way engine.wiki.* and engine.frontier.* do.
-function requireHeadSha(projectDir: string): void {
-  try {
-    getHeadSha(projectDir);
-  } catch {
-    throw new RpcMethodError(RpcErrorCodes.SERVER_ERROR, `not a git repository: ${projectDir}`);
-  }
-}
-
-// Looks up the provider kind recorded at engine.models.configure() time —
-// pricing.ts's table is keyed "<providerKind>/<modelId>", not by providerId,
-// so metering a worker run needs the SAME lookup engine.models.complete's
-// runComplete() does internally (models/methods.ts's own kindOf helper,
-// unexported — duplicated here rather than widening that module's surface
-// for one three-line helper, matching how frontier duplicates
-// requireHeadSha above). Falls back to the providerId itself for the
-// unsupported case of a resolve()-able-but-never-configured provider.
-function kindOf(engine: Engine, providerId: string): string {
-  const registered = engine.models.registry.list().find((p) => p.id === providerId);
-  return registered?.kind ?? providerId;
-}
-
 // Holds one WorktreeManager per base repo, cached by realpath so distinct
 // spellings of the same project share one manager (and its prune()), PLUS
 // the set of in-flight worker-run AbortControllers (see beginRun/endRun/
@@ -110,7 +73,7 @@ export class WorkerService {
   // rather than at Engine construction time, since Engine has no project
   // path to prune against until the first worker.run/cleanup call arrives.
   async getManager(projectDir: string): Promise<WorktreeManager> {
-    const key = keyFor(projectDir);
+    const key = resolveProjectKey(projectDir);
     let manager = this.#managers.get(key);
     if (manager === undefined) {
       manager = new WorktreeManager(projectDir);
@@ -156,7 +119,7 @@ export function registerWorkerMethods(engine: Engine): void {
     // -> meter -> return.
     //
     // The git guard, model resolution, and worktree creation are wrapped in
-    // their own try/catch below: `requireHeadSha`/`registry.resolve`
+    // their own try/catch below: `requireGitRepo`/`registry.resolve`
     // already throw a properly-coded `RpcMethodError` (SERVER_ERROR /
     // INVALID_PARAMS) and pass through unchanged, but `getManager`/
     // `manager.create` can fail with a raw `Error` (e.g. a `git worktree
@@ -172,13 +135,13 @@ export function registerWorkerMethods(engine: Engine): void {
     let taskId: string;
     let worktree: Worktree;
     try {
-      requireHeadSha(params.projectDir);
+      requireGitRepo(params.projectDir);
 
       // Resolved BEFORE the worktree is created: an unconfigured provider
       // (or any other resolve()-time failure) must never leave an orphaned
       // worktree behind.
       languageModel = engine.models.registry.resolve(params.providerId, params.model);
-      kind = kindOf(engine, params.providerId);
+      kind = providerKindOf(engine.models.registry, params.providerId);
 
       manager = await engine.worker.getManager(params.projectDir);
       taskId = randomUUID();
@@ -253,12 +216,10 @@ export function registerWorkerMethods(engine: Engine): void {
       // synthetic "worker/..." kind — pricing.ts's table is keyed by provider
       // kind, and engine.models.usage's byModel breakdown needs to line up
       // with engine.models.complete's own records for the same provider/model
-      // so totals stay comparable across call sites. UsageRecord (meter.ts)
-      // has no spare field to tag "this record came from a worker run"
-      // without a schema change touching every existing record shape, so
-      // worker vs engine.models.complete vs engine.frontier.* records are NOT
-      // distinguishable in the ledger today — see the task report for the
-      // considered alternatives.
+      // so totals stay comparable across call sites. `source: "worker"`
+      // (M5b Task 1) is what makes worker vs engine.models.complete vs
+      // engine.frontier.* records distinguishable in the ledger — see
+      // engine.models.usage's bySource breakdown.
       engine.models.meter.record({
         providerId: params.providerId,
         kind,
@@ -266,6 +227,7 @@ export function registerWorkerMethods(engine: Engine): void {
         usage: loopResult.usage,
         costUsd,
         at: Date.now(),
+        source: "worker",
       });
 
       engine.log(
@@ -320,7 +282,7 @@ export function registerWorkerMethods(engine: Engine): void {
     // failing `git worktree prune` call, whose raw `Error` falls through to
     // the dispatcher's generic INTERNAL_ERROR (-32603) instead of this
     // method's SERVER_ERROR (-32000) contract.
-    requireHeadSha(params.projectDir);
+    requireGitRepo(params.projectDir);
 
     const manager = await engine.worker.getManager(params.projectDir);
     const resolvedTarget = path.resolve(params.worktreePath);
