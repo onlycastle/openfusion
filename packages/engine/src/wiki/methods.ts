@@ -248,10 +248,11 @@ export function registerWikiMethods(engine: Engine): void {
         );
       }
       const ranked = rankFiles(store.allSymbols(), store.allRefs());
+      const renderable = ranked.filter((r) => r.definedSymbols.length > 0).length;
       const map = renderRepoMap(ranked, budgetTokens ?? 1024);
       // each rendered block is exactly two lines (file + symbols)
       const rendered = map.length === 0 ? 0 : map.trimEnd().split("\n").length / 2;
-      return { map, files: ranked.length, truncated: rendered < ranked.length };
+      return { map, files: ranked.length, truncated: rendered < renderable };
     },
   );
 
