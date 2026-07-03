@@ -1,4 +1,4 @@
-import { APICallError, generateText, type ModelMessage } from "ai";
+import { APICallError, generateText, RetryError, type ModelMessage } from "ai";
 import { z } from "zod";
 import { RpcErrorCodes } from "@openfusion/shared";
 import type { Engine } from "../engine.js";
@@ -67,11 +67,22 @@ function toModelMessages(messages: CompleteMessage[]): ModelMessage[] {
 }
 
 // Classifies a `generateText`/provider failure as safe to retry against the
-// next candidate in the fallback chain. Retryable: AI SDK APICallError with
-// isRetryable true or a 5xx/429 statusCode, network-level fetch TypeErrors,
-// and (for test doubles) any thrown value exposing a truthy `isRetryable`
-// property or 5xx/429 `statusCode`.
+// next candidate in the fallback chain. Checked first: the AI SDK's own
+// `AI_RetryError`, thrown when `generateText`'s internal retry budget is
+// exhausted (`reason: "maxRetriesExceeded"`) — not an APICallError, so it
+// must be unwrapped and judged on its `lastError` (or trusted outright on
+// exhaustion) rather than falling through to "not retryable". With
+// `maxRetries: 0` set on the `generateText` call below this branch is
+// defense-in-depth rather than the hot path, since the SDK now rethrows the
+// raw error on the first failure instead of wrapping it — see the call site
+// comment. Otherwise retryable: AI SDK APICallError with isRetryable true or
+// a 5xx/429 statusCode, network-level fetch TypeErrors, and (for test
+// doubles) any thrown value exposing a truthy `isRetryable` property or
+// 5xx/429 `statusCode`.
 export function isRetryableModelError(err: unknown): boolean {
+  if (RetryError.isInstance(err)) {
+    return err.reason === "maxRetriesExceeded" || isRetryableModelError(err.lastError);
+  }
   if (APICallError.isInstance(err)) {
     if (err.isRetryable) return true;
     return err.statusCode !== undefined && (err.statusCode >= 500 || err.statusCode === 429);
@@ -134,6 +145,9 @@ async function runComplete(
         model: languageModel,
         ...promptOptions,
         maxOutputTokens: params.maxOutputTokens,
+        // The fallback chain is the single retry layer; SDK-internal retries
+        // would stack backoff under it (M2 final review, Important #2).
+        maxRetries: 0,
       });
 
       const usage = normalizeUsage(result.usage);
