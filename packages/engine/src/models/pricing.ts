@@ -141,6 +141,14 @@ export function estimateCostUsd(pricing: ModelPricing, usage: NormalizedUsage): 
   );
 }
 
+// Non-finite (NaN, +/-Infinity) collapses to 0 alongside the existing
+// missing-field default — a provider adapter that hands back a malformed
+// usage number must not poison cost estimation (NaN propagates through
+// arithmetic silently) or the cost meter's running totals.
+function finiteOr0(value: number | undefined): number {
+  return value !== undefined && Number.isFinite(value) ? value : 0;
+}
+
 // Reads the Vercel AI SDK v7 result.usage shape:
 // { inputTokens?, outputTokens?, inputTokenDetails?: { cacheReadTokens? } }.
 // Any missing field (including a wholly missing/undefined usage object)
@@ -152,8 +160,8 @@ export function normalizeUsage(raw: unknown): NormalizedUsage {
     inputTokenDetails?: { cacheReadTokens?: number };
   };
   return {
-    inputTokens: usage.inputTokens ?? 0,
-    outputTokens: usage.outputTokens ?? 0,
-    cacheReadTokens: usage.inputTokenDetails?.cacheReadTokens ?? 0,
+    inputTokens: finiteOr0(usage.inputTokens),
+    outputTokens: finiteOr0(usage.outputTokens),
+    cacheReadTokens: finiteOr0(usage.inputTokenDetails?.cacheReadTokens),
   };
 }

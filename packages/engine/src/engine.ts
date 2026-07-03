@@ -1,26 +1,40 @@
 import { RpcDispatcher } from "./rpc/dispatcher.js";
+import { FrontierService, registerFrontierMethods } from "./engines/methods.js";
 import { registerCoreMethods } from "./methods.js";
 import { ModelsService, registerModelsMethods } from "./models/methods.js";
 import { WikiService, registerWikiMethods } from "./wiki/methods.js";
 
 export interface EngineOptions {
   log?: (message: string) => void;
+  // Server-initiated notification sink. Used by engine.frontier.prompt to
+  // stream `frontier.event { sessionId, seq, event }` lines while a prompt
+  // is in flight — the engine's first server→client notifications. Defaults
+  // to a no-op so unit tests that construct an Engine directly don't need to
+  // wire one up; main.ts supplies the real stdout writer (see main.ts).
+  notify?: (method: string, params: unknown) => void;
 }
 
 export class Engine {
   readonly dispatcher = new RpcDispatcher();
   readonly log: (message: string) => void;
+  readonly notify: (method: string, params: unknown) => void;
   readonly wiki = new WikiService();
   readonly models = new ModelsService();
+  readonly frontier = new FrontierService();
 
   constructor(options: EngineOptions = {}) {
     this.log = options.log ?? (() => {});
+    this.notify = options.notify ?? (() => {});
     registerCoreMethods(this.dispatcher);
     registerWikiMethods(this);
     registerModelsMethods(this);
+    registerFrontierMethods(this);
   }
 
   async close(): Promise<void> {
+    // Frontier sessions may hold subprocesses that talk to the wiki's MCP
+    // server, so tear them down before wiki.close() stops that server.
+    await this.frontier.close();
     await this.wiki.close();
   }
 }
@@ -38,6 +52,15 @@ export { ENGINE_VERSION } from "./version.js";
 export { RpcMethodError } from "./rpc/errors.js";
 export { registerMethod } from "./rpc/register.js";
 export { WikiService } from "./wiki/methods.js";
+export { FrontierService, registerFrontierMethods } from "./engines/methods.js";
+export type {
+  FrontierAdapter,
+  FrontierEvent,
+  FrontierPromptHandle,
+  FrontierSession,
+} from "./engines/types.js";
+export { createClaudeAdapter } from "./engines/claude.js";
+export type { CreateClaudeAdapterOptions } from "./engines/claude.js";
 export { WikiStore, openWikiStore } from "./wiki/store.js";
 export { WikiParser } from "./wiki/parser.js";
 export { buildIndex, getHeadSha } from "./wiki/indexer.js";

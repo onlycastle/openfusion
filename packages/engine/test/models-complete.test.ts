@@ -23,6 +23,27 @@ async function call(engine: Engine, method: string, params: unknown): Promise<an
   return engine.dispatcher.dispatch({ jsonrpc: "2.0", id: 1, method, params });
 }
 
+// Simulates a hung provider: the returned fetch promise never settles on its
+// own, mirroring a server that accepted the connection but never responds.
+// It DOES honor the abort signal the SDK attaches to the request (real
+// `fetch` implementations reject when their signal fires) so that
+// `timeoutMs` -> `AbortSignal.timeout()` -> generateText's per-call
+// `abortSignal` plumbing has something real to abort. Without this listener
+// the promise would hang forever regardless of the deadline, since nothing
+// else races the fetch call.
+function hungFetch(): typeof fetch {
+  return (async (_input: RequestInfo | URL, init?: RequestInit) =>
+    new Promise<Response>((_resolve, reject) => {
+      const signal = init?.signal;
+      if (signal === undefined || signal === null) return;
+      if (signal.aborted) {
+        reject(signal.reason);
+        return;
+      }
+      signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+    })) as typeof fetch;
+}
+
 describe("engine.models.complete", () => {
   it("happy path: records usage + cost from a priced model", async () => {
     const engine = createEngine();
@@ -245,10 +266,113 @@ describe("engine.models.complete", () => {
       expect(pricing).not.toBeNull();
       const expectedCost = estimateCostUsd(pricing!, res.result.usage);
       expect(res.result.costUsd).toBeCloseTo(expectedCost, 10);
+
+      // Pre-savings live-metering smoke (Moonshot/GLM cache-field
+      // discovery): the openai-compatible chat model always populates
+      // `providerMetadata` with at least `{ [providerName]: {} }`, verified
+      // empirically against @ai-sdk/openai-compatible's doGenerate. Assert
+      // it passes through `engine.models.complete` rather than being
+      // dropped.
+      expect(res.result.providerMetadata).toBeDefined();
+      expect(typeof res.result.providerMetadata).toBe("object");
     } finally {
       await engine.close();
     }
   });
+
+  // Regression coverage for per-attempt `timeoutMs`: a hung provider (one
+  // whose fetch never settles) must not hang `engine.models.complete`
+  // forever. `AbortSignal.timeout()` fires the deadline, the AI SDK's
+  // internal retry wrapper rethrows abort/timeout errors unwrapped even
+  // under `maxRetries: 0` (verified by reading
+  // `retryWithExponentialBackoffInternal`: `isAbortError` is checked before
+  // the maxRetries===0 short-circuit), and the classifier must recognize
+  // that raw error as retryable — a hung provider is exactly the case
+  // failover exists for.
+  it("timeout: hung primary with no fallback fails fast with a \"timed out\" attempt error", async () => {
+    const engine = createEngine();
+    try {
+      engine.models.registry.configure(
+        {
+          id: "p-hung",
+          kind: "openai-compatible",
+          apiKey: TEST_API_KEY,
+          baseURL: "http://p-hung.local/v1",
+        },
+        hungFetch(),
+      );
+
+      // 1000ms is the schema floor (timeoutMs: int 1000..600000) — the
+      // smallest deadline this method accepts, still comfortably under the
+      // 5s elapsed bound this test asserts.
+      const start = Date.now();
+      const res = await call(engine, "engine.models.complete", {
+        providerId: "p-hung",
+        model: "qwen3-coder-next",
+        prompt: "hello",
+        timeoutMs: 1000,
+      });
+      const elapsed = Date.now() - start;
+
+      expect(res.result).toBeUndefined();
+      expect(res.error?.code).toBe(RpcErrorCodes.SERVER_ERROR);
+      const data = res.error?.data as { attempts: Array<{ providerId: string; error?: string }> };
+      expect(data.attempts).toHaveLength(1);
+      expect(data.attempts[0]?.providerId).toBe("p-hung");
+      expect(data.attempts[0]?.error).toContain("timed out");
+      expect(elapsed).toBeLessThan(5000);
+    } finally {
+      await engine.close();
+    }
+  }, 10000);
+
+  it("timeout: hung primary fails over to a healthy fallback (real adapter path)", async () => {
+    const engine = createEngine();
+    try {
+      engine.models.registry.configure(
+        {
+          id: "p-hung",
+          kind: "openai-compatible",
+          apiKey: TEST_API_KEY,
+          baseURL: "http://p-hung.local/v1",
+        },
+        hungFetch(),
+      );
+
+      const upFetch = (async () =>
+        new Response(fixtureBody, {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        })) as typeof fetch;
+      engine.models.registry.configure(
+        {
+          id: "p-up",
+          kind: "openai-compatible",
+          apiKey: TEST_API_KEY,
+          baseURL: "http://p-up.local/v1",
+        },
+        upFetch,
+      );
+
+      const res = await call(engine, "engine.models.complete", {
+        providerId: "p-hung",
+        model: "qwen3-coder-next",
+        prompt: "hello",
+        timeoutMs: 1000,
+        fallbacks: [{ providerId: "p-up", model: "qwen3-coder-next" }],
+      });
+
+      expect(res.error).toBeUndefined();
+      expect(res.result.providerId).toBe("p-up");
+      expect(res.result.attempts).toHaveLength(2);
+      expect(res.result.attempts[0].providerId).toBe("p-hung");
+      expect(res.result.attempts[0].error).toContain("timed out");
+      expect(res.result.attempts[1].providerId).toBe("p-up");
+      expect(res.result.attempts[1].error).toBeUndefined();
+    } finally {
+      await engine.close();
+    }
+  }, 10000);
 
   // Regression coverage for the M2 final review Critical finding: real
   // `generateText` failures against real openai-compatible adapters (HTTP

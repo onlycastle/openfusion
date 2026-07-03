@@ -197,6 +197,10 @@ built-in editor.
 4. **Routing quality** — bad routing erases savings via rework. Mitigation:
    conservative default classes, escalation after 2 failures, cost meter
    makes regressions visible immediately.
+5. **Subscription-auth ToS** — engine is auth-agnostic by design (M3); distributing
+   any claude.ai login flow is prohibited by provider terms. Mitigation:
+   revisit before public DMG release (M8) to confirm terms permit embedded
+   official CLI usage under user subscription.
 
 ## Appendix: Research Summary
 
