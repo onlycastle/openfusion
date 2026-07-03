@@ -44,6 +44,7 @@ describe("buildIndex", () => {
     expect(stats.filesSeen).toBe(2);
     expect(stats.filesIndexed).toBe(2);
     expect(stats.filesSkipped).toBe(0);
+    expect(stats.filesFailed).toBe(0);
     expect(stats.symbols).toBeGreaterThanOrEqual(2);
     expect(stats.headSha).toBe(getHeadSha(dir));
     expect(store.getMeta("head_sha")).toBe(stats.headSha);

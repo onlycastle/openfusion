@@ -9,6 +9,7 @@ export interface IndexStats {
   filesSeen: number;
   filesIndexed: number;
   filesSkipped: number;
+  filesFailed: number;
   filesRemoved: number;
   symbols: number;
   refs: number;
@@ -45,6 +46,7 @@ export async function buildIndex(
 
   let filesIndexed = 0;
   let filesSkipped = 0;
+  let filesFailed = 0;
   const seen = new Set<string>();
   const updates: FileUpdate[] = [];
 
@@ -75,7 +77,10 @@ export async function buildIndex(
       continue;
     }
     const result = parser.parseFile(relPath, source);
-    if (result === null) continue;
+    if (result === null) {
+      filesFailed += 1;
+      continue;
+    }
     updates.push({
       path: relPath,
       hash,
@@ -94,6 +99,7 @@ export async function buildIndex(
     filesSeen: seen.size,
     filesIndexed,
     filesSkipped,
+    filesFailed,
     filesRemoved: removals.length,
     symbols: counts.symbols,
     refs: counts.refs,

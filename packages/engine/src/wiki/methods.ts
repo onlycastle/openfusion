@@ -1,4 +1,4 @@
-import { realpathSync } from "node:fs";
+import { existsSync, realpathSync } from "node:fs";
 import path from "node:path";
 import { z } from "zod";
 import { RpcErrorCodes } from "@openfusion/shared";
@@ -172,6 +172,22 @@ export function registerWikiMethods(engine: Engine): void {
     ProjectParamsSchema,
     ({ projectDir }) => {
       const currentSha = requireHeadSha(projectDir);
+      const resolvedDir = keyFor(projectDir);
+      const dbPath = path.join(resolvedDir, ".openfusion", "cache", "wiki.db");
+
+      // If wiki.db doesn't exist, the wiki hasn't been built yet
+      if (!existsSync(dbPath)) {
+        return {
+          built: false,
+          headSha: null,
+          currentSha,
+          stale: false,
+          files: 0,
+          symbols: 0,
+          refs: 0,
+        };
+      }
+
       const store = engine.wiki.getStore(projectDir);
       const headSha = store.getMeta("head_sha");
       const counts = store.counts();

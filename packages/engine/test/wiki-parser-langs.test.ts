@@ -33,4 +33,28 @@ describe("multi-language parsing", () => {
       expect(exts.has(e)).toBe(true);
     }
   });
+
+  it("extracts call references from python", () => {
+    const result = parser.parseFile("test.py", "def f():\n    pass\nf()\n");
+    expect(result).not.toBeNull();
+    expect(result!.refs.map((r) => r.name)).toContain("f");
+  });
+
+  it("extracts call references from go", () => {
+    const result = parser.parseFile("test.go", "package p\nfunc A() {}\nfunc B() { A() }\n");
+    expect(result).not.toBeNull();
+    expect(result!.refs.map((r) => r.name)).toContain("A");
+  });
+
+  it("extracts call references from rust", () => {
+    const result = parser.parseFile("test.rs", "fn a() { b(); }\nfn b() {}\n");
+    expect(result).not.toBeNull();
+    expect(result!.refs.map((r) => r.name)).toContain("b");
+  });
+
+  it("extracts call references from java", () => {
+    const result = parser.parseFile("Test.java", "class D { int a() { return b(); } int b() { return 1; } }\n");
+    expect(result).not.toBeNull();
+    expect(result!.refs.map((r) => r.name)).toContain("b");
+  });
 });

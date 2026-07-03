@@ -139,6 +139,37 @@ describe("MCP wiki server", () => {
     }
   }, 10_000);
 
+  // Variant: zero-byte idle socket (connect and write nothing)
+  it("stop resolves even with a zero-byte idle socket open", async () => {
+    makeRepo();
+    await rpc("engine.wiki.build", { projectDir: dir });
+    const started = await rpc("engine.mcp.start", { projectDir: dir });
+    expect(started.error).toBeUndefined();
+    const url = started.result.url as string;
+
+    const parsed = new URL(url);
+    const socket = net.createConnection({
+      host: parsed.hostname,
+      port: Number(parsed.port),
+    });
+    await new Promise<void>((resolve, reject) => {
+      socket.once("connect", resolve);
+      socket.once("error", reject);
+    });
+    // Write nothing — just an idle connection
+    try {
+      const TIMEOUT = Symbol("timeout");
+      const winner = await Promise.race([
+        rpc("engine.mcp.stop", { projectDir: dir }),
+        new Promise((resolve) => setTimeout(() => resolve(TIMEOUT), 5_000)),
+      ]);
+      expect(winner).not.toBe(TIMEOUT);
+      expect((winner as { result: { stopped: boolean } }).result.stopped).toBe(true);
+    } finally {
+      socket.destroy();
+    }
+  }, 10_000);
+
   // Finding 3: startMcpServer's check-then-await-then-set was a TOCTOU race
   // — two concurrent engine.mcp.start calls for the same root could both
   // pass the "no existing server" check and start two servers, leaking the

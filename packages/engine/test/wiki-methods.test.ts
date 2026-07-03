@@ -102,4 +102,34 @@ describe("wiki RPC methods", () => {
     const res = await call("engine.wiki.map", { projectDir: dir });
     expect(res.error?.code).toBe(RpcErrorCodes.SERVER_ERROR);
   }, 30_000);
+
+  it("status on a never-built project reports built:false without creating .openfusion", async () => {
+    makeRepo();
+    const res = await call("engine.wiki.status", { projectDir: dir });
+    expect(res.result.built).toBe(false);
+    expect(existsSync(path.join(dir, ".openfusion"))).toBe(false);
+  });
+
+  it("map with low budget truncates and reports truncated:true", async () => {
+    makeRepo();
+    // Create 8+ .ts files with enough content to exceed 64-token budget when ranked
+    for (let i = 0; i < 10; i++) {
+      writeFileSync(
+        path.join(dir, `f${i}.ts`),
+        `// File ${i}: extensive content\n` +
+        `export function functionNameA${i}() { return ${i}; }\n` +
+        `export function functionNameB${i}() { return ${i * 2}; }\n` +
+        `export function functionNameC${i}() { return ${i * 3}; }\n` +
+        `export interface InterfaceType${i} { value: number; key: string; }\n`,
+      );
+    }
+    execFileSync("git", ["-C", dir, "add", "-A"]);
+    execFileSync("git", ["-C", dir, "commit", "-qm", "add files"]);
+
+    await call("engine.wiki.build", { projectDir: dir });
+    const res = await call("engine.wiki.map", { projectDir: dir, budgetTokens: 64 });
+    expect(res.error).toBeUndefined();
+    expect(res.result.truncated).toBe(true);
+    expect(res.result.files).toBeGreaterThanOrEqual(8);
+  }, 30_000);
 });
