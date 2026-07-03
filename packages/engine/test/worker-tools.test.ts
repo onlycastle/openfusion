@@ -109,6 +109,83 @@ describe("bash", () => {
   });
 });
 
+// Fix 1 (review round 1): the AI SDK passes a MERGED abortSignal (the run's
+// own abortSignal combined with any per-tool timeout) as `options.abortSignal`
+// on every `execute` call -- confirmed by reading ai@7.0.11's
+// executeToolCall, which builds `toolAbortSignal = mergeAbortSignals(...)`
+// and passes it as `options.abortSignal`. A worker deadline (timeoutMs) is
+// plumbed into `generateText({ abortSignal })` upstream, so THIS is the only
+// channel through which that deadline can interrupt an in-flight `bash`
+// call -- bash's own `bashTimeoutMs` is a much larger, independent ceiling.
+describe("abortSignal propagation (Fix 1, review round 1)", () => {
+  it("bash resolves promptly when options.abortSignal aborts mid-sleep, well under bashTimeoutMs", async () => {
+    dir = makeRoot();
+    // bashTimeoutMs is deliberately large (30s) so a prompt resolution here
+    // can ONLY be explained by the abortSignal killing the child -- not by
+    // bash's own timeout coincidentally firing first.
+    const tools = createWorkerTools({ root: dir, bashTimeoutMs: 30_000 });
+    const ac = new AbortController();
+    setTimeout(() => ac.abort(), 100);
+
+    const start = Date.now();
+    const result = await getExecute(tools.bash)(
+      { command: "sleep 5" },
+      { ...FAKE_OPTS, abortSignal: ac.signal },
+    );
+    const elapsed = Date.now() - start;
+
+    expect(elapsed).toBeLessThan(2000);
+    expect(result).toBeDefined();
+  }, 10_000);
+
+  it("read_file returns {error: 'aborted'} for an already-aborted signal, without reading", async () => {
+    dir = makeRoot();
+    writeFileSync(path.join(dir, "a.txt"), "hello");
+    const tools = createWorkerTools({ root: dir });
+    const ac = new AbortController();
+    ac.abort();
+
+    const result = await getExecute(tools.read_file)(
+      { path: "a.txt" },
+      { ...FAKE_OPTS, abortSignal: ac.signal },
+    );
+
+    expect(result.error).toBe("aborted");
+    expect(result.content).toBeUndefined();
+  });
+
+  it("write_file returns {error: 'aborted'} for an already-aborted signal, without writing", async () => {
+    dir = makeRoot();
+    const tools = createWorkerTools({ root: dir });
+    const ac = new AbortController();
+    ac.abort();
+
+    const result = await getExecute(tools.write_file)(
+      { path: "new.txt", content: "hi" },
+      { ...FAKE_OPTS, abortSignal: ac.signal },
+    );
+
+    expect(result.error).toBe("aborted");
+    expect(existsSync(path.join(dir, "new.txt"))).toBe(false);
+  });
+
+  it("edit returns {error: 'aborted'} for an already-aborted signal, without editing", async () => {
+    dir = makeRoot();
+    writeFileSync(path.join(dir, "a.txt"), "foo bar baz");
+    const tools = createWorkerTools({ root: dir });
+    const ac = new AbortController();
+    ac.abort();
+
+    const result = await getExecute(tools.edit)(
+      { path: "a.txt", find: "bar", replace: "QUX" },
+      { ...FAKE_OPTS, abortSignal: ac.signal },
+    );
+
+    expect(result.error).toBe("aborted");
+    expect(readFileSync(path.join(dir, "a.txt"), "utf8")).toBe("foo bar baz");
+  });
+});
+
 describe("read_file", () => {
   it("reads a file inside root", async () => {
     dir = makeRoot();
