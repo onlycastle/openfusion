@@ -56,6 +56,15 @@ const CleanupParamsSchema = z.object({
   deleteBranch: z.boolean().optional(),
 });
 
+const ListParamsSchema = z.object({
+  projectDir: z.string().min(1),
+});
+
+const GcParamsSchema = z.object({
+  projectDir: z.string().min(1),
+  keep: z.array(z.string()).optional(),
+});
+
 // Holds one WorktreeManager per base repo, cached by realpath so distinct
 // spellings of the same project share one manager (and its prune()), PLUS
 // the set of in-flight worker-run AbortControllers (see beginRun/endRun/
@@ -294,5 +303,59 @@ export function registerWorkerMethods(engine: Engine): void {
     await manager.remove(found, { deleteBranch: params.deleteBranch });
     engine.log(`worker.cleanup ${found.id} removed`);
     return { removed: true };
+  });
+
+  // The worktree lifecycle policy's DISCOVERY half (M5b Task 5): a thin
+  // projection of WorktreeManager.list() down to {path, branch} — everything
+  // a caller needs to decide what to keep vs sweep, without leaking `base`/
+  // `baseSha` (internal to diff()/diffStat()'s anchoring, not part of this
+  // surface's contract). Reads are always live off `git worktree list
+  // --porcelain` (via the cached manager) rather than any locally-tracked
+  // set, so this reflects reality even after an out-of-band `git worktree
+  // remove` or a crash that skipped engine.worker.cleanup entirely.
+  registerMethod(engine.dispatcher, "engine.worker.list", ListParamsSchema, async (params) => {
+    requireGitRepo(params.projectDir);
+    const manager = await engine.worker.getManager(params.projectDir);
+    const worktrees = await manager.list();
+    return { worktrees: worktrees.map((w) => ({ path: w.path, branch: w.branch })) };
+  });
+
+  // The worktree lifecycle policy's SWEEP half (M5b Task 5). The three
+  // producers of worker worktrees each have their own disposition already:
+  // engine.worker.run leaves success AND failure worktrees on disk on
+  // purpose (see worktree.ts's class doc comment); engine.orchestrate cleans
+  // up its OWN rejected/empty-diff attempts as it goes (orchestrate.ts's
+  // cleanupWorktree) and deliberately leaves the surviving
+  // approved/escalated worktree for engine.orchestrate.apply to read the
+  // diff from. What neither of those covers is a worktree abandoned by a
+  // crash (engine process killed mid-run, before any of the above cleanup
+  // logic got to run) — gc is that backstop: call it with `keep` set to
+  // whatever worktree paths are still legitimately in flight (e.g. the one
+  // orchestrate just returned as its result), and everything else this
+  // manager knows about gets removed, branch and all. Safe to call
+  // unconditionally after a session ends, or periodically — a project with
+  // zero worker worktrees is a no-op (`removed: []`).
+  registerMethod(engine.dispatcher, "engine.worker.gc", GcParamsSchema, async (params) => {
+    requireGitRepo(params.projectDir);
+    const manager = await engine.worker.getManager(params.projectDir);
+    const worktrees = await manager.list();
+    // Comparison is realpath-based (resolveProjectKey — the same helper
+    // WorkerService itself uses to key its manager cache), not raw string
+    // equality: a `keep` entry reached through a symlinked path spelling
+    // (or a relative one) must still match the manager's own, already
+    // realpath'd worktree.path (see WorktreeManager's constructor doc
+    // comment on why baseRepo — and therefore every path it returns — is
+    // realpath'd up front).
+    const keep = new Set((params.keep ?? []).map(resolveProjectKey));
+    const removed: string[] = [];
+    for (const worktree of worktrees) {
+      if (keep.has(resolveProjectKey(worktree.path))) continue;
+      await manager.remove(worktree, { deleteBranch: true });
+      removed.push(worktree.path);
+    }
+    if (removed.length > 0) {
+      engine.log(`worker.gc removed ${removed.length} worktree(s)`);
+    }
+    return { removed };
   });
 }

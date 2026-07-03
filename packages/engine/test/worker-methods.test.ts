@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { MockLanguageModelV4 } from "ai/test";
@@ -486,5 +486,138 @@ describe("engine.worker.run", () => {
     expect(res.error.message).toContain("aborted");
     // afterEach calls engine.close() again -- must be harmless once the
     // in-flight set this test emptied out is already empty.
+  });
+});
+
+// M5b Task 5: the worktree lifecycle policy's discovery (list) and sweep
+// (gc) surface. Neither method runs a worker loop -- worktrees are created
+// directly via WorktreeManager.create through the SAME cached manager
+// engine.worker.run itself uses (engine.worker.getManager), which is the
+// realistic path (worker.run's own worktree ends up in that same manager's
+// list()).
+describe("engine.worker.list", () => {
+  it("lists worktrees created via the cached WorktreeManager, mapped to {path, branch}", async () => {
+    dir = makeRepo();
+    engine = createEngine();
+
+    const manager = await engine.worker.getManager(dir);
+    const w1 = await manager.create("task-1");
+    const w2 = await manager.create("task-2");
+
+    const res = await call(engine, "engine.worker.list", { projectDir: dir });
+    expect(res.error).toBeUndefined();
+    expect(res.result.worktrees).toEqual(
+      expect.arrayContaining([
+        { path: w1.path, branch: w1.branch },
+        { path: w2.path, branch: w2.branch },
+      ]),
+    );
+    expect(res.result.worktrees).toHaveLength(2);
+  });
+
+  it("returns an empty list for a clean project with no worker worktrees", async () => {
+    dir = makeRepo();
+    engine = createEngine();
+
+    const res = await call(engine, "engine.worker.list", { projectDir: dir });
+    expect(res.error).toBeUndefined();
+    expect(res.result.worktrees).toEqual([]);
+  });
+
+  it("rejects a non-git projectDir with SERVER_ERROR", async () => {
+    dir = mkdtempSync(path.join(os.tmpdir(), "of-worker-list-nongit-"));
+    engine = createEngine();
+
+    const res = await call(engine, "engine.worker.list", { projectDir: dir });
+    expect(res.result).toBeUndefined();
+    expect(res.error.code).toBe(RpcErrorCodes.SERVER_ERROR);
+  });
+});
+
+describe("engine.worker.gc", () => {
+  it("removes all worker worktrees and deletes their branches when no keep list is given", async () => {
+    dir = makeRepo();
+    engine = createEngine();
+
+    const manager = await engine.worker.getManager(dir);
+    const w1 = await manager.create("task-1");
+    const w2 = await manager.create("task-2");
+
+    const res = await call(engine, "engine.worker.gc", { projectDir: dir });
+    expect(res.error).toBeUndefined();
+    expect(res.result.removed).toEqual(expect.arrayContaining([w1.path, w2.path]));
+    expect(res.result.removed).toHaveLength(2);
+
+    expect(existsSync(w1.path)).toBe(false);
+    expect(existsSync(w2.path)).toBe(false);
+    expect(git(dir, "branch", "--list", w1.branch)).toBe("");
+    expect(git(dir, "branch", "--list", w2.branch)).toBe("");
+  });
+
+  it("keeps exactly the worktree whose path is in `keep`, removing and branch-deleting the rest", async () => {
+    dir = makeRepo();
+    engine = createEngine();
+
+    const manager = await engine.worker.getManager(dir);
+    const w1 = await manager.create("task-1");
+    const survivor = await manager.create("task-2");
+
+    const res = await call(engine, "engine.worker.gc", { projectDir: dir, keep: [survivor.path] });
+    expect(res.error).toBeUndefined();
+    expect(res.result.removed).toEqual([w1.path]);
+
+    expect(existsSync(w1.path)).toBe(false);
+    expect(git(dir, "branch", "--list", w1.branch)).toBe("");
+
+    expect(existsSync(survivor.path)).toBe(true);
+    expect(git(dir, "branch", "--list", survivor.branch)).toContain(survivor.branch);
+  });
+
+  it("returns an empty removed list for a clean project with no worker worktrees", async () => {
+    dir = makeRepo();
+    engine = createEngine();
+
+    const res = await call(engine, "engine.worker.gc", { projectDir: dir });
+    expect(res.error).toBeUndefined();
+    expect(res.result.removed).toEqual([]);
+  });
+
+  it("matches a symlinked-spelling keep path via realpath comparison, not string equality", async () => {
+    dir = makeRepo();
+    engine = createEngine();
+
+    const manager = await engine.worker.getManager(dir);
+    const w1 = await manager.create("task-1");
+    const survivor = await manager.create("task-2");
+
+    // A symlink pointing AT the survivor's real worktree directory, under a
+    // completely different path -- a plain string/path.resolve comparison
+    // against `survivor.path` would never match this.
+    const symlinkPath = mkdtempSync(path.join(os.tmpdir(), "of-worker-gc-keep-"));
+    rmSync(symlinkPath, { recursive: true, force: true });
+    symlinkSync(survivor.path, symlinkPath, "dir");
+
+    try {
+      const res = await call(engine, "engine.worker.gc", { projectDir: dir, keep: [symlinkPath] });
+      expect(res.error).toBeUndefined();
+      expect(res.result.removed).toEqual([w1.path]);
+      expect(existsSync(survivor.path)).toBe(true);
+      expect(git(dir, "branch", "--list", survivor.branch)).toContain(survivor.branch);
+    } finally {
+      // unlinkSync, not rmSync: symlinkPath is a symlink POINTING AT a
+      // directory, and Node's rmSync (even non-recursive) stats through the
+      // symlink and refuses with EISDIR -- unlinkSync removes the symlink
+      // entry itself, leaving the real target (survivor.path) untouched.
+      unlinkSync(symlinkPath);
+    }
+  });
+
+  it("rejects a non-git projectDir with SERVER_ERROR", async () => {
+    dir = mkdtempSync(path.join(os.tmpdir(), "of-worker-gc-nongit-"));
+    engine = createEngine();
+
+    const res = await call(engine, "engine.worker.gc", { projectDir: dir });
+    expect(res.result).toBeUndefined();
+    expect(res.error.code).toBe(RpcErrorCodes.SERVER_ERROR);
   });
 });
