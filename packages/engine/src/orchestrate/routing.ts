@@ -12,7 +12,7 @@ import { RpcMethodError } from "../rpc/errors.js";
 // it would otherwise pick doesn't actually exist in this harness's
 // routing.taskClasses) — routeTask treats it identically to "class not
 // found": fall back to routing.defaults.agent.
-const DEFAULT_TASK_CLASS = "__default__";
+export const DEFAULT_TASK_CLASS = "__default__";
 
 export interface RoutedAgent {
   agent: AgentDef;
@@ -36,28 +36,33 @@ export interface RoutedAgent {
 // dropped a class degrades gracefully to the next rule (and ultimately to
 // `"__default__"`) instead of routing to a class that isn't there.
 //
-// Matching is case-insensitive substring matching against the raw task
-// string — deliberately crude; the harness's own taskClasses map is the
-// place to get more classes recognized, not this function.
+// Matching is case-insensitive word-boundary matching: the task is tokenized
+// into lowercase words (split on non-alphanumeric characters), and a keyword
+// only matches if it equals one of those tokens (whole-word match). This
+// prevents substring collisions like "Dockerfile" matching "doc" or "prefix"
+// matching "fix".
 export function classifyTask(task: string, routing: Routing): string {
   const lower = task.toLowerCase();
-  const mentions = (...keywords: string[]): boolean => keywords.some((kw) => lower.includes(kw));
+  // Tokenize into words: split on non-alphanumeric, filter empties
+  const tokens = lower.split(/[^a-z0-9]+/).filter((token) => token.length > 0);
+  const mentions = (...keywords: string[]): boolean =>
+    keywords.some((kw) => tokens.includes(kw));
   const firstConfiguredClass = (...candidates: string[]): string | undefined =>
     candidates.find((name) => name in routing.taskClasses);
 
-  if (mentions("test")) {
+  if (mentions("test", "tests")) {
     const cls = firstConfiguredClass("tests", "test");
     if (cls !== undefined) return cls;
   }
-  if (mentions("doc", "readme")) {
+  if (mentions("doc", "docs", "readme")) {
     const cls = firstConfiguredClass("docs", "documentation", "doc");
     if (cls !== undefined) return cls;
   }
-  if (mentions("refactor")) {
+  if (mentions("refactor", "refactoring")) {
     const cls = firstConfiguredClass("refactor", "refactoring");
     if (cls !== undefined) return cls;
   }
-  if (mentions("fix", "bug")) {
+  if (mentions("fix", "bug", "bugs")) {
     const cls = firstConfiguredClass("fix", "bugfix", "bug");
     if (cls !== undefined) return cls;
   }

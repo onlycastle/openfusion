@@ -152,6 +152,41 @@ describe("classifyTask", () => {
   it("is case-insensitive", () => {
     expect(classifyTask("WRITE A UNIT TEST", routing)).toBe("tests");
   });
+
+  describe("word-boundary regression tests (Issue: substring misroutes)", () => {
+    // Regression tests: substring matching was misrouting tasks by matching
+    // partial words. E.g., "Dockerfile" contains "doc" so it was classified
+    // as docs; "prefix" contains "fix" so it was classified as fix.
+    // Word-boundary matching ensures only whole-word tokens are matched.
+
+    it("does not misroute 'Dockerfile' to docs class (substring 'doc' should not match)", () => {
+      expect(classifyTask("update the Dockerfile networking config", routing)).toBe("codegen");
+    });
+
+    it("does not misroute 'prefix' to fix class (substring 'fix' should not match)", () => {
+      expect(classifyTask("rename the event prefix constant", routing)).toBe("codegen");
+    });
+
+    it("does not misroute 'contest' to tests class (substring 'test' should not match)", () => {
+      expect(classifyTask("update the contest leaderboard page", routing)).toBe("codegen");
+    });
+
+    it("still correctly matches 'test' word boundary", () => {
+      expect(classifyTask("write a unit test for the parser", routing)).toBe("tests");
+    });
+
+    it("still correctly matches 'readme' word boundary (case-insensitive)", () => {
+      expect(classifyTask("update the README", routing)).toBe("docs");
+    });
+
+    it("still correctly matches 'fix' word boundary", () => {
+      expect(classifyTask("fix the null pointer bug", routing)).toBe("fix");
+    });
+
+    it("still correctly matches 'bug' word boundary", () => {
+      expect(classifyTask("there is a bug in the system", routing)).toBe("fix");
+    });
+  });
 });
 
 describe("routeTask", () => {
