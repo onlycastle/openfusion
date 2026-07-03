@@ -277,6 +277,15 @@ export function registerFrontierMethods(engine: Engine): void {
       let seq = 0;
       let events = 0;
       let resultEvent: Extract<FrontierEvent, { type: "result" }> | undefined;
+      // Set by the timeout timer below, checked by the loop before every
+      // notify. Once true, the timeout's own "frontier prompt timed out"
+      // frontier.event (emitted by the timer callback, below) is meant to be
+      // terminal — without this guard, the loop promise keeps running in the
+      // background after Promise.race below has already settled (racing
+      // promises don't cancel each other), and would go on emitting
+      // frontier.event notifications — with reused, now-stale seq numbers —
+      // for any event the adapter still manages to produce after abort().
+      let timedOut = false;
 
       // Races the streamed-events loop against timeoutMs. On timeout: abort
       // the handle, emit one final frontier.event error notification, and
@@ -292,6 +301,7 @@ export function registerFrontierMethods(engine: Engine): void {
       // .unref() would let the process exit mid-abort
       const timeoutPromise = new Promise<never>((_resolve, reject) => {
         timer = setTimeout(() => {
+          timedOut = true;
           handle.abort();
           engine.notify("frontier.event", {
             sessionId: params.sessionId,
@@ -302,24 +312,41 @@ export function registerFrontierMethods(engine: Engine): void {
         }, timeoutMs);
       });
 
+      // M3 final review, Important 1: an adapter throw out of `handle.events`
+      // (no-auth errors, aborts, ...) is an OPERATIONAL frontier failure, not
+      // an engine bug — it must surface as SERVER_ERROR, not fall through to
+      // the dispatcher's generic INTERNAL_ERROR fallback. RpcMethodError
+      // instances (none currently thrown by an adapter, but the contract
+      // should hold) pass through untouched rather than being double-wrapped.
       const loopPromise = (async () => {
-        for await (const event of handle.events) {
-          engine.notify("frontier.event", { sessionId: params.sessionId, seq, event });
-          seq += 1;
-          events += 1;
-          if (event.type === "result") {
-            resultEvent = event;
+        try {
+          for await (const event of handle.events) {
+            if (timedOut) break;
+            engine.notify("frontier.event", { sessionId: params.sessionId, seq, event });
+            seq += 1;
+            events += 1;
+            if (event.type === "result") {
+              resultEvent = event;
+            }
           }
+        } catch (err) {
+          if (err instanceof RpcMethodError) throw err;
+          const message = err instanceof Error ? err.message : String(err);
+          throw new RpcMethodError(RpcErrorCodes.SERVER_ERROR, message);
         }
       })();
 
       try {
         await Promise.race([loopPromise, timeoutPromise]);
+      } catch (err) {
+        engine.log(`frontier.prompt ${params.sessionId} ${timedOut ? "timeout" : "error"}`);
+        throw err;
       } finally {
         clearTimeout(timer);
       }
 
       if (resultEvent === undefined) {
+        engine.log(`frontier.prompt ${params.sessionId} error`);
         throw new RpcMethodError(
           RpcErrorCodes.SERVER_ERROR,
           "session ended without a result event",
@@ -336,6 +363,7 @@ export function registerFrontierMethods(engine: Engine): void {
 
   registerMethod(engine.dispatcher, "engine.frontier.stop", SessionParamsSchema, async (params) => {
     const stopped = await engine.frontier.removeSession(params.sessionId);
+    engine.log(`frontier.stop ${params.sessionId}`);
     return { stopped };
   });
 

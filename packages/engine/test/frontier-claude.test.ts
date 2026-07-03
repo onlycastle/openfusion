@@ -199,11 +199,13 @@ describe("createClaudeAdapter", () => {
     const session = await adapter.createSession({ projectDir: "/repo", wikiMcpUrl: null, log: noopLog });
     await drain(session.prompt("hi"));
 
+    // M3 final review, Important 3: "Bash(git log*)" was dropped from the
+    // v1 allowlist — `git log --output=/path` writes a file, which breaches
+    // the read-only posture this list exists to enforce.
     expect(captured[0]?.allowedTools).toEqual([
       "Read",
       "Grep",
       "Glob",
-      "Bash(git log*)",
       "mcp__wiki__wiki_query",
       "mcp__wiki__wiki_map",
     ]);

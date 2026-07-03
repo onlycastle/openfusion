@@ -65,6 +65,21 @@ interface FakeAdapterOptions {
   // assert what the RPC handler forwards (or, post-fix, deliberately does
   // NOT forward) to the adapter — see the timeoutMs single-authority test.
   capturedOpts?: Array<{ timeoutMs?: number } | undefined>;
+  // When set, prompt()'s events generator throws this value (via `throw`,
+  // not `yield`) on its very first iteration instead of yielding any events.
+  // Mirrors a real adapter surfacing an operational failure mid-stream (a
+  // no-auth error, an aborted subprocess, ...) — accepts `unknown` rather
+  // than `Error` so the fake can also exercise a plain non-Error throw (e.g.
+  // `throw "string-boom"`), which JS permits and the M0-deferred gap never
+  // covered.
+  throwInEvents?: unknown;
+  // Only meaningful together with blockUntilAbort: after the aborted signal
+  // resolves, the generator yields this ONE extra event before ending,
+  // instead of ending immediately. Used to prove the RPC handler's
+  // post-timeout `timedOut` guard suppresses a frontier.event notification
+  // for an event the adapter manages to emit after abort() has already
+  // fired.
+  postAbortEvent?: FrontierEvent;
 }
 
 function makeFakeAdapter(opts: FakeAdapterOptions = {}): FrontierAdapter {
@@ -81,6 +96,12 @@ function makeFakeAdapter(opts: FakeAdapterOptions = {}): FrontierAdapter {
           opts.capturedOpts?.push(promptOpts);
           const callIndex = promptCalls;
           promptCalls += 1;
+          if (opts.throwInEvents !== undefined) {
+            async function* gen(): AsyncGenerator<FrontierEvent> {
+              throw opts.throwInEvents;
+            }
+            return { events: gen(), abort: () => {} };
+          }
           if (opts.blockUntilAbort === true && callIndex === 0) {
             let resolveAborted: () => void = () => {};
             const aborted = new Promise<void>((resolve) => {
@@ -88,6 +109,7 @@ function makeFakeAdapter(opts: FakeAdapterOptions = {}): FrontierAdapter {
             });
             async function* gen(): AsyncGenerator<FrontierEvent> {
               await aborted;
+              if (opts.postAbortEvent !== undefined) yield opts.postAbortEvent;
             }
             return {
               events: gen(),
@@ -360,7 +382,19 @@ describe("frontier RPC methods", () => {
     const notifications: Array<{ method: string; params: unknown }> = [];
     engine = createEngine({ notify: (method, params) => notifications.push({ method, params }) });
     const abortSpy = { count: 0 };
-    engine.frontier.registerAdapter(makeFakeAdapter({ blockUntilAbort: true, abortSpy }));
+    // M3 final review, Minor 4: give the fake ONE post-abort event attempt
+    // (yielded right after abort() resolves) to prove the loop's `timedOut`
+    // guard suppresses it — before this fix, the loop kept running in the
+    // background after the timeout RPC error had already been returned, and
+    // would still call engine.notify() for any event the adapter emitted
+    // after abort().
+    engine.frontier.registerAdapter(
+      makeFakeAdapter({
+        blockUntilAbort: true,
+        abortSpy,
+        postAbortEvent: { type: "text", text: "should-not-notify" },
+      }),
+    );
 
     const start = await call("engine.frontier.start", { projectDir: dir, attachWiki: false });
     const { sessionId } = start.result;
@@ -377,6 +411,15 @@ describe("frontier RPC methods", () => {
       type: "error",
       message: "frontier prompt timed out",
     });
+
+    // The timeout error notification must be terminal: no further
+    // frontier.event notifications may arrive, even though the fake's
+    // generator yields one more event after abort() resolves. Give the
+    // background loop promise a chance to run (it's not awaited by the RPC
+    // handler once the timeout race is settled) before asserting.
+    const countAfterTimeout = notifications.length;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(notifications.length).toBe(countAfterTimeout);
 
     // Session must still be usable for the next prompt — not torn down.
     const list = await call("engine.frontier.list", {});
@@ -497,6 +540,50 @@ describe("frontier RPC methods", () => {
   // RPC error even though the session entry was already deleted from our
   // bookkeeping. stop() should stay tolerant of a throwing close(), exactly
   // like close() already is.
+  // M3 final review, Important 1: the prompt handler's event-loop iteration
+  // (`for await (const event of handle.events)`) let any adapter throw
+  // (no-auth errors, aborts, ...) propagate straight past the RPC handler
+  // into the dispatcher's generic catch, which maps it to INTERNAL_ERROR
+  // (-32603) — indistinguishable from an actual engine bug in this codebase.
+  // These are operational frontier failures, not engine bugs, so they must
+  // surface as SERVER_ERROR (-32000) instead. Fix: wrap the loop so a
+  // non-RpcMethodError throw is rethrown as
+  // RpcMethodError(SERVER_ERROR, message); an RpcMethodError thrown by the
+  // adapter (none currently do, but the contract should hold) passes through
+  // untouched rather than being double-wrapped.
+  it("adapter events iterator throwing a plain Error surfaces as SERVER_ERROR, not INTERNAL_ERROR", async () => {
+    dir = makeRepo();
+    engine = createEngine();
+    engine.frontier.registerAdapter(makeFakeAdapter({ throwInEvents: new Error("engine exploded") }));
+
+    const start = await call("engine.frontier.start", { projectDir: dir, attachWiki: false });
+    const { sessionId } = start.result;
+
+    const res = await call("engine.frontier.prompt", { sessionId, text: "hi" });
+    expect(res.error?.code).toBe(RpcErrorCodes.SERVER_ERROR);
+    expect(res.error?.message).toBe("engine exploded");
+  });
+
+  // Closes the M0-deferred non-Error-throw gap: JS permits `throw` with any
+  // value, not just Error instances. Before this fix, EVERY throw from the
+  // loop (Error or not) fell through to the dispatcher's generic catch,
+  // which already does `err instanceof Error ? err.message : String(err)` —
+  // but the loop itself did no SERVER_ERROR wrapping at all, so this path
+  // was untested end-to-end for frontier.prompt specifically. Verifies the
+  // non-Error throw explicitly, with String coercion of the thrown value.
+  it("adapter events iterator throwing a non-Error value surfaces as SERVER_ERROR with String coercion", async () => {
+    dir = makeRepo();
+    engine = createEngine();
+    engine.frontier.registerAdapter(makeFakeAdapter({ throwInEvents: "string-boom" }));
+
+    const start = await call("engine.frontier.start", { projectDir: dir, attachWiki: false });
+    const { sessionId } = start.result;
+
+    const res = await call("engine.frontier.prompt", { sessionId, text: "hi" });
+    expect(res.error?.code).toBe(RpcErrorCodes.SERVER_ERROR);
+    expect(res.error?.message).toBe("string-boom");
+  });
+
   it("stop tolerates a throwing session close() — returns {stopped: true}, no RPC error", async () => {
     dir = makeRepo();
     engine = createEngine();

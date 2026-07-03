@@ -6,10 +6,28 @@
 // (see docs/research/2026-07-03-m3-api-verification.md, "Auth posture").
 //
 // v1 is READ-ONLY orchestration (answers/plans; no edits) per the M3 exit
-// criterion — write tools arrive with M5's worker/review loop. Enforced
-// twice, redundantly: `allowedTools` never lists an editing tool, and
-// `canUseTool` unconditionally denies (belt-and-suspenders against a future
-// allowedTools edit that forgets the second guard).
+// criterion — write tools arrive with M5's worker/review loop.
+//
+// TOOL-POLICY RECORD (M3 final review, Important 2 — corrects an earlier,
+// inverted version of this comment; M4 builds tool policy on this file, so
+// get it right here): `allowedTools` and `canUseTool` are NOT two redundant
+// guards over the same tools. They govern two DISJOINT sets, and
+// `allowedTools` wins outright for the tools it lists. The SDK's own runtime
+// warning (`CLAUDE_SDK_CAN_USE_TOOL_SHADOWED`) says so directly: entries in
+// `allowedTools` auto-approve the matching tool call BEFORE `canUseTool` is
+// ever consulted — per the SDK's documented permission order (hooks → deny
+// → ask → mode → allow → canUseTool), the `allow` step runs, and can
+// short-circuit, ahead of `canUseTool`.
+//
+// So: `allowedTools` (READ_ONLY_ALLOWED_TOOLS below) is the SOLE authority
+// for the tools it lists — `canUseTool` never even runs for them.
+// `canUseTool` only governs tools NOT in `allowedTools` — here, that's
+// "everything else", which is why it unconditionally denies.
+//
+// Consequence for future work: write-capability must ONLY ever be added via
+// `canUseTool` policy (e.g. a path-scoped allow for a specific write tool),
+// never by adding a tool to `allowedTools` — anything placed there bypasses
+// `canUseTool`'s policy entirely, by design of the SDK itself.
 import { randomUUID } from "node:crypto";
 import { query } from "@anthropic-ai/claude-agent-sdk";
 import type { ModelUsage, Query } from "@anthropic-ai/claude-agent-sdk";
@@ -17,14 +35,12 @@ import type { FrontierAdapter, FrontierEvent, FrontierPromptHandle, FrontierSess
 
 const CLAUDE_CODE_KIND = "claude-code";
 
-const READ_ONLY_ALLOWED_TOOLS = [
-  "Read",
-  "Grep",
-  "Glob",
-  "Bash(git log*)",
-  "mcp__wiki__wiki_query",
-  "mcp__wiki__wiki_map",
-];
+// "Bash(git log*)" was dropped from this list (M3 final review, Important
+// 3): `git log --output=/path` writes a file, and permission-scoping the
+// tool name doesn't scope its flags — that residual write capability
+// breaches the read-only v1 posture below just as surely as an unscoped
+// Bash entry would.
+const READ_ONLY_ALLOWED_TOOLS = ["Read", "Grep", "Glob", "mcp__wiki__wiki_query", "mcp__wiki__wiki_map"];
 
 type FrontierResultEvent = Extract<FrontierEvent, { type: "result" }>;
 
@@ -75,12 +91,21 @@ export function createClaudeAdapter(options: CreateClaudeAdapterOptions = {}): F
         id,
         projectDir,
 
-        prompt(text, opts): FrontierPromptHandle {
+        // M3 final review, Minor 7: this used to also arm its own
+        // `setTimeout(opts.timeoutMs)` here, racing a second independent
+        // timer against engine.frontier.prompt's RPC-level one over the same
+        // deadline (see methods.ts's timeoutPromise) — a review finding from
+        // an earlier round (see docs/superpowers/sdd/m3-task-4-report.md,
+        // "Fix 1 / Finding 1") already made the RPC layer the single
+        // timeout authority and stopped forwarding `opts.timeoutMs` into
+        // this call. That left this branch unreachable dead code; removed
+        // outright rather than left dormant. `opts` (still part of the
+        // FrontierSession contract in types.ts, for any other future caller)
+        // is consequently unused here and dropped from this implementation —
+        // TS structurally allows implementing a method with fewer parameters
+        // than its interface declares.
+        prompt(text): FrontierPromptHandle {
           const abortController = new AbortController();
-          let timer: ReturnType<typeof setTimeout> | undefined;
-          if (opts?.timeoutMs !== undefined) {
-            timer = setTimeout(() => abortController.abort(), opts.timeoutMs);
-          }
 
           const q = queryFn({
             prompt: text,
@@ -100,45 +125,41 @@ export function createClaudeAdapter(options: CreateClaudeAdapterOptions = {}): F
           activeQuery = q;
 
           async function* mapEvents(): AsyncGenerator<FrontierEvent> {
-            try {
-              // Prompt text and every streamed message body are user/model
-              // content — never pass them to `log`. Only lifecycle facts
-              // (nothing here) would be safe; this loop logs nothing.
-              for await (const message of q) {
-                if (message.type === "assistant") {
-                  for (const block of message.message.content) {
-                    if (block.type === "text") {
-                      yield { type: "text", text: block.text };
-                    } else if (block.type === "tool_use") {
-                      yield {
-                        type: "tool_use",
-                        name: block.name,
-                        summary: JSON.stringify(block.input).slice(0, 200),
-                      };
-                    }
+            // Prompt text and every streamed message body are user/model
+            // content — never pass them to `log`. Only lifecycle facts
+            // (nothing here) would be safe; this loop logs nothing.
+            for await (const message of q) {
+              if (message.type === "assistant") {
+                for (const block of message.message.content) {
+                  if (block.type === "text") {
+                    yield { type: "text", text: block.text };
+                  } else if (block.type === "tool_use") {
+                    yield {
+                      type: "tool_use",
+                      name: block.name,
+                      summary: JSON.stringify(block.input).slice(0, 200),
+                    };
                   }
-                } else if (message.type === "result") {
-                  resumeSessionId = message.session_id;
-                  const usage = {
-                    inputTokens: message.usage.input_tokens,
-                    outputTokens: message.usage.output_tokens,
-                    cacheReadTokens: message.usage.cache_read_input_tokens,
-                  };
-                  const resultEvent: FrontierResultEvent = {
-                    type: "result",
-                    resultText: message.subtype === "success" ? message.result : message.errors.join("; "),
-                    costUsd: message.total_cost_usd,
-                    usage,
-                    numTurns: message.num_turns,
-                    durationMs: message.duration_ms,
-                    engineSessionId: message.session_id,
-                  };
-                  onResult?.(resultEvent, dominantModel(message.modelUsage));
-                  yield resultEvent;
                 }
+              } else if (message.type === "result") {
+                resumeSessionId = message.session_id;
+                const usage = {
+                  inputTokens: message.usage.input_tokens,
+                  outputTokens: message.usage.output_tokens,
+                  cacheReadTokens: message.usage.cache_read_input_tokens,
+                };
+                const resultEvent: FrontierResultEvent = {
+                  type: "result",
+                  resultText: message.subtype === "success" ? message.result : message.errors.join("; "),
+                  costUsd: message.total_cost_usd,
+                  usage,
+                  numTurns: message.num_turns,
+                  durationMs: message.duration_ms,
+                  engineSessionId: message.session_id,
+                };
+                onResult?.(resultEvent, dominantModel(message.modelUsage));
+                yield resultEvent;
               }
-            } finally {
-              if (timer !== undefined) clearTimeout(timer);
             }
           }
 
