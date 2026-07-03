@@ -13,7 +13,8 @@
     }
   },
   "files": [
-    "dist"
+    "dist",
+    "queries"
   ],
   "scripts": {
     "build": "tsc -p tsconfig.json",
@@ -23,6 +24,8 @@
   "dependencies": {
     "@openfusion/shared": "workspace:*",
     "better-sqlite3": "^12.11.1",
+    "tree-sitter-wasms": "^0.1.13",
+    "web-tree-sitter": "^0.26.10",
     "zod": "^4.4.3"
   },
   "devDependencies": {
