@@ -44,6 +44,14 @@
 // (Finding 2) a target path is canonicalized (symlinks resolved) before the
 // containment check, so a pre-existing symlink inside a scope dir pointing
 // outside it can no longer be used to write out-of-scope.
+//
+// M4 task-1 re-review round 2 fixed a regression Finding 2's own realpath
+// introduced: realpathing each writeScope dir (createSession, below) without
+// re-checking the RESULT against projectDir meant a writeScope entry that
+// was ITSELF a symlink out of the project — lexically inside projectDir, so
+// it passed methods.ts's RPC-layer check untouched — got realpath'd into,
+// and fully trusted as, its external target. Every realpath'd scope dir is
+// now re-verified contained in the project root and dropped if it isn't.
 import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
@@ -187,14 +195,44 @@ export function createClaudeAdapter(options: CreateClaudeAdapterOptions = {}): F
       // stay bypassable if the scope dir ITSELF were a symlink). A scope dir
       // that doesn't exist yet falls back to its resolved (non-canonical)
       // path — there's nothing to realpath.
-      const writeScopeDirs = (toolPolicy?.writeScope ?? []).map((dir) => {
-        const resolved = path.resolve(projectDir, dir);
-        try {
-          return fs.realpathSync(resolved);
-        } catch {
-          return resolved;
-        }
-      });
+      //
+      // M4 task-1 re-review round 2 (Important regression): realpathing
+      // alone re-opened the escape Finding 1 closed at the RPC layer.
+      // methods.ts's engine.frontier.start validates only the LEXICAL
+      // resolution of each writeScope entry against projectDir — it can't
+      // see through a symlink from string paths alone. So a pre-existing
+      // symlink named as a writeScope entry (lexically inside projectDir)
+      // that actually points OUTSIDE projectDir sails through that RPC
+      // check, then gets realpath'd above into the external target and
+      // would be trusted outright as a scope dir — a deterministic full
+      // containment escape, worse than the bug Finding 2 closed. Every
+      // realpath'd scope dir is therefore re-verified contained in the
+      // canonical project root below (same isPathContained predicate used
+      // everywhere else in this file); one that fails is DROPPED rather
+      // than thrown — the RPC layer already validated the lexical form, so
+      // this is defense-in-depth at the trust boundary this adapter owns,
+      // not the primary gate — and contributes nothing to writeScopeDirs,
+      // so no write can ever land there.
+      let canonicalProjectDir: string;
+      try {
+        canonicalProjectDir = fs.realpathSync(projectDir);
+      } catch {
+        canonicalProjectDir = path.resolve(projectDir);
+      }
+      const writeScopeDirs = (toolPolicy?.writeScope ?? [])
+        .map((dir) => {
+          const resolved = path.resolve(projectDir, dir);
+          try {
+            return fs.realpathSync(resolved);
+          } catch {
+            return resolved;
+          }
+        })
+        .filter((realDir) => {
+          if (isPathContained(realDir, canonicalProjectDir)) return true;
+          log("writeScope entry dropped (resolves outside project after symlink resolution)");
+          return false;
+        });
 
       return {
         id,

@@ -483,6 +483,75 @@ describe("canUseTool symlink-canonical path checks (Finding 2)", () => {
   });
 });
 
+// M4 task-1 re-review round 2 (Important regression): Finding 2's fix (the
+// describe block above) realpath's each writeScope dir at session creation
+// so a scope dir that is ITSELF a symlink still resolves correctly — but it
+// never re-checked the realpath'd result against projectDir. methods.ts's
+// RPC-layer writeScope validation only checks the LEXICAL resolution of
+// each entry against projectDir (see methods.ts's engine.frontier.start) —
+// it has no way to see through a symlink from string paths alone. So a
+// pre-existing symlink named as a writeScope entry, lexically inside
+// projectDir, that actually points OUTSIDE projectDir sails through that
+// RPC check, then gets realpath'd here into the external target and
+// trusted outright as a scope dir — a deterministic full containment
+// escape, worse than the bug Finding 2 closed (that one needed a target
+// path to traverse a symlink; this one needs nothing but naming the
+// symlink itself as the writeScope entry). Closed by re-verifying
+// containment of each realpath'd scope dir against the canonical project
+// root and dropping any that fail it (see claude.ts's writeScopeDirs).
+describe("writeScope entry that is itself a symlink out of the project (review round 2 regression)", () => {
+  let tmpRoot: string;
+
+  afterEach(() => {
+    if (tmpRoot !== undefined) rmSync(tmpRoot, { recursive: true, force: true });
+  });
+
+  it("denies writes through a writeScope entry that symlinks outside the project (containment escape)", async () => {
+    tmpRoot = mkdtempSync(path.join(os.tmpdir(), "of-claude-scope-escape-"));
+    const projectDir = path.join(tmpRoot, "project");
+    const outsideDir = path.join(tmpRoot, "outside");
+    mkdirSync(projectDir, { recursive: true });
+    mkdirSync(outsideDir, { recursive: true });
+    symlinkSync(outsideDir, path.join(projectDir, "link-out"));
+
+    const { canUseTool } = await getCanUseTool(
+      { writeScope: [path.join(projectDir, "link-out")] },
+      projectDir,
+    );
+
+    const direct = await canUseTool(
+      "Write",
+      { file_path: path.join(outsideDir, "x.txt"), content: "x" },
+      signalOpts,
+    );
+    expect(direct.behavior).toBe("deny");
+
+    const throughLink = await canUseTool(
+      "Write",
+      { file_path: path.join(projectDir, "link-out", "x.txt"), content: "x" },
+      signalOpts,
+    );
+    expect(throughLink.behavior).toBe("deny");
+  });
+
+  it("still allows writes when the writeScope symlink points inside the project (legitimate case preserved)", async () => {
+    tmpRoot = mkdtempSync(path.join(os.tmpdir(), "of-claude-scope-escape-"));
+    const projectDir = path.join(tmpRoot, "project");
+    const realScopeDir = path.join(projectDir, "real-scope");
+    const scopeLink = path.join(projectDir, "scope-link");
+    mkdirSync(realScopeDir, { recursive: true });
+    symlinkSync(realScopeDir, scopeLink);
+
+    const { canUseTool } = await getCanUseTool({ writeScope: [scopeLink] }, projectDir);
+    const result = await canUseTool(
+      "Write",
+      { file_path: path.join(scopeLink, "note.txt"), content: "x" },
+      signalOpts,
+    );
+    expect(result).toEqual({ behavior: "allow" });
+  });
+});
+
 // M4 task-1: rate-limit visibility. SDKAssistantMessage carries an optional
 // top-level `error?: SDKAssistantMessageError` tag (inspected in
 // @anthropic-ai/claude-agent-sdk@0.3.198's sdk.d.ts) — a bare string enum
