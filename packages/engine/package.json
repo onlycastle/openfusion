@@ -21,7 +21,8 @@
     "test": "vitest run"
   },
   "dependencies": {
-    "@openfusion/shared": "workspace:*"
+    "@openfusion/shared": "workspace:*",
+    "zod": "^4.4.3"
   },
   "devDependencies": {
     "@types/node": "^22.20.0",

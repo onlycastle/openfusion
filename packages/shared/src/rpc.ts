@@ -8,9 +8,10 @@ export const RpcErrorCodes = {
   METHOD_NOT_FOUND: -32601,
   INVALID_PARAMS: -32602,
   INTERNAL_ERROR: -32603,
+  SERVER_ERROR: -32000,
 } as const;
 
-export const RpcIdSchema = z.union([z.string(), z.number()]);
+export const RpcIdSchema = z.union([z.string(), z.number().int()]);
 
 export const RpcRequestSchema = z.object({
   jsonrpc: z.literal(JSONRPC_VERSION),
