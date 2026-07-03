@@ -41,4 +41,14 @@ describe("renderRepoMap", () => {
     expect(map).toContain("src/file0.ts");
     expect(map).not.toContain("src/file49.ts");
   });
+
+  it("skips files with empty definedSymbols", () => {
+    const ranked = [
+      { file: "a.ts", score: 1, definedSymbols: [] },
+      { file: "b.ts", score: 0.5, definedSymbols: ["x"] },
+    ];
+    const map = renderRepoMap(ranked, 1000);
+    expect(map).toContain("b.ts");
+    expect(map).not.toContain("a.ts");
+  });
 });

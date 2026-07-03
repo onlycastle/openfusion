@@ -70,6 +70,7 @@ export function renderRepoMap(ranked: RankedFile[], budgetTokens: number): strin
   const lines: string[] = [];
   let used = 0;
   for (const r of ranked) {
+    if (r.definedSymbols.length === 0) continue;
     const block = `${r.file}\n  ${r.definedSymbols.slice(0, 8).join(", ")}\n`;
     if (used + block.length > budgetChars) break;
     lines.push(block);
