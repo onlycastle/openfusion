@@ -6,10 +6,17 @@ import type { Engine } from "../engine.js";
 import { RpcMethodError } from "../rpc/errors.js";
 import { registerMethod } from "../rpc/register.js";
 import { HarnessGenError } from "./driver.js";
+import { exportHarness } from "./exporters.js";
 import { generateHarness, type GenerateHarnessResult } from "./generate.js";
-import { HarnessValidationError, harnessStatus } from "./store.js";
+import { validateHarness } from "./schema.js";
+import { HarnessValidationError, harnessStatus, loadHarness } from "./store.js";
 
 const ProjectParamsSchema = z.object({ projectDir: z.string().min(1) });
+
+const ExportParamsSchema = z.object({
+  projectDir: z.string().min(1),
+  format: z.enum(["agents-md", "claude-subagents"]),
+});
 
 // Same canonicalization as wiki/methods.ts's own keyFor: resolve to a
 // symlink-free path so distinct spellings of the same directory share one
@@ -77,5 +84,31 @@ export function registerHarnessMethods(engine: Engine): void {
       }
       throw err;
     }
+  });
+
+  registerMethod(engine.dispatcher, "engine.harness.export", ExportParamsSchema, async ({ projectDir, format }) => {
+    let bundle;
+    try {
+      bundle = loadHarness(projectDir);
+    } catch (err) {
+      if (err instanceof HarnessValidationError) {
+        throw new RpcMethodError(RpcErrorCodes.SERVER_ERROR, err.message, { issues: err.issues });
+      }
+      throw err;
+    }
+    // Requires a harness that is both PRESENT (loadHarness didn't return
+    // null — something has been generated) and STRUCTURALLY VALID
+    // (validateHarness's cross-artifact referential check, the same gate
+    // generateHarness itself enforces at write time) — a bundle that loads
+    // but fails that check (e.g. hand-edited via the Harness editor into a
+    // dangling routing reference) is just as unexportable as no harness at
+    // all, so both collapse to the same error rather than exporters.ts
+    // having to defend against a referentially-broken bundle itself.
+    if (bundle === null || validateHarness(bundle).length > 0) {
+      throw new RpcMethodError(RpcErrorCodes.SERVER_ERROR, "no valid harness; run engine.harness.generate first");
+    }
+    const result = await exportHarness(projectDir, bundle, format);
+    engine.log(`harness.export ${projectDir} (${format}): ${result.files.length} files`);
+    return result;
   });
 }

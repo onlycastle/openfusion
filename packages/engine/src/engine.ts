@@ -80,6 +80,8 @@ export { generateHarness } from "./harness/generate.js";
 export type { GenerateHarnessResult } from "./harness/generate.js";
 export { HarnessGenError, promptForJson } from "./harness/driver.js";
 export type { DriverNotice, PromptForJsonOpts } from "./harness/driver.js";
+export { exportHarness } from "./harness/exporters.js";
+export type { HarnessExportFormat, HarnessExportResult } from "./harness/exporters.js";
 export {
   AgentDefSchema,
   HarnessBundleSchema,

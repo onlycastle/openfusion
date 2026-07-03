@@ -16,6 +16,33 @@ loopback HTTP (M1b complete). Frontier sessions now exist (M3) over a
 concurrency-bounded RPC protocol; the engine is auth-agnostic. OpenFusion
 never handles frontier credentials — the embedded official CLI uses whatever
 login you have configured; review your provider's terms for subscription use.
+Harness generation (M4) drives a frontier session over the indexed repo to
+produce a committable `.openfusion/` harness — an LLM wiki, a specialist
+agent roster, and a routing policy — gated by structural validation at
+generation time; the eval loop that flips `verification.evals` from
+`"pending"` to `"pass"` lands in M6. Two exporters turn that harness into
+interop artifacts other tools can read: an `AGENTS.md` project brief and
+per-agent Claude Code subagents under `.claude/agents/`.
+
+## Generating a harness
+
+    engine.harness.generate  { "projectDir": "/path/to/repo" }
+    engine.harness.status    { "projectDir": "/path/to/repo" }
+    engine.harness.export    { "projectDir": "/path/to/repo", "format": "agents-md" }
+    engine.harness.export    { "projectDir": "/path/to/repo", "format": "claude-subagents" }
+
+`generate` requires a git repository and a registered frontier adapter; it
+writes `.openfusion/` (wiki pages, agent defs, `routing.yaml`, `manifest.json`)
+and is safe to re-run — regeneration prunes only the artifacts the prior
+generation itself wrote, never hand-edited additions. `status` is a cheap,
+poll-friendly read of `manifest.json` alone. `export` requires a harness that
+is both present and structurally valid (else `SERVER_ERROR`); `agents-md`
+writes `<projectDir>/AGENTS.md`, `claude-subagents` writes one file per agent
+under `<projectDir>/.claude/agents/`. **Unverified until the eval gate
+passes**: every exported harness is marked `UNVERIFIED` in `AGENTS.md` (and
+the eval status is visible via `engine.harness.status`) until
+`manifest.verification.evals` reads `"pass"` — treat agent prompts and
+routing as unproven against your project until then.
 
 ## Engine Protocol
 
