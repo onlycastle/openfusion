@@ -1,5 +1,6 @@
 import { execFileSync } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -27,6 +28,25 @@ function makeRepo(): void {
 
 async function rpc(method: string, params: unknown): Promise<any> {
   return engine.dispatcher.dispatch({ jsonrpc: "2.0", id: 1, method, params });
+}
+
+// Opens a raw TCP connection to the MCP server's port and writes a POST
+// /mcp request whose body never completes (Content-Length: 999 but the
+// socket is never ended) — simulates a client that stalls mid-request.
+async function openStalledConnection(url: string): Promise<net.Socket> {
+  const parsed = new URL(url);
+  const socket = net.createConnection({
+    host: parsed.hostname,
+    port: Number(parsed.port),
+  });
+  await new Promise<void>((resolve, reject) => {
+    socket.once("connect", resolve);
+    socket.once("error", reject);
+  });
+  socket.write(
+    `POST ${parsed.pathname} HTTP/1.1\r\nHost: ${parsed.host}\r\nContent-Type: application/json\r\nContent-Length: 999\r\n\r\n{"partial":`,
+  );
+  return socket;
 }
 
 describe("MCP wiki server", () => {
@@ -71,4 +91,69 @@ describe("MCP wiki server", () => {
     const res = await rpc("engine.mcp.start", { projectDir: dir });
     expect(res.error?.code).toBe(-32000);
   });
+
+  // Finding 1: a stalled client used to wedge the shared McpServer — every
+  // later request would 500 forever once a prior transport was left
+  // attached. A fresh McpServer per request must keep later requests
+  // working even while an earlier one is stuck mid-body.
+  it("a stalled request does not wedge the server for later requests", async () => {
+    makeRepo();
+    await rpc("engine.wiki.build", { projectDir: dir });
+    const started = await rpc("engine.mcp.start", { projectDir: dir });
+    expect(started.error).toBeUndefined();
+    const url = started.result.url as string;
+
+    const socket = await openStalledConnection(url);
+    try {
+      const client = new Client({ name: "test-client", version: "0.0.1" });
+      await client.connect(new StreamableHTTPClientTransport(new URL(url)));
+      const tools = await client.listTools();
+      expect(tools.tools.map((t) => t.name).sort()).toEqual(["wiki_map", "wiki_query"]);
+      await client.close();
+    } finally {
+      socket.destroy();
+    }
+  }, 30_000);
+
+  // Finding 2: http.Server.close() waits indefinitely for open sockets, so
+  // a stalled connection could hang engine.mcp.stop (and Engine.close)
+  // forever. stop() must win a race against a stalled connection.
+  it("stop resolves even with a stalled connection open", async () => {
+    makeRepo();
+    await rpc("engine.wiki.build", { projectDir: dir });
+    const started = await rpc("engine.mcp.start", { projectDir: dir });
+    expect(started.error).toBeUndefined();
+    const url = started.result.url as string;
+
+    const socket = await openStalledConnection(url);
+    try {
+      const TIMEOUT = Symbol("timeout");
+      const winner = await Promise.race([
+        rpc("engine.mcp.stop", { projectDir: dir }),
+        new Promise((resolve) => setTimeout(() => resolve(TIMEOUT), 5_000)),
+      ]);
+      expect(winner).not.toBe(TIMEOUT);
+      expect((winner as { result: { stopped: boolean } }).result.stopped).toBe(true);
+    } finally {
+      socket.destroy();
+    }
+  }, 10_000);
+
+  // Finding 3: startMcpServer's check-then-await-then-set was a TOCTOU race
+  // — two concurrent engine.mcp.start calls for the same root could both
+  // pass the "no existing server" check and start two servers, leaking the
+  // first. Concurrent starts must coalesce onto one server.
+  it("concurrent start calls for the same root coalesce onto one server", async () => {
+    makeRepo();
+    await rpc("engine.wiki.build", { projectDir: dir });
+    const [a, b] = await Promise.all([
+      rpc("engine.mcp.start", { projectDir: dir }),
+      rpc("engine.mcp.start", { projectDir: dir }),
+    ]);
+    expect(a.error).toBeUndefined();
+    expect(b.error).toBeUndefined();
+    expect(a.result.url).toBe(b.result.url);
+    const status = await rpc("engine.mcp.status", {});
+    expect(status.result.servers).toHaveLength(1);
+  }, 30_000);
 });

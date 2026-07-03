@@ -38,6 +38,7 @@ export class WikiService {
   #parserPromise: Promise<WikiParser> | undefined;
   #building = new Map<string, Promise<IndexStats>>();
   #mcpServers = new Map<string, McpWikiServer>();
+  #mcpStarting = new Map<string, Promise<McpWikiServer>>();
 
   getStore(projectDir: string): WikiStore {
     const key = keyFor(projectDir);
@@ -55,13 +56,30 @@ export class WikiService {
 
   // Idempotent per resolved root: a second start() for the same project
   // returns the already-running server instead of binding a second port.
+  // Concurrent calls that arrive before the first start() has resolved
+  // coalesce onto the same in-flight promise (mirrors build()'s #building
+  // map below) — otherwise both would pass the "no existing server" check,
+  // each start its own server, and leak the first one.
   async startMcpServer(engine: Engine, projectDir: string): Promise<McpWikiServer> {
     const key = keyFor(projectDir);
     const existing = this.#mcpServers.get(key);
     if (existing !== undefined) return existing;
-    const server = await McpWikiServer.start(engine, key);
-    this.#mcpServers.set(key, server);
-    return server;
+
+    const inFlight = this.#mcpStarting.get(key);
+    if (inFlight !== undefined) return inFlight;
+
+    const promise = McpWikiServer.start(engine, key)
+      .then((server) => {
+        this.#mcpServers.set(key, server);
+        return server;
+      })
+      .finally(() => {
+        // Clear on both success and failure so a rejected start doesn't
+        // poison the map — the next call gets a fresh attempt.
+        this.#mcpStarting.delete(key);
+      });
+    this.#mcpStarting.set(key, promise);
+    return promise;
   }
 
   async stopMcpServer(projectDir: string): Promise<boolean> {

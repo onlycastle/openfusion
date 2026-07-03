@@ -12,6 +12,51 @@ async function readBody(req: IncomingMessage): Promise<unknown> {
   return raw.length > 0 ? (JSON.parse(raw) as unknown) : undefined;
 }
 
+// Builds a fresh McpServer with the wiki tools registered. Called once per
+// request (see the request handler below) rather than once per process:
+// the SDK's Protocol.connect() throws "Already connected to a transport..."
+// if a prior request's transport is still attached (e.g. a client that
+// never completes its body), which would otherwise wedge the shared server
+// and 500 every later request. A fresh McpServer per request is the SDK's
+// documented stateless pattern for this transport.
+function buildMcpServer(engine: Engine, projectDir: string): McpServer {
+  const mcp = new McpServer({ name: "openfusion-wiki", version: "0.0.1" });
+
+  mcp.registerTool(
+    "wiki_query",
+    {
+      description:
+        "Look up where a symbol is defined and referenced in this project's code index",
+      inputSchema: { symbol: z.string().min(1) },
+    },
+    ({ symbol }) => {
+      const store = engine.wiki.getStore(projectDir);
+      const payload = {
+        definitions: store.symbolsByName(symbol),
+        references: store.refsByName(symbol),
+      };
+      return { content: [{ type: "text", text: JSON.stringify(payload) }] };
+    },
+  );
+
+  mcp.registerTool(
+    "wiki_map",
+    {
+      description:
+        "Get a token-budgeted map of this project's most important files and symbols",
+      inputSchema: { budgetTokens: z.number().int().min(64).max(32768).optional() },
+    },
+    ({ budgetTokens }) => {
+      const store = engine.wiki.getStore(projectDir);
+      const ranked = rankFiles(store.allSymbols(), store.allRefs());
+      const map = renderRepoMap(ranked, budgetTokens ?? 1024);
+      return { content: [{ type: "text", text: map }] };
+    },
+  );
+
+  return mcp;
+}
+
 export class McpWikiServer {
   private constructor(
     readonly projectDir: string,
@@ -20,46 +65,13 @@ export class McpWikiServer {
   ) {}
 
   static async start(engine: Engine, projectDir: string): Promise<McpWikiServer> {
-    const mcp = new McpServer({ name: "openfusion-wiki", version: "0.0.1" });
-
-    mcp.registerTool(
-      "wiki_query",
-      {
-        description:
-          "Look up where a symbol is defined and referenced in this project's code index",
-        inputSchema: { symbol: z.string().min(1) },
-      },
-      ({ symbol }) => {
-        const store = engine.wiki.getStore(projectDir);
-        const payload = {
-          definitions: store.symbolsByName(symbol),
-          references: store.refsByName(symbol),
-        };
-        return { content: [{ type: "text", text: JSON.stringify(payload) }] };
-      },
-    );
-
-    mcp.registerTool(
-      "wiki_map",
-      {
-        description:
-          "Get a token-budgeted map of this project's most important files and symbols",
-        inputSchema: { budgetTokens: z.number().int().min(64).max(32768).optional() },
-      },
-      ({ budgetTokens }) => {
-        const store = engine.wiki.getStore(projectDir);
-        const ranked = rankFiles(store.allSymbols(), store.allRefs());
-        const map = renderRepoMap(ranked, budgetTokens ?? 1024);
-        return { content: [{ type: "text", text: map }] };
-      },
-    );
-
     const http = createServer((req: IncomingMessage, res: ServerResponse) => {
       void (async () => {
         if (req.method !== "POST" || req.url !== "/mcp") {
           res.writeHead(404).end();
           return;
         }
+        const mcp = buildMcpServer(engine, projectDir);
         const transport = new StreamableHTTPServerTransport({
           sessionIdGenerator: undefined,
         });
@@ -72,6 +84,11 @@ export class McpWikiServer {
       });
     });
 
+    // Bound so a stalled client (headers sent, body never completes) can't
+    // hold a connection — and this server's stop() — open indefinitely.
+    http.requestTimeout = 30_000;
+    http.headersTimeout = 15_000;
+
     await new Promise<void>((resolve) => http.listen(0, "127.0.0.1", resolve));
     const address = http.address();
     if (address === null || typeof address === "string") {
@@ -82,9 +99,14 @@ export class McpWikiServer {
     return new McpWikiServer(projectDir, url, http);
   }
 
+  // http.Server.close() alone waits indefinitely for open sockets to end on
+  // their own, so a stalled connection would hang this (and therefore
+  // Engine.close()) forever. closeAllConnections() forces every open
+  // socket closed immediately alongside the close() callback.
   async stop(): Promise<void> {
-    await new Promise<void>((resolve, reject) =>
-      this.http.close((err) => (err ? reject(err) : resolve())),
-    );
+    await new Promise<void>((resolve, reject) => {
+      this.http.close((err) => (err ? reject(err) : resolve()));
+      this.http.closeAllConnections();
+    });
   }
 }
