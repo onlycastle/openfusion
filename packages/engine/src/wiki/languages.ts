@@ -33,8 +33,8 @@ export const LANGUAGE_SPECS: LanguageSpec[] = [
 export function wasmDir(): string {
   const require = createRequire(import.meta.url);
   return path.join(
-    path.dirname(require.resolve("tree-sitter-wasms/package.json")),
-    "out",
+    path.dirname(require.resolve("@vscode/tree-sitter-wasm/package.json")),
+    "wasm",
   );
 }
 

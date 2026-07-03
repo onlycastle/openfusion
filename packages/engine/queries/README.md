@@ -1,4 +1,26 @@
 # Vendored tree-sitter tags queries (MIT)
 
-- typescript/tags.scm from tree-sitter/tree-sitter-typescript (v0.23.2), also used for .tsx
-- javascript/tags.scm from tree-sitter/tree-sitter-javascript (v0.23.1)
+- `typescript/tags.scm`: merge of `tree-sitter/tree-sitter-javascript` tags.scm
+  (v0.23.1) and `tree-sitter/tree-sitter-typescript` tags.scm (v0.23.2), also
+  used for `.tsx`. The merge is required because tree-sitter-typescript's
+  grammar is built on top of tree-sitter-javascript's grammar.js and reuses
+  its node types (`function_declaration`, `class_declaration`,
+  `method_definition`, `call_expression`, ...); upstream's typescript
+  tags.scm omits patterns for those shared node types and expects consumers
+  to merge in the base javascript tags query. Our loader (`parser.ts`) reads
+  one `tags.scm` file per `queryDir` and does not resolve `inherits:`
+  directives, so the merge is pre-baked into the vendored file, with a
+  comment marking where the typescript-specific additions begin.
+- `javascript/tags.scm` from `tree-sitter/tree-sitter-javascript` (v0.23.1),
+  unmodified.
+
+## Grammar wasm source
+
+Grammar wasm binaries are loaded at runtime from `@vscode/tree-sitter-wasm`
+(see `../src/wiki/languages.ts` `wasmDir()`), not from the queries above —
+the queries are grammar-version-sensitive only loosely (matched against node
+type names, not exact grammar builds) and remain compatible with the
+`@vscode/tree-sitter-wasm@0.3.1` typescript/tsx/javascript grammars (built
+from tree-sitter-typescript ^0.23.2 / tree-sitter-javascript ^0.25.0 per that
+package's `devDependencies`). See the engine package README / task report
+for why `tree-sitter-wasms` was dropped in favor of this package.

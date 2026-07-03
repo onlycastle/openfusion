@@ -15,92 +15,6 @@ interface LoadedLanguage {
   query: Query;
 }
 
-// Workaround for web-tree-sitter 0.26.10 / tree-sitter-wasms 0.1.13 incompatibility
-// tree-sitter-wasms has "dylink" (6 bytes) but web-tree-sitter expects "dylink.0" (8 bytes)
-// We rename "dylink" to "dylink.0" by expanding the buffer and updating size encodings
-async function patchWasmDylink(buffer: Buffer): Promise<Uint8Array> {
-  const src = new Uint8Array(buffer);
-
-  // Find the dylink custom section: 0x06 followed by "dylink"
-  let pos = 9; // After magic(4) + version(4) + section_id(1)
-
-  // Skip LEB128 size bytes
-  while (pos < src.length && (src[pos]! & 0x80)) pos++;
-  if (pos >= src.length) return src;
-  const sizeEndPos = pos + 1;
-
-  // Check for name length = 6
-  if (sizeEndPos >= src.length || src[sizeEndPos] !== 0x06) return src;
-
-  // Check for "dylink"
-  const nameStart = sizeEndPos + 1;
-  if (nameStart + 6 > src.length) return src;
-
-  let isDylink = true;
-  const dylink = [0x64, 0x79, 0x6c, 0x69, 0x6e, 0x6b]; // "dylink"
-  for (let i = 0; i < 6; i++) {
-    if (src[nameStart + i] !== dylink[i]) {
-      isDylink = false;
-      break;
-    }
-  }
-
-  if (!isDylink) return src;
-
-  // Found dylink! Now we need to:
-  // 1. Read the current section size (positions 9 to sizeEndPos-1)
-  // 2. Calculate new size = oldSize + 2 (adding 2 bytes to name)
-  // 3. Create new WASM with expanded name
-  // 4. Update the section size LEB128 encoding
-
-  // Read old size
-  let oldSize = 0, mult = 1;
-  for (let i = 9; i < sizeEndPos; i++) {
-    oldSize |= (src[i]! & 0x7f) * mult;
-    mult *= 128;
-  }
-
-  const newSize = oldSize + 2;
-  const oldDataStart = nameStart + 6;
-
-  // Encode newSize as LEB128
-  const newSizeBytes: number[] = [];
-  let sz = newSize;
-  do {
-    let byte = sz & 0x7f;
-    sz >>= 7;
-    if (sz !== 0) byte |= 0x80;
-    newSizeBytes.push(byte);
-  } while (sz !== 0);
-
-  // Build new buffer
-  const headerSize = 9;
-  const newNameSize = 8;
-  const dataSize = src.length - oldDataStart;
-  const newLen = headerSize + newSizeBytes.length + 1 + newNameSize + dataSize;
-  const result = new Uint8Array(newLen);
-
-  // Copy header (magic + version + section_id)
-  result.set(src.slice(0, 9), 0);
-
-  // Write new size
-  result.set(new Uint8Array(newSizeBytes), 9);
-  let writePos = 9 + newSizeBytes.length;
-
-  // Write new name length (8)
-  result[writePos++] = 0x08;
-
-  // Write new name ("dylink.0")
-  const newName = [0x64, 0x79, 0x6c, 0x69, 0x6e, 0x6b, 0x2e, 0x30]; // "dylink.0"
-  result.set(new Uint8Array(newName), writePos);
-  writePos += 8;
-
-  // Copy remaining data
-  result.set(src.slice(oldDataStart), writePos);
-
-  return result;
-}
-
 export class WikiParser {
   #parser: Parser;
   #byExtension: Map<string, LoadedLanguage>;
@@ -115,21 +29,8 @@ export class WikiParser {
     const parser = new Parser();
     const byExtension = new Map<string, LoadedLanguage>();
     const queryCache = new Map<string, string>();
-    const queries = new Map<string, Query>();
-
     for (const spec of LANGUAGE_SPECS) {
-      const wasmPath = path.join(wasmDir(), spec.wasmFile);
-      const wasmBuffer = await readFile(wasmPath);
-
-      let language: Language;
-      try {
-        const patchedWasm = await patchWasmDylink(wasmBuffer);
-        language = await Language.load(patchedWasm);
-      } catch (error) {
-        console.warn(`Warning: Could not load language for ${spec.id}: ${error instanceof Error ? error.message : String(error)}`);
-        continue;
-      }
-
+      const language = await Language.load(path.join(wasmDir(), spec.wasmFile));
       let tags = queryCache.get(spec.queryDir);
       if (tags === undefined) {
         tags = await readFile(
@@ -138,22 +39,10 @@ export class WikiParser {
         );
         queryCache.set(spec.queryDir, tags);
       }
-
-      let query: Query | null = null;
-      try {
-        query = new Query(language, tags);
-        queries.set(spec.id, query);
-      } catch (error) {
-        // Fallback for unsupported doc-directives
-        console.warn(`Warning: Could not load query for ${spec.id}: ${error instanceof Error ? error.message : String(error)}`);
-      }
-
-      if (query !== null) {
-        const loaded: LoadedLanguage = { id: spec.id, language, query };
-        for (const ext of spec.extensions) byExtension.set(ext, loaded);
-      }
+      const query = new Query(language, tags);
+      const loaded: LoadedLanguage = { id: spec.id, language, query };
+      for (const ext of spec.extensions) byExtension.set(ext, loaded);
     }
-
     return new WikiParser(parser, byExtension);
   }
 
