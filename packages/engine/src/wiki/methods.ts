@@ -94,6 +94,7 @@ export function registerWikiMethods(engine: Engine): void {
     "engine.wiki.query",
     QueryParamsSchema,
     ({ projectDir, symbol }) => {
+      requireHeadSha(projectDir);
       const store = engine.wiki.getStore(projectDir);
       return {
         definitions: store.symbolsByName(symbol),

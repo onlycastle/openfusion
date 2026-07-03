@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -67,5 +67,13 @@ describe("wiki RPC methods", () => {
     engine = createEngine();
     const res = await call("engine.wiki.query", { projectDir: dir });
     expect(res.error?.code).toBe(RpcErrorCodes.INVALID_PARAMS);
+  });
+
+  it("query returns SERVER_ERROR for a non-git directory (no cache side effect)", async () => {
+    dir = mkdtempSync(path.join(os.tmpdir(), "of-nogit-q-"));
+    engine = createEngine();
+    const res = await call("engine.wiki.query", { projectDir: dir, symbol: "x" });
+    expect(res.error?.code).toBe(RpcErrorCodes.SERVER_ERROR);
+    expect(existsSync(path.join(dir, ".openfusion"))).toBe(false);
   });
 });
