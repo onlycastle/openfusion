@@ -38,6 +38,12 @@ export class Engine {
   }
 
   async close(): Promise<void> {
+    // Abort any in-flight worker run FIRST: a wedged runWorkerLoop() call
+    // has no other way to unblock, and — since WorkerService.close() only
+    // fires the abort signal without waiting for the run's own promise to
+    // settle (see its own doc comment) — this is cheap to put ahead of the
+    // frontier/wiki teardown below rather than racing it against them.
+    await this.worker.close();
     // Frontier sessions may hold subprocesses that talk to the wiki's MCP
     // server, so tear them down before wiki.close() stops that server.
     await this.frontier.close();

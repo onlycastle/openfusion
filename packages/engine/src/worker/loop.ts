@@ -22,6 +22,12 @@ export interface WorkerRunInput {
   wikiDigest?: string;
   tools: Record<string, Tool>;
   maxSteps?: number;
+  // Forwarded straight through to generateText's own `abortSignal` (see the
+  // call below). The caller (engine.worker.run, worker/methods.ts) owns
+  // building this -- a combined timeoutMs deadline + a per-run
+  // AbortController it can fire on engine.close() -- runWorkerLoop itself
+  // stays deadline-agnostic and just plumbs whatever signal it's given.
+  abortSignal?: AbortSignal;
   onStep?: (s: { step: number; toolCalls: number; text?: string }) => void;
 }
 
@@ -79,6 +85,7 @@ export async function runWorkerLoop(input: WorkerRunInput): Promise<WorkerRunRes
     // isStepCount(1) and would never continue past a single tool call.
     stopWhen: isStepCount(maxSteps),
     prompt,
+    abortSignal: input.abortSignal,
     onStepEnd: (step: StepResult<Record<string, Tool>>) => {
       input.onStep?.({
         step: step.stepNumber,

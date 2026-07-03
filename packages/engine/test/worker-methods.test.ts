@@ -80,6 +80,33 @@ function makeWorkerMock(): MockLanguageModelV4 {
   });
 }
 
+// Simulates a hung model call: the returned promise never settles on its
+// own, mirroring a provider that accepted the request but never responds.
+// It DOES honor the `abortSignal` generateText attaches to the call so that
+// timeoutMs -> AbortSignal.timeout() -> runWorkerLoop's abortSignal plumbing
+// (and WorkerService.close()'s own abort) has something real to interrupt --
+// MockLanguageModelV4 does not race the signal against its doGenerate
+// implementation itself (mirrors worker-loop.test.ts's own makeHangingModel
+// and models-complete.test.ts's hungFetch, one layer up the stack).
+function makeHangingWorkerMock(): MockLanguageModelV4 {
+  return new MockLanguageModelV4({
+    // `return`ed (not `await`ed then fallen off the end) so the arrow
+    // function's inferred return type stays `Promise<never>` -- which IS
+    // structurally assignable to the doGenerate contract's
+    // `PromiseLike<LanguageModelV4GenerateResult>` (never being the bottom
+    // type), whereas `await`-then-implicit-return infers `Promise<void>`,
+    // which is not. See worker-loop.test.ts's own makeHangingModel.
+    doGenerate: async ({ abortSignal }) =>
+      new Promise<never>((_resolve, reject) => {
+        if (abortSignal?.aborted) {
+          reject(abortSignal.reason);
+          return;
+        }
+        abortSignal?.addEventListener("abort", () => reject(abortSignal.reason), { once: true });
+      }),
+  });
+}
+
 describe("engine.worker.run", () => {
   it("produces a reviewable diff, summary, usage, and priced cost, and leaves the worktree in place", async () => {
     dir = makeRepo();
@@ -373,5 +400,82 @@ describe("engine.worker.run", () => {
     const failedWorktreePath = failRes.error.data.worktree.path as string;
     // NOT auto-removed — the worktree is still on disk for inspection.
     expect(existsSync(failedWorktreePath)).toBe(true);
+  });
+
+  // M5b Task 0: a hung model call must not hang engine.worker.run forever.
+  // timeoutMs -> AbortSignal.timeout() -> runWorkerLoop's abortSignal fires
+  // the deadline; the existing failure path (SERVER_ERROR + worktree
+  // breadcrumb, no auto-remove) already does the right thing once the
+  // signal actually interrupts the loop.
+  it("timeoutMs: a hung model call fails fast as SERVER_ERROR containing \"timed out\", leaving the worktree in place", async () => {
+    dir = makeRepo();
+    engine = createEngine();
+    engine.models.registry.configure({ id: "p1", kind: "deepseek", apiKey: TEST_API_KEY });
+    engine.models.registry.setTestModel("p1", makeHangingWorkerMock());
+
+    const start = Date.now();
+    const res = await call(engine, "engine.worker.run", {
+      projectDir: dir,
+      task: "create hello.txt",
+      providerId: "p1",
+      model: "deepseek-v4-flash",
+      // 500ms is comfortably under the schema floor's neighbor (1000ms is
+      // the actual floor) -- picked small so this test itself stays fast
+      // while still asserting a real deadline fired, not an immediate
+      // synchronous rejection.
+      timeoutMs: 1000,
+    });
+    const elapsed = Date.now() - start;
+
+    expect(res.result).toBeUndefined();
+    expect(res.error.code).toBe(RpcErrorCodes.SERVER_ERROR);
+    expect(res.error.message).toContain("timed out");
+    // Bounds this as "fired the deadline", not "hung until some larger
+    // default/afterEach timeout saved us".
+    expect(elapsed).toBeLessThan(5000);
+
+    const worktreePath = res.error.data?.worktree?.path as string | undefined;
+    expect(typeof worktreePath).toBe("string");
+    expect(existsSync(worktreePath!)).toBe(true);
+  }, 10_000);
+
+  // M5b Task 0: engine.close() must abort an in-flight worker run rather
+  // than hang behind it (or wait out that run's own, possibly much larger,
+  // timeoutMs) -- this is what lets escalation/orchestration end a worker
+  // run on demand.
+  it("engine.close() aborts an in-flight run instead of hanging behind it", async () => {
+    dir = makeRepo();
+    engine = createEngine();
+    engine.models.registry.configure({ id: "p1", kind: "deepseek", apiKey: TEST_API_KEY });
+    engine.models.registry.setTestModel("p1", makeHangingWorkerMock());
+
+    const runPromise = call(engine, "engine.worker.run", {
+      projectDir: dir,
+      task: "create hello.txt",
+      providerId: "p1",
+      model: "deepseek-v4-flash",
+      // Deliberately large -- big enough that ONLY engine.close()'s abort
+      // (not this run's own timeoutMs) could plausibly end this run within
+      // the test's own bounds below.
+      timeoutMs: 1_800_000,
+    });
+
+    // Let the run actually start (worktree created, controller registered
+    // with WorkerService) before racing engine.close() against it.
+    await new Promise((r) => setTimeout(r, 50));
+
+    const closeStart = Date.now();
+    await engine.close();
+    const closeElapsed = Date.now() - closeStart;
+    // Bounds this as "close() aborted the run", not "close() happened to
+    // wait for something else".
+    expect(closeElapsed).toBeLessThan(2000);
+
+    const res = await runPromise;
+    expect(res.result).toBeUndefined();
+    expect(res.error.code).toBe(RpcErrorCodes.SERVER_ERROR);
+    expect(res.error.message).toContain("aborted");
+    // afterEach calls engine.close() again -- must be harmless once the
+    // in-flight set this test emptied out is already empty.
   });
 });

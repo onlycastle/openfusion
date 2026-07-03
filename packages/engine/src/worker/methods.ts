@@ -40,7 +40,16 @@ const RunParamsSchema = z.object({
   wikiDigest: z.string().optional(),
   maxSteps: z.number().int().min(1).max(100).optional(),
   bashTimeoutMs: z.number().int().min(1000).max(600000).optional(),
+  // Whole-run deadline for the model loop (NOT a per-tool-call budget --
+  // that's bashTimeoutMs above). Ceiling is 30 minutes, well above
+  // engine.models.complete's own 10-minute timeoutMs ceiling: a worker run
+  // is a full multi-step tool loop (up to maxSteps model calls), not one
+  // completion, so it legitimately needs more room. Mirrors the M3 pattern
+  // (models/methods.ts's own timeoutMs -> AbortSignal.timeout()).
+  timeoutMs: z.number().int().min(1000).max(1_800_000).optional(),
 });
+
+const DEFAULT_RUN_TIMEOUT_MS = 600_000;
 
 const CleanupParamsSchema = z.object({
   projectDir: z.string().min(1),
@@ -85,11 +94,15 @@ function kindOf(engine: Engine, providerId: string): string {
 }
 
 // Holds one WorktreeManager per base repo, cached by realpath so distinct
-// spellings of the same project share one manager (and its prune()).
-// Deliberately holds NOTHING else — see the module doc comment above.
+// spellings of the same project share one manager (and its prune()), PLUS
+// the set of in-flight worker-run AbortControllers (see beginRun/endRun/
+// close below) — the one piece of run-lifecycle state that has to live
+// somewhere Engine.close() can reach without engine.worker.run's handler
+// needing to expose anything beyond the RPC surface itself.
 export class WorkerService {
   #managers = new Map<string, WorktreeManager>();
   #pruned = new Set<string>();
+  #inFlight = new Set<AbortController>();
 
   // Lazily creates (and caches) the WorktreeManager for a project, running
   // WorktreeManager.prune() once per manager the first time it's needed —
@@ -108,6 +121,32 @@ export class WorkerService {
       await manager.prune();
     }
     return manager;
+  }
+
+  // Registers a run's own AbortController as in-flight, right before
+  // engine.worker.run starts its runWorkerLoop() call, so close() below has
+  // something to abort if the engine shuts down mid-run. Paired with
+  // endRun() in that handler's `finally` — every beginRun() MUST have a
+  // matching endRun(), successful run or not, or this set would leak
+  // controllers for the life of the process.
+  beginRun(controller: AbortController): void {
+    this.#inFlight.add(controller);
+  }
+
+  endRun(controller: AbortController): void {
+    this.#inFlight.delete(controller);
+  }
+
+  // Aborts every in-flight worker run so Engine.close() can never hang
+  // behind a wedged one (a stuck model call has no other way to be
+  // interrupted). Deliberately does NOT wait for those runs to actually
+  // settle — each run's own try/finally in engine.worker.run reacts to the
+  // abort and does its own cleanup (including calling endRun above); this
+  // method's only job is to fire the signal.
+  async close(): Promise<void> {
+    for (const controller of this.#inFlight) {
+      controller.abort(new Error("worker run aborted"));
+    }
   }
 }
 
@@ -161,6 +200,28 @@ export function registerWorkerMethods(engine: Engine): void {
       },
     });
 
+    // Two independent abort sources, combined into the ONE signal
+    // runWorkerLoop actually gets: `timeoutSignal` fires on its own after
+    // timeoutMs (a wedged model call that never errors on its own),
+    // `controller` is fired by WorkerService.close() (Engine.close() mid-run
+    // — see WorkerService.beginRun/endRun/close). AbortSignal.any is stable
+    // since Node 20.3 (this repo's floor is >=22) and confirmed to typecheck
+    // against this repo's tsconfig (no DOM lib override needed) — no manual
+    // fallback combinator is carried here.
+    //
+    // Kept as separate named signals (rather than only ever consulting the
+    // combined one) so the catch block below can ask "was it timeoutSignal
+    // or controller that actually fired?" by checking each source's OWN
+    // `.aborted` flag directly — deterministic regardless of how the AI SDK
+    // or a given provider adapter happens to wrap/rewrap the thrown error
+    // (mirrors models/methods.ts's isTimeoutError doc comment on why that
+    // module has to parse error shape instead: it only has ONE signal to
+    // reason about, we have two known sources here).
+    const timeoutMs = params.timeoutMs ?? DEFAULT_RUN_TIMEOUT_MS;
+    const timeoutSignal = AbortSignal.timeout(timeoutMs);
+    const controller = new AbortController();
+    engine.worker.beginRun(controller);
+
     try {
       const loopResult = await runWorkerLoop({
         model: languageModel,
@@ -168,6 +229,7 @@ export function registerWorkerMethods(engine: Engine): void {
         wikiDigest: params.wikiDigest,
         tools,
         maxSteps: params.maxSteps,
+        abortSignal: AbortSignal.any([timeoutSignal, controller.signal]),
         // Step progress is likewise structured + truncated (loop.ts's own
         // ON_STEP_TEXT_TRUNCATE_CHARS) — never the model's full raw output.
         onStep: (s) => {
@@ -226,10 +288,29 @@ export function registerWorkerMethods(engine: Engine): void {
       // class-level doc comment ("never call remove() from a failure
       // path"). The path is carried in `data` so the caller can inspect, or
       // manually clean up the partial work via engine.worker.cleanup.
-      const message = err instanceof Error ? err.message : String(err);
+      const rawMessage = err instanceof Error ? err.message : String(err);
+      // Distinguishes WHY the run was cut short, checking each abort
+      // source's own `.aborted` flag (set the instant that signal fires,
+      // independent of whatever the AI SDK/provider adapter did to the
+      // thrown error) rather than parsing `err`'s shape — see the abort
+      // signal setup above for why that's safe to do here. `timeoutSignal`
+      // is checked first: if BOTH happened to be aborted (a close raced a
+      // timeout), "timed out" is the more informative half of that story.
+      const message = timeoutSignal.aborted
+        ? `worker run timed out after ${timeoutMs}ms: ${rawMessage}`
+        : controller.signal.aborted
+          ? `worker run aborted: ${rawMessage}`
+          : rawMessage;
       throw new RpcMethodError(RpcErrorCodes.SERVER_ERROR, `worker run failed: ${message}`, {
         worktree: { path: worktree.path, branch: worktree.branch },
       });
+    } finally {
+      // Matches beginRun() above — every registered controller must be
+      // unregistered once this run is done, success or failure, or
+      // WorkerService's in-flight set would leak controllers for the life
+      // of the process (and re-abort an already-finished run's controller
+      // on the next engine.close()).
+      engine.worker.endRun(controller);
     }
   });
 
