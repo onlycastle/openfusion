@@ -1,6 +1,17 @@
 import type { RpcDispatcher } from "./dispatcher.js";
 import { encodeNdjson, type DecodedLine } from "./ndjson.js";
 
+/**
+ * StdioPipeline: JSON-RPC 2.0 over stdio in ndjson encoding.
+ *
+ * Concurrency ownership: the client owns bounding of in-flight expensive calls
+ * (engine.models.complete, engine.frontier.prompt). The pipeline itself is
+ * intentionally uncapped — responses flow in completion order, allowing parallel
+ * requests to finish out-of-order while the dispatcher batches independently.
+ * This design (M2 final review) trades unbounded memory for simpler state
+ * management and natural task-parallelism (e.g., multiple model completions
+ * starting and finishing at different rates within a single frontier session).
+ */
 export class StdioPipeline {
   #dispatcher: RpcDispatcher;
   #write: (line: string) => void;
