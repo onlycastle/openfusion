@@ -28,13 +28,14 @@ export interface ReviewDiffInput {
 }
 
 export interface ReviewDiffOpts {
-  // Reserved for a future per-call deadline on the review turn. promptForJson
-  // (src/harness/driver.ts) does not currently accept a per-call timeout —
-  // it calls session.prompt(text) with no opts — so there is nothing to
-  // thread this through to yet. Kept on the signature per the M5b Task 3
-  // brief so callers can start passing it now; wiring an actual timeout
-  // (e.g. a race against the session, or extending promptForJson's opts) is
-  // left to M5b Task 4's orchestrator, which owns overall run deadlines.
+  // Per-attempt deadline for the review turn — threaded straight through to
+  // promptForJson's own opts.timeoutMs (src/harness/driver.ts), which passes
+  // it to session.prompt(text, { timeoutMs }) on EACH attempt. See that
+  // module's own doc comment for why this is a PER-ATTEMPT bound (not a
+  // whole-call one): a validation-feedback retry gets its own fresh
+  // deadline, so total worst case is `(1 + retries) * timeoutMs`. Wired by
+  // M5b Task 4's orchestrator, which owns overall run deadlines and is the
+  // first caller to actually pass a value here.
   timeoutMs?: number;
 }
 
@@ -88,9 +89,12 @@ function buildReviewPrompt(input: ReviewDiffInput): string {
 export async function reviewDiff(
   session: FrontierSession,
   input: ReviewDiffInput,
-  _opts: ReviewDiffOpts = {},
+  opts: ReviewDiffOpts = {},
 ): Promise<{ verdict: ReviewVerdict; costUsd: number | null }> {
   const prompt = buildReviewPrompt(input);
-  const result = await promptForJson(session, prompt, ReviewVerdictSchema, { stage: "review" });
+  const result = await promptForJson(session, prompt, ReviewVerdictSchema, {
+    stage: "review",
+    timeoutMs: opts.timeoutMs,
+  });
   return { verdict: result.value, costUsd: result.costUsd };
 }

@@ -315,6 +315,57 @@ describe("promptForJson — error events", () => {
   });
 });
 
+describe("promptForJson — timeoutMs threading (M5b Task 4)", () => {
+  it("threads opts.timeoutMs to session.prompt on every attempt", async () => {
+    const capturedOpts: Array<{ timeoutMs?: number } | undefined> = [];
+    const session: FrontierSession = {
+      id: "fake-session",
+      projectDir: "/fake/project",
+      prompt(text: string, promptOpts): FrontierPromptHandle {
+        capturedOpts.push(promptOpts);
+        async function* gen(): AsyncGenerator<FrontierEvent> {
+          yield textEvent('```json\n{"a": "nope"}\n```');
+          yield resultEvent();
+        }
+        return { events: gen(), abort: () => {} };
+      },
+      async close(): Promise<void> {},
+    };
+
+    await expect(
+      promptForJson(session, "p", PointSchema, { retries: 1, timeoutMs: 5000 }),
+    ).rejects.toBeInstanceOf(HarnessGenError);
+
+    // Both attempts (the first prompt AND the validation-retry re-prompt)
+    // must receive the SAME per-attempt timeoutMs — see PromptForJsonOpts's
+    // doc comment for why this is per-attempt rather than a shared budget.
+    expect(capturedOpts).toHaveLength(2);
+    expect(capturedOpts[0]).toEqual({ timeoutMs: 5000 });
+    expect(capturedOpts[1]).toEqual({ timeoutMs: 5000 });
+  });
+
+  it("omitting timeoutMs forwards { timeoutMs: undefined } — matches pre-Task-4 callers", async () => {
+    const capturedOpts: Array<{ timeoutMs?: number } | undefined> = [];
+    const session: FrontierSession = {
+      id: "fake-session",
+      projectDir: "/fake/project",
+      prompt(text: string, promptOpts): FrontierPromptHandle {
+        capturedOpts.push(promptOpts);
+        async function* gen(): AsyncGenerator<FrontierEvent> {
+          yield textEvent('```json\n{"a": 1}\n```');
+          yield resultEvent();
+        }
+        return { events: gen(), abort: () => {} };
+      },
+      async close(): Promise<void> {},
+    };
+
+    await promptForJson(session, "p", PointSchema);
+
+    expect(capturedOpts).toEqual([{ timeoutMs: undefined }]);
+  });
+});
+
 describe("promptForJson — json fence extraction", () => {
   it("does not extract a json5 fence as a json block (falls back to whole-text)", async () => {
     const { session } = makeScriptedSession([

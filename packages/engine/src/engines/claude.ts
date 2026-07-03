@@ -142,14 +142,18 @@ export interface CreateClaudeAdapterOptions {
   /** DI for tests; defaults to the real SDK's query(). */
   queryFn?: typeof query;
   /**
-   * Invoked once per `result` message with the mapped FrontierEvent and the
+   * Invoked once per `result` message with the mapped FrontierEvent, the
    * "dominant" model from the SDK's per-model usage breakdown (see
-   * dominantModel below). The adapter itself stays meter-agnostic —
+   * dominantModel below), and the session's own `resultLabel` (opaque —
+   * see createSession's opts in ./types.ts) if one was supplied when the
+   * session was created. The adapter itself stays meter-agnostic —
    * registerFrontierMethods wires this to engine.models' CostMeter (kind
    * "frontier-claude") when it registers the default adapter, so this file
-   * never imports the models layer.
+   * never imports the models layer; `resultLabel` is passed through
+   * untouched purely so that wiring can distinguish which purpose (e.g.
+   * M5b Task 4's review vs escalate) produced a given result.
    */
-  onResult?: (result: FrontierResultEvent, model: string) => void;
+  onResult?: (result: FrontierResultEvent, model: string, resultLabel?: string) => void;
 }
 
 // modelUsage can hold more than one model when a fallback fires mid-turn,
@@ -176,7 +180,7 @@ export function createClaudeAdapter(options: CreateClaudeAdapterOptions = {}): F
   return {
     kind: CLAUDE_CODE_KIND,
 
-    async createSession({ projectDir, wikiMcpUrl, log, toolPolicy }): Promise<FrontierSession> {
+    async createSession({ projectDir, wikiMcpUrl, log, toolPolicy, resultLabel }): Promise<FrontierSession> {
       const id = randomUUID();
       let resumeSessionId: string | null = null;
       let activeQuery: Query | null = null;
@@ -350,7 +354,7 @@ export function createClaudeAdapter(options: CreateClaudeAdapterOptions = {}): F
                   durationMs: message.duration_ms,
                   engineSessionId: message.session_id,
                 };
-                onResult?.(resultEvent, dominantModel(message.modelUsage));
+                onResult?.(resultEvent, dominantModel(message.modelUsage), resultLabel);
                 yield resultEvent;
               }
             }

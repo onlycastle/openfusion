@@ -213,7 +213,7 @@ export function registerFrontierMethods(engine: Engine): void {
   // the adapter's own result-mapping, one record per `result` message.
   engine.frontier.registerAdapter(
     createClaudeAdapter({
-      onResult: (result, model) => {
+      onResult: (result, model, resultLabel) => {
         engine.models.meter.record({
           providerId: "claude-code",
           kind: "frontier-claude",
@@ -221,11 +221,17 @@ export function registerFrontierMethods(engine: Engine): void {
           usage: result.usage,
           costUsd: result.costUsd,
           at: Date.now(),
-          // Default for now — Task 4's orchestrator distinguishes a
-          // frontier call driving REVIEW from one driving ESCALATION and
-          // will pass the more specific source through; every frontier
-          // record is "frontier-review" until that plumbing lands.
-          source: "frontier-review",
+          // M5b Task 4: the orchestrator opens sessions directly off this
+          // SAME registered adapter (engine.frontier.getAdapter) for two
+          // distinct purposes — a read-only REVIEW session and a
+          // write-scoped ESCALATION session — and tags each session's
+          // createSession call with `resultLabel: "frontier-review"` /
+          // `"frontier-escalate"` (types.ts) so results from the two are
+          // metered under distinct sources. Every OTHER caller of this
+          // adapter (engine.frontier.start, generateHarness) never sets
+          // resultLabel, so `undefined` here still defaults to
+          // "frontier-review", preserving this hook's pre-Task-4 behavior.
+          source: resultLabel === "frontier-escalate" ? "frontier-escalate" : "frontier-review",
         });
       },
     }),

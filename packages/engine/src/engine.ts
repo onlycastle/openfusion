@@ -3,6 +3,7 @@ import { FrontierService, registerFrontierMethods } from "./engines/methods.js";
 import { HarnessService, registerHarnessMethods } from "./harness/methods.js";
 import { registerCoreMethods } from "./methods.js";
 import { ModelsService, registerModelsMethods } from "./models/methods.js";
+import { OrchestrateService, registerOrchestrateMethods } from "./orchestrate/methods.js";
 import { WikiService, registerWikiMethods } from "./wiki/methods.js";
 import { WorkerService, registerWorkerMethods } from "./worker/methods.js";
 
@@ -25,6 +26,7 @@ export class Engine {
   readonly frontier = new FrontierService();
   readonly harness = new HarnessService();
   readonly worker = new WorkerService();
+  readonly orchestrate = new OrchestrateService();
 
   constructor(options: EngineOptions = {}) {
     this.log = options.log ?? (() => {});
@@ -35,6 +37,15 @@ export class Engine {
     registerFrontierMethods(this);
     registerHarnessMethods(this);
     registerWorkerMethods(this);
+    // Registered LAST: engine.orchestrate composes engine.worker.run through
+    // the dispatcher itself (see orchestrate/orchestrate.ts's header
+    // comment), so every method it might call must already be registered by
+    // the time a caller can reach engine.orchestrate. Registration order
+    // doesn't actually gate that (dispatch() resolves the target handler at
+    // CALL time, not registration time), but this ordering keeps the
+    // constructor's own reading order matching the real dependency
+    // direction.
+    registerOrchestrateMethods(this);
   }
 
   async close(): Promise<void> {
@@ -115,3 +126,10 @@ export { createWorkerTools } from "./worker/tools.js";
 export type { ToolContext } from "./worker/tools.js";
 export { runWorkerLoop } from "./worker/loop.js";
 export type { WorkerRunInput, WorkerRunResult } from "./worker/loop.js";
+export { classifyTask, routeTask, DEFAULT_TASK_CLASS } from "./orchestrate/routing.js";
+export type { RoutedAgent } from "./orchestrate/routing.js";
+export { ReviewVerdictSchema, reviewDiff } from "./orchestrate/review.js";
+export type { ReviewVerdict, ReviewDiffInput, ReviewDiffOpts } from "./orchestrate/review.js";
+export { OrchestrateService, registerOrchestrateMethods } from "./orchestrate/methods.js";
+export { orchestrate } from "./orchestrate/orchestrate.js";
+export type { OrchestrateParams, OrchestrateAttempt, OrchestrateResult } from "./orchestrate/orchestrate.js";

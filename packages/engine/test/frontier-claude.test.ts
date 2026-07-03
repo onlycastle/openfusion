@@ -281,6 +281,89 @@ describe("createClaudeAdapter", () => {
     });
   });
 
+  // M5b Task 4: createSession's opts gained an opaque `resultLabel`
+  // (./types.ts) forwarded verbatim to onResult's third argument, so a
+  // caller multiplexing ONE registered adapter across different purposes
+  // (the orchestrator's review vs escalate sessions) can tag which purpose
+  // produced a given result without the adapter itself knowing what the
+  // label means.
+  it("forwards createSession's resultLabel to onResult's third argument", async () => {
+    const { queryFn } = makeQueryFn([[RESULT_MSG]]);
+    const seen: Array<string | undefined> = [];
+    const adapter = createClaudeAdapter({
+      queryFn,
+      onResult: (_result, _model, resultLabel) => {
+        seen.push(resultLabel);
+      },
+    });
+    const session = await adapter.createSession({
+      projectDir: "/repo",
+      wikiMcpUrl: null,
+      log: noopLog,
+      resultLabel: "frontier-escalate",
+    });
+    await drain(session.prompt("hi"));
+
+    expect(seen).toEqual(["frontier-escalate"]);
+  });
+
+  it("omitting resultLabel forwards undefined to onResult's third argument", async () => {
+    const { queryFn } = makeQueryFn([[RESULT_MSG]]);
+    const seen: Array<string | undefined> = [];
+    const adapter = createClaudeAdapter({
+      queryFn,
+      onResult: (_result, _model, resultLabel) => {
+        seen.push(resultLabel);
+      },
+    });
+    const session = await adapter.createSession({ projectDir: "/repo", wikiMcpUrl: null, log: noopLog });
+    await drain(session.prompt("hi"));
+
+    expect(seen).toEqual([undefined]);
+  });
+
+  // Mirrors engines/methods.ts's real onResult wiring (registerFrontierMethods)
+  // exactly the same way the "kind frontier-claude" test above mirrors its
+  // default "frontier-review" tagging — that closure can't be exercised
+  // directly here (it always drives the real SDK's query(), never a fake
+  // queryFn), so its mapping logic (resultLabel "frontier-escalate" ->
+  // source "frontier-escalate", anything else -> "frontier-review") is
+  // asserted against the same onResult -> meter.record call shape.
+  it("M5b Task 4: resultLabel 'frontier-escalate' maps to source 'frontier-escalate' (mirrors the real wiring)", async () => {
+    const { queryFn } = makeQueryFn([[RESULT_MSG]]);
+    const meter = new CostMeter();
+    const adapter = createClaudeAdapter({
+      queryFn,
+      onResult: (result, model, resultLabel) => {
+        meter.record({
+          providerId: "claude-code",
+          kind: "frontier-claude",
+          model,
+          usage: result.usage,
+          costUsd: result.costUsd,
+          at: Date.now(),
+          source: resultLabel === "frontier-escalate" ? "frontier-escalate" : "frontier-review",
+        });
+      },
+    });
+    const session = await adapter.createSession({
+      projectDir: "/repo",
+      wikiMcpUrl: null,
+      log: noopLog,
+      resultLabel: "frontier-escalate",
+    });
+    await drain(session.prompt("hi"));
+
+    const totals = meter.totals();
+    expect(totals.bySource["frontier-escalate"]).toEqual({
+      calls: 1,
+      inputTokens: 1000,
+      outputTokens: 200,
+      costUsd: 0.12,
+    });
+    expect(totals.bySource["frontier-review"]).toBeUndefined();
+  });
+
   it("abort() aborts the AbortController passed to queryFn", async () => {
     const { queryFn, captured } = makeQueryFn([[RESULT_MSG]]);
     const adapter = createClaudeAdapter({ queryFn });

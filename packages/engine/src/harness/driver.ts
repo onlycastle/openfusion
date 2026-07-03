@@ -54,6 +54,20 @@ export interface PromptForJsonOpts {
   // class comment above. promptForJson never inspects or derives this
   // itself.
   stage?: string;
+  // Per-ATTEMPT deadline, threaded verbatim into
+  // `session.prompt(currentPrompt, { timeoutMs })` on EACH attempt (M5b
+  // Task 4) — NOT a whole-call budget: a fresh attempt (including any
+  // validation-feedback retry) gets its own full `timeoutMs`, so the total
+  // worst case across every attempt is `(1 + retries) * timeoutMs`. This is
+  // deliberately simple (no cross-attempt budget tracking) — acceptable
+  // because the attempt COUNT is already bounded by `retries`, and matches
+  // the M5b Task 4 brief's explicit call: per-attempt semantics are simplest
+  // and sufficient here. Undefined (the default, and what every M4 caller —
+  // harness/generate.ts — still passes) forwards `timeoutMs: undefined` to
+  // session.prompt, which is a harmless no-op for any FrontierSession
+  // implementation (equivalent to the pre-Task-4 `session.prompt(text)` call
+  // with no opts at all).
+  timeoutMs?: number;
 }
 
 // A validation problem in a schema/path/message shape uniform enough to
@@ -183,7 +197,7 @@ export async function promptForJson<S extends z.ZodType>(
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
     notify({ kind: "attempt", detail: `prompt attempt ${attempt}/${maxAttempts}` });
 
-    const handle = session.prompt(currentPrompt);
+    const handle = session.prompt(currentPrompt, { timeoutMs: opts.timeoutMs });
     let text = "";
     try {
       for await (const event of handle.events) {
