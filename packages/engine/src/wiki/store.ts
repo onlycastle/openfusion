@@ -32,6 +32,8 @@ CREATE INDEX IF NOT EXISTS idx_refs_name ON refs(name);
 CREATE INDEX IF NOT EXISTS idx_refs_file ON refs(file);
 `;
 
+const SCHEMA_VERSION = 1;
+
 export class WikiStore {
   #db: Database.Database;
 
@@ -148,5 +150,6 @@ export function openWikiStore(projectDir: string): WikiStore {
   const db = new Database(path.join(cacheDir, "wiki.db"));
   db.pragma("journal_mode = WAL");
   db.exec(SCHEMA);
+  db.pragma(`user_version = ${SCHEMA_VERSION}`);
   return new WikiStore(db);
 }

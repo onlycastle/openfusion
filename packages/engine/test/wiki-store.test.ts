@@ -2,6 +2,7 @@ import { mkdtempSync, readFileSync, rmSync, existsSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import Database from "better-sqlite3";
 import { openWikiStore } from "../src/wiki/store.js";
 
 let dir: string;
@@ -76,5 +77,13 @@ describe("WikiStore", () => {
     store.setMeta("head_sha", "def456");
     expect(store.getMeta("head_sha")).toBe("def456");
     store.close();
+  });
+
+  it("stamps schema version 1 in the database", () => {
+    const store = makeStore();
+    store.close();
+    const db = new Database(path.join(dir, ".openfusion/cache/wiki.db"));
+    expect(db.pragma("user_version", { simple: true })).toBe(1);
+    db.close();
   });
 });

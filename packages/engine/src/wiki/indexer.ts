@@ -61,7 +61,13 @@ export async function buildIndex(
       filesSkipped += 1; // too large to parse: keep any existing entries
       continue;
     }
-    const source = readFileSync(absPath, "utf8");
+    let source: string;
+    try {
+      source = readFileSync(absPath, "utf8");
+    } catch {
+      filesSkipped += 1; // vanished between stat and read: keep existing entries
+      continue;
+    }
     const hash = createHash("sha256").update(source).digest("hex");
     if (store.getFileHash(relPath) === hash) {
       filesSkipped += 1;

@@ -57,4 +57,15 @@ describe("WikiParser", () => {
     expect(exts.has(".tsx")).toBe(true);
     expect(exts.has(".js")).toBe(true);
   });
+
+  it("does not double-count new-expression class references", () => {
+    const result = parser.parseFile(
+      "n.ts",
+      "class Foo {}\nconst x = new Foo();\n",
+    );
+    const fooClassRefs = result!.refs.filter(
+      (r) => r.name === "Foo" && r.kind === "class",
+    );
+    expect(fooClassRefs).toHaveLength(1);
+  });
 });

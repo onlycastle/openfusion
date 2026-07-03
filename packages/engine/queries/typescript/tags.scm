@@ -130,6 +130,3 @@
 
 (type_annotation
   (type_identifier) @name) @reference.type
-
-(new_expression
-  constructor: (identifier) @name) @reference.class
