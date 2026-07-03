@@ -334,7 +334,17 @@ export function registerWorkerMethods(engine: Engine): void {
   // orchestrate just returned as its result), and everything else this
   // manager knows about gets removed, branch and all. Safe to call
   // unconditionally after a session ends, or periodically — a project with
-  // zero worker worktrees is a no-op (`removed: []`).
+  // zero worker worktrees is a no-op (`removed: []`, `failed: []`).
+  //
+  // Final review Fix 1 (Important): each worktree's manager.remove() call is
+  // now isolated in its own try/catch — a mid-sweep failure (e.g. a locked
+  // file handle, a permissions error) used to escape uncaught, aborting the
+  // WHOLE gc call with a generic INTERNAL_ERROR and losing the `removed`
+  // list for every worktree already swept before the failing one. A failure
+  // is now recorded in `failed` (path + error message) and the sweep
+  // continues — the caller gets back exactly what happened instead of an
+  // all-or-nothing throw, so a partial gc can be retried or inspected rather
+  // than silently discarded.
   registerMethod(engine.dispatcher, "engine.worker.gc", GcParamsSchema, async (params) => {
     requireGitRepo(params.projectDir);
     const manager = await engine.worker.getManager(params.projectDir);
@@ -348,14 +358,23 @@ export function registerWorkerMethods(engine: Engine): void {
     // realpath'd up front).
     const keep = new Set((params.keep ?? []).map(resolveProjectKey));
     const removed: string[] = [];
+    const failed: Array<{ path: string; error: string }> = [];
     for (const worktree of worktrees) {
       if (keep.has(resolveProjectKey(worktree.path))) continue;
-      await manager.remove(worktree, { deleteBranch: true });
-      removed.push(worktree.path);
+      try {
+        await manager.remove(worktree, { deleteBranch: true });
+        removed.push(worktree.path);
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        failed.push({ path: worktree.path, error: message });
+      }
     }
     if (removed.length > 0) {
       engine.log(`worker.gc removed ${removed.length} worktree(s)`);
     }
-    return { removed };
+    if (failed.length > 0) {
+      engine.log(`worker.gc failed to remove ${failed.length} worktree(s)`);
+    }
+    return { removed, failed };
   });
 }

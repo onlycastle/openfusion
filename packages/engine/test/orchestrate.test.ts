@@ -436,6 +436,94 @@ describe("engine.orchestrate — retry then approve", () => {
   });
 });
 
+// Final review Fix 3 (Important): retries used to be blind re-rolls —
+// attempt n+1 got the IDENTICAL worker task prompt as attempt n, ignoring
+// the prior verdict's `reasons` (or the fact of a prior empty diff)
+// entirely. That weakens convergence and inflates the escalation rate (an
+// M6 metric). The fix threads the prior attempt's outcome into
+// buildWorkerTask so attempt n+1's task text names what went wrong.
+//
+// Captures the `task` param of every engine.worker.run dispatch by
+// monkeypatching engine.dispatcher.dispatch — the same monkeypatch style
+// already used elsewhere in this suite for manager.create/diff — since
+// orchestrate.ts drives engine.worker.run through the dispatcher
+// (callEngineMethod), not a direct function call.
+function captureWorkerTasks(e: Engine): string[] {
+  const tasks: string[] = [];
+  const originalDispatch = e.dispatcher.dispatch.bind(e.dispatcher);
+  e.dispatcher.dispatch = (async (message: unknown) => {
+    const req = message as { method?: string; params?: { task?: string } };
+    if (req.method === "engine.worker.run" && typeof req.params?.task === "string") {
+      tasks.push(req.params.task);
+    }
+    return originalDispatch(message);
+  }) as typeof e.dispatcher.dispatch;
+  return tasks;
+}
+
+describe("engine.orchestrate — retry feedback", () => {
+  it("attempt 1's task is unchanged; attempt 2's task appends the prior verdict's rejection reasons", async () => {
+    dir = makeRepo();
+    await writeTestHarness(dir, { failuresBeforeFrontier: 2 });
+    engine = createEngine();
+    engine.models.registry.configure({ id: "p1", kind: "deepseek", apiKey: TEST_API_KEY });
+    engine.models.registry.setTestModel("p1", makeMultiAttemptWorkerMock());
+    engine.frontier.registerAdapter(
+      makeFakeFrontierAdapter({
+        reviewVerdicts: [
+          { decision: "request-changes", reasons: ["needs a null check", "missing test coverage"], severity: "minor" },
+          { decision: "approve", reasons: [], severity: "none" },
+        ],
+      }),
+    );
+    const capturedTasks = captureWorkerTasks(engine);
+
+    const res = await call(engine, "engine.orchestrate", { projectDir: dir, task: "improve the widget" });
+    expect(res.error).toBeUndefined();
+
+    expect(capturedTasks).toHaveLength(2);
+    // Attempt 1 gets exactly the base framing — no feedback yet exists.
+    expect(capturedTasks[0]).toBe("You are a codegen specialist. Follow instructions exactly.\n\nimprove the widget");
+    // Attempt 2 appends the prior verdict's own reasons, verbatim.
+    expect(capturedTasks[1]).toContain(capturedTasks[0]);
+    expect(capturedTasks[1]).toContain("needs a null check");
+    expect(capturedTasks[1]).toContain("missing test coverage");
+    expect(capturedTasks[1]!.toLowerCase()).toContain("previous attempt was reviewed and rejected");
+  });
+
+  it("attempt 2's task notes a prior empty diff when attempt 1 made no changes", async () => {
+    dir = makeRepo();
+    await writeTestHarness(dir, { failuresBeforeFrontier: 2 });
+    engine = createEngine();
+    engine.models.registry.configure({ id: "p1", kind: "deepseek", apiKey: TEST_API_KEY });
+    // Attempt 1: no tool calls at all (empty diff). Attempt 2: writes a file
+    // and is approved.
+    let step = 0;
+    engine.models.registry.setTestModel(
+      "p1",
+      new MockLanguageModelV4({
+        doGenerate: async () => {
+          step++;
+          if (step === 1) return textStep("nothing to change");
+          if (step === 2) return toolCallStep("attempt2.txt", "second try");
+          return textStep("Attempt 2 summary");
+        },
+      }),
+    );
+    engine.frontier.registerAdapter(
+      makeFakeFrontierAdapter({ reviewVerdicts: [{ decision: "approve", reasons: [], severity: "none" }] }),
+    );
+    const capturedTasks = captureWorkerTasks(engine);
+
+    const res = await call(engine, "engine.orchestrate", { projectDir: dir, task: "improve the widget" });
+    expect(res.error).toBeUndefined();
+    expect(res.result.outcome).toBe("worker-approved");
+
+    expect(capturedTasks).toHaveLength(2);
+    expect(capturedTasks[1]!.toLowerCase()).toContain("previous attempt produced no changes");
+  });
+});
+
 describe("engine.orchestrate — escalation", () => {
   it("both worker attempts rejected -> frontier escalation (with writeScope) edits a file -> escalated", async () => {
     dir = makeRepo();

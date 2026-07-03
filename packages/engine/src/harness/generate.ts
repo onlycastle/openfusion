@@ -266,6 +266,13 @@ export async function generateHarness(engine: Engine, projectDir: string): Promi
     projectDir,
     wikiMcpUrl: mcpServer.url,
     log: engine.log,
+    // Final review Fix 2: an hour-long, ONE-TIME harness-generation run is
+    // not per-task review overhead — tag it distinctly so
+    // engines/methods.ts's onResult hook meters it under source
+    // "frontier-generate" instead of the "frontier-review" default, which
+    // otherwise breaks M6's per-task cost amortization math (see
+    // models/meter.ts's UsageSource doc comment).
+    resultLabel: "frontier-generate",
   });
 
   try {

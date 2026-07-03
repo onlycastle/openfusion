@@ -547,6 +547,7 @@ describe("engine.worker.gc", () => {
     expect(res.error).toBeUndefined();
     expect(res.result.removed).toEqual(expect.arrayContaining([w1.path, w2.path]));
     expect(res.result.removed).toHaveLength(2);
+    expect(res.result.failed).toEqual([]);
 
     expect(existsSync(w1.path)).toBe(false);
     expect(existsSync(w2.path)).toBe(false);
@@ -565,6 +566,7 @@ describe("engine.worker.gc", () => {
     const res = await call(engine, "engine.worker.gc", { projectDir: dir, keep: [survivor.path] });
     expect(res.error).toBeUndefined();
     expect(res.result.removed).toEqual([w1.path]);
+    expect(res.result.failed).toEqual([]);
 
     expect(existsSync(w1.path)).toBe(false);
     expect(git(dir, "branch", "--list", w1.branch)).toBe("");
@@ -580,6 +582,46 @@ describe("engine.worker.gc", () => {
     const res = await call(engine, "engine.worker.gc", { projectDir: dir });
     expect(res.error).toBeUndefined();
     expect(res.result.removed).toEqual([]);
+    expect(res.result.failed).toEqual([]);
+  });
+
+  // Final review Fix 1 (Important): the per-worktree remove loop had no
+  // try/catch — a mid-sweep manager.remove() throw (e.g. an OS-level
+  // failure removing one worktree) used to escape as a raw Error, falling
+  // through to the dispatcher's generic INTERNAL_ERROR, and losing the
+  // partial `removed` list for every worktree ALREADY swept before the
+  // failing one. Confirmed RED against pre-fix code (the whole RPC call
+  // rejected with INTERNAL_ERROR instead of returning `{removed, failed}`).
+  it("isolates a mid-sweep remove failure: the other worktrees are still removed, and the failure is reported in `failed` instead of aborting the whole call", async () => {
+    dir = makeRepo();
+    engine = createEngine();
+
+    const manager = await engine.worker.getManager(dir);
+    const w1 = await manager.create("task-1");
+    const w2 = await manager.create("task-2");
+    const w3 = await manager.create("task-3");
+
+    const originalRemove = manager.remove.bind(manager);
+    manager.remove = async (worktree, opts) => {
+      if (worktree.path === w2.path) {
+        throw new Error("simulated remove failure for task-2");
+      }
+      return originalRemove(worktree, opts);
+    };
+
+    const res = await call(engine, "engine.worker.gc", { projectDir: dir });
+    expect(res.error).toBeUndefined();
+
+    expect(res.result.removed).toEqual(expect.arrayContaining([w1.path, w3.path]));
+    expect(res.result.removed).toHaveLength(2);
+    expect(res.result.failed).toEqual([{ path: w2.path, error: "simulated remove failure for task-2" }]);
+
+    // The two healthy worktrees were actually removed from disk...
+    expect(existsSync(w1.path)).toBe(false);
+    expect(existsSync(w3.path)).toBe(false);
+    // ...but the one whose remove() failed is still there, untouched.
+    expect(existsSync(w2.path)).toBe(true);
+    expect(git(dir, "branch", "--list", w2.branch)).toContain(w2.branch);
   });
 
   it("matches a symlinked-spelling keep path via realpath comparison, not string equality", async () => {

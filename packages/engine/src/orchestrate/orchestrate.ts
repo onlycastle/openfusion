@@ -135,12 +135,47 @@ interface WorkerRunResponse {
   worktree: { path: string; branch: string };
 }
 
+// Final review Fix 3 (Important): what the PRIOR worker attempt (if any)
+// produced, threaded into the loop below so the NEXT attempt's task text can
+// react to it — a blind re-roll (attempt n+1 gets the identical prompt as
+// attempt n) ignores the reviewer's own diagnosis and weakens convergence,
+// inflating the escalation rate (an M6 metric). `empty: true` means the
+// prior attempt's diff was blank (never reached review at all); `verdict`
+// carries the prior review's own decision/reasons once one exists.
+interface PriorAttempt {
+  empty?: true;
+  verdict?: ReviewVerdict;
+}
+
+// Renders PriorAttempt into the exact feedback line appended to the next
+// attempt's task text — kept separate from buildWorkerTask so the two
+// distinct "what went wrong" cases (no changes at all vs. reviewed and
+// rejected) stay easy to read independently. Returns undefined when there is
+// nothing to say (no prior attempt, or a prior attempt that was approved —
+// which never reaches a second attempt in practice, but is handled the same
+// way defensively: no feedback needed since the pipeline already returned).
+function describePriorAttempt(prior: PriorAttempt | undefined): string | undefined {
+  if (prior === undefined) return undefined;
+  if (prior.empty === true) {
+    return "A previous attempt produced no changes; make sure you actually edit files.";
+  }
+  if (prior.verdict !== undefined && prior.verdict.decision === "request-changes") {
+    return `A previous attempt was reviewed and rejected for these reasons: ${prior.verdict.reasons.join(", ")}. Address them.`;
+  }
+  return undefined;
+}
+
 // Builds the single `task` string handed to engine.worker.run: the routed
 // agent's own specialist prompt, then the user's task — "keep simple: pass
 // task + agent.prompt as the worker task framing" per the task brief (a
-// fuller wiki-digest-aware framing is left to later work).
-function buildWorkerTask(agent: AgentDef, task: string): string {
-  return `${agent.prompt}\n\n${task}`;
+// fuller wiki-digest-aware framing is left to later work) — plus, from the
+// second attempt onward, a feedback line naming what the PRIOR attempt got
+// wrong (Final review Fix 3), so a retry is an informed correction rather
+// than an identical re-roll.
+function buildWorkerTask(agent: AgentDef, task: string, prior?: PriorAttempt): string {
+  const base = `${agent.prompt}\n\n${task}`;
+  const feedback = describePriorAttempt(prior);
+  return feedback === undefined ? base : `${base}\n\n${feedback}`;
 }
 
 // Drains a frontier turn WITHOUT any JSON-schema expectation (unlike
@@ -387,6 +422,12 @@ export async function orchestrate(engine: Engine, params: OrchestrateParams): Pr
 
     if (routed.resolution !== "frontier") {
       const { providerId, model } = routed.resolution;
+      // Final review Fix 3: set right after the FIRST attempt completes
+      // (empty or reviewed), so attempt 2+'s buildWorkerTask call below can
+      // append what went wrong — attempt 1 always sees `undefined` here (no
+      // prior attempt exists yet), matching this fix's "attempt-1 task is
+      // unchanged" contract.
+      let priorAttempt: PriorAttempt | undefined;
 
       for (let i = 0; i < maxWorkerAttempts; i++) {
         const n = nextAttemptNumber();
@@ -396,7 +437,7 @@ export async function orchestrate(engine: Engine, params: OrchestrateParams): Pr
         try {
           workerResult = await callEngineMethod<WorkerRunResponse>(engine, "engine.worker.run", {
             projectDir: params.projectDir,
-            task: buildWorkerTask(routed.agent, params.task),
+            task: buildWorkerTask(routed.agent, params.task, priorAttempt),
             providerId,
             model,
             timeoutMs: params.workerTimeoutMs,
@@ -423,6 +464,7 @@ export async function orchestrate(engine: Engine, params: OrchestrateParams): Pr
           attempts.push({ n, kind: "worker", summary: workerResult.summary, empty: true });
           await cleanupWorktree(engine, params.projectDir, workerResult.worktree.path);
           lastWorktree = null;
+          priorAttempt = { empty: true };
           continue;
         }
 
@@ -468,6 +510,7 @@ export async function orchestrate(engine: Engine, params: OrchestrateParams): Pr
 
         await cleanupWorktree(engine, params.projectDir, workerResult.worktree.path);
         lastWorktree = null;
+        priorAttempt = { verdict };
       }
     }
 

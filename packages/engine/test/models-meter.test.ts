@@ -61,19 +61,31 @@ describe("CostMeter — per-surface source tagging", () => {
     expect(totals.unpricedCalls).toBe(1);
   });
 
-  it("supports all four documented sources: complete, worker, frontier-review, frontier-escalate", () => {
+  // Final review Fix 2: two new sources were added — "frontier-generate"
+  // (harness generation, an hour-long one-time run) and
+  // "frontier-interactive" (engine.frontier.start's interactive sessions) —
+  // so this ledger can distinguish them from per-task "frontier-review" cost
+  // for M6's amortization math. Before the fix, UsageSource only had four
+  // members and this test (with the two new ones added) fails TYPECHECKING
+  // (`source` not assignable to `UsageSource`), which is this test's RED
+  // signal — CostMeter itself is otherwise source-agnostic (just a keyed
+  // bucket), so there is no runtime behavior to separately assert.
+  it("supports all six documented sources: complete, worker, frontier-review, frontier-escalate, frontier-generate, frontier-interactive", () => {
     const meter = new CostMeter();
-    for (const source of ["complete", "worker", "frontier-review", "frontier-escalate"] as const) {
+    const sources = [
+      "complete",
+      "worker",
+      "frontier-review",
+      "frontier-escalate",
+      "frontier-generate",
+      "frontier-interactive",
+    ] as const;
+    for (const source of sources) {
       meter.record(record({ source }));
     }
     const totals = meter.totals();
-    expect(Object.keys(totals.bySource).sort()).toEqual([
-      "complete",
-      "frontier-escalate",
-      "frontier-review",
-      "worker",
-    ]);
-    for (const source of ["complete", "worker", "frontier-review", "frontier-escalate"]) {
+    expect(Object.keys(totals.bySource).sort()).toEqual([...sources].sort());
+    for (const source of sources) {
       expect(totals.bySource[source]?.calls).toBe(1);
     }
   });

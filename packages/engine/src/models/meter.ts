@@ -4,12 +4,33 @@ import type { NormalizedUsage } from "./pricing.js";
 // break totals down by call site (Task 4's orchestrator wants to see
 // frontier-review vs frontier-escalate cost separately from plain worker
 // runs) without having to re-derive it from `kind`/`model` after the fact.
-// "frontier-review"/"frontier-escalate" are both produced by the same
-// frontier-claude adapter path (engines/methods.ts's onResult hook) — which
-// one a given call used is a Task 4 concern (the orchestrator decides review
-// vs escalate); today every frontier record is tagged "frontier-review" as
-// the default until that distinction is wired through.
-export type UsageSource = "complete" | "worker" | "frontier-review" | "frontier-escalate";
+// All four "frontier-*" sources are produced by the same frontier-claude
+// adapter path (engines/methods.ts's onResult hook) — which one a given call
+// used is decided by the RESULT LABEL its createSession call passed
+// (engines/types.ts's `resultLabel`):
+//   - "frontier-review": engine.orchestrate's read-only review-the-diff
+//     session (per-task quality-gate overhead).
+//   - "frontier-escalate": engine.orchestrate's write-scoped
+//     do-the-task-directly session (a worker-attempt substitute, not review
+//     overhead).
+//   - "frontier-generate": engine.harness.generate's session — an hour-long,
+//     ONE-TIME run, never per-task review overhead. Final review Fix 2:
+//     before this label existed, generation cost was folded into
+//     "frontier-review" and broke M6's per-task amortization math.
+//   - "frontier-interactive": engine.frontier.start's own interactive
+//     sessions (the raw RPC surface, no orchestrator/generator involved) —
+//     likewise never per-task review overhead.
+// "frontier-review" remains the fallback for a createSession call that omits
+// resultLabel entirely, but every real call site now sets one of the four
+// explicitly (see harness/generate.ts, engines/methods.ts's frontier.start
+// handler, and orchestrate.ts's review/escalate sessions).
+export type UsageSource =
+  | "complete"
+  | "worker"
+  | "frontier-review"
+  | "frontier-escalate"
+  | "frontier-generate"
+  | "frontier-interactive";
 
 // One successful `engine.models.complete` attempt. Failed attempts are never
 // recorded here — only what actually consumed tokens (see methods.ts).
