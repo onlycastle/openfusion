@@ -552,6 +552,47 @@ describe("writeScope entry that is itself a symlink out of the project (review r
   });
 });
 
+// M5a task-1 (M4 T1 deferred, day-one critical for worker worktrees): a
+// writeScope entry that does NOT exist on disk yet gets its realpath
+// fallback built from the RAW projectDir string, while the containment
+// baseline (canonicalProjectDir) IS realpath'd — see claude.ts's
+// writeScopeDirs. On a symlinked project root (macOS os.tmpdir() ->
+// /var/folders, which is really /private/var/folders; worker worktrees live
+// under os.tmpdir()) that compares a lexical path against a canonical one,
+// they never match, and the entry is silently dropped: every write to a
+// not-yet-existing scope dir is denied. Reproduced with an EXPLICIT symlink
+// here rather than relying on os.tmpdir()'s own symlink, since that's not
+// guaranteed on every CI runner (e.g. Linux).
+describe("writeScope entry that does not exist yet under a symlinked project root (M5a task-1)", () => {
+  let tmpRoot: string;
+
+  afterEach(() => {
+    if (tmpRoot !== undefined) rmSync(tmpRoot, { recursive: true, force: true });
+  });
+
+  it("allows a write to a not-yet-existing writeScope dir reached through a symlinked project root", async () => {
+    tmpRoot = mkdtempSync(path.join(os.tmpdir(), "of-claude-scope-notexist-"));
+    const realBase = path.join(tmpRoot, "real-base");
+    const linkBase = path.join(tmpRoot, "link-base");
+    mkdirSync(realBase, { recursive: true });
+    symlinkSync(realBase, linkBase);
+
+    const projectDir = path.join(linkBase, "proj");
+    mkdirSync(projectDir, { recursive: true });
+    // "scratch" deliberately does NOT exist yet — realpathSync on it throws,
+    // exercising the not-yet-existing-scope-dir fallback path this test
+    // guards.
+
+    const { canUseTool } = await getCanUseTool({ writeScope: ["scratch"] }, projectDir);
+    const result = await canUseTool(
+      "Write",
+      { file_path: path.join(projectDir, "scratch", "x.txt"), content: "x" },
+      signalOpts,
+    );
+    expect(result).toEqual({ behavior: "allow" });
+  });
+});
+
 // M4 task-1: rate-limit visibility. SDKAssistantMessage carries an optional
 // top-level `error?: SDKAssistantMessageError` tag (inspected in
 // @anthropic-ai/claude-agent-sdk@0.3.198's sdk.d.ts) — a bare string enum
