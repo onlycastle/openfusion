@@ -216,6 +216,94 @@ describe("writeHarness atomicity", () => {
   });
 });
 
+describe("writeHarness manifest-last ordering", () => {
+  it("does not create manifest.json when a non-manifest write fails on a fresh projectDir", async () => {
+    makeDir();
+    fsFailure.matchSubstring = ".codegen-worker.yaml.tmp-";
+    await expect(writeHarness(dir, validBundle())).rejects.toThrow("injected write failure");
+
+    expect(existsSync(path.join(dir, ".openfusion/manifest.json"))).toBe(false);
+    expect(loadHarness(dir)).toBeNull();
+  });
+
+  it("leaves the OLD manifest and bundle untouched when a regeneration's non-manifest write fails", async () => {
+    makeDir();
+    const bundle = validBundle();
+    await writeHarness(dir, bundle);
+
+    fsFailure.matchSubstring = ".codegen-worker.yaml.tmp-";
+    // Only the manifest (headSha) and the agent (whose write is about to
+    // fail) differ from `bundle` — pages/routing are byte-identical to the
+    // first generation's — so a coherent-old-bundle assertion holds
+    // regardless of internal write ordering: nothing that already matches
+    // is a "mix", and the one thing that doesn't match fails to write.
+    const nextBundle = validBundle({
+      manifest: validManifest({ headSha: "new-sha-999" }),
+      agents: [{ ...bundle.agents[0]!, description: "Updated description for regeneration test." }],
+    });
+    await expect(writeHarness(dir, nextBundle)).rejects.toThrow("injected write failure");
+
+    const manifestRaw = readFileSync(path.join(dir, ".openfusion/manifest.json"), "utf8");
+    expect(JSON.parse(manifestRaw).headSha).toBe("abc123");
+    expect(loadHarness(dir)).toEqual(bundle);
+  });
+});
+
+describe("writeHarness stale artifact pruning", () => {
+  it("removes an agent file for an agent no longer in the bundle on regeneration", async () => {
+    makeDir();
+    const agentA: AgentDef = {
+      name: "agent-a",
+      role: "worker",
+      description: "Agent A.",
+      prompt: "You are agent A.",
+      taskClasses: ["codegen"],
+      model: { kind: "deepseek", model: "deepseek-chat" },
+      escalation: { maxAttempts: 1 },
+    };
+    const agentB: AgentDef = {
+      name: "agent-b",
+      role: "worker",
+      description: "Agent B.",
+      prompt: "You are agent B.",
+      taskClasses: ["docs"],
+      model: { kind: "deepseek", model: "deepseek-chat" },
+      escalation: { maxAttempts: 1 },
+    };
+    await writeHarness(dir, validBundle({ agents: [agentA, agentB] }));
+    expect(existsSync(path.join(dir, ".openfusion/agents/agent-a.yaml"))).toBe(true);
+    expect(existsSync(path.join(dir, ".openfusion/agents/agent-b.yaml"))).toBe(true);
+
+    await writeHarness(dir, validBundle({ agents: [agentA] }));
+
+    expect(existsSync(path.join(dir, ".openfusion/agents/agent-b.yaml"))).toBe(false);
+    expect(existsSync(path.join(dir, ".openfusion/agents/agent-a.yaml"))).toBe(true);
+    const loaded = loadHarness(dir);
+    expect(loaded?.agents.map((a) => a.name)).toEqual(["agent-a"]);
+
+    // Pruning must stay scoped to wiki/ + agents/ — the cache/ guard is
+    // untouched.
+    const gitignore = readFileSync(path.join(dir, ".openfusion/.gitignore"), "utf8");
+    expect(gitignore).toContain("cache/");
+  });
+
+  it("removes the old file for a renamed wiki page on regeneration", async () => {
+    makeDir();
+    const bundle = validBundle();
+    await writeHarness(dir, bundle);
+    expect(existsSync(path.join(dir, ".openfusion/wiki/architecture.md"))).toBe(true);
+
+    const renamedPage: WikiPage = { ...bundle.pages[0]!, slug: "architecture-renamed" };
+    await writeHarness(dir, validBundle({ pages: [renamedPage, bundle.pages[1]!] }));
+
+    expect(existsSync(path.join(dir, ".openfusion/wiki/architecture.md"))).toBe(false);
+    expect(existsSync(path.join(dir, ".openfusion/wiki/architecture-renamed.md"))).toBe(true);
+    expect(existsSync(path.join(dir, ".openfusion/wiki/build-and-test.md"))).toBe(true);
+    const loaded = loadHarness(dir);
+    expect(loaded?.pages.map((p) => p.slug).sort()).toEqual(["architecture-renamed", "build-and-test"]);
+  });
+});
+
 describe("loadHarness", () => {
   it("returns null when no harness has been generated", () => {
     makeDir();
