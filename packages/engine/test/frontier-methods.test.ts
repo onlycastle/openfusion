@@ -252,4 +252,44 @@ describe("frontier RPC methods", () => {
     await engine.close();
     expect(closeSpy.closed).toBe(true);
   });
+
+  // Carried Important from Task 2 review: FrontierService.close() used to
+  // await each session's close() unguarded, so one throwing session both
+  // aborted the shutdown loop (leaving later sessions' subprocesses
+  // dangling) AND — since Engine.close awaits frontier.close() before
+  // wiki.close() — skipped wiki shutdown entirely. Mirrors
+  // WikiService.close()'s per-resource try/catch isolation.
+  it("close() isolates a throwing session's close() so other sessions still close and close() resolves", async () => {
+    dir = makeRepo();
+    engine = createEngine();
+    engine.frontier.registerAdapter(makeFakeAdapter());
+    const adapter = engine.frontier.getAdapter("claude-code")!;
+
+    const okClose = { closed: false };
+    const throwingSession: FrontierSession = {
+      id: "throwing-inner-id",
+      projectDir: dir,
+      prompt(): FrontierPromptHandle {
+        throw new Error("not used in this test");
+      },
+      close: async () => {
+        throw new Error("boom");
+      },
+    };
+    const okSession: FrontierSession = {
+      id: "ok-inner-id",
+      projectDir: dir,
+      prompt(): FrontierPromptHandle {
+        throw new Error("not used in this test");
+      },
+      close: async () => {
+        okClose.closed = true;
+      },
+    };
+    engine.frontier.addSession("throwing-session", { session: throwingSession, adapter });
+    engine.frontier.addSession("ok-session", { session: okSession, adapter });
+
+    await expect(engine.frontier.close()).resolves.toBeUndefined();
+    expect(okClose.closed).toBe(true);
+  });
 });

@@ -8,6 +8,7 @@ import { RpcMethodError } from "../rpc/errors.js";
 import { registerMethod } from "../rpc/register.js";
 import { getHeadSha } from "../wiki/indexer.js";
 import { wikiDbPath } from "../wiki/store.js";
+import { createClaudeAdapter } from "./claude.js";
 import type { FrontierAdapter, FrontierEvent, FrontierSession } from "./types.js";
 
 const StartParamsSchema = z.object({
@@ -57,8 +58,9 @@ function isWikiBuilt(engine: Engine, projectDir: string): boolean {
 // Holds registered adapters (one per engine "kind") and the live sessions
 // created through them. Mirrors the shape of WikiService/ModelsService:
 // instantiated once per Engine, methods.ts's RPC handlers are the only
-// callers. Task 3 registers the Claude adapter by default; this task
-// registers none — tests inject fakes via registerAdapter().
+// callers. registerFrontierMethods registers the Claude adapter by default
+// (kind "claude-code"); tests can still override it (or register other
+// kinds) via registerAdapter() — a same-kind call replaces the Map entry.
 export class FrontierService {
   #adapters = new Map<string, FrontierAdapter>();
   #sessions = new Map<string, SessionEntry>();
@@ -114,13 +116,47 @@ export class FrontierService {
   }
 
   async close(): Promise<void> {
-    for (const sessionId of [...this.#sessions.keys()]) {
-      await this.removeSession(sessionId);
+    for (const [sessionId, entry] of [...this.#sessions.entries()]) {
+      this.#sessions.delete(sessionId);
+      this.#inFlight.delete(sessionId);
+      try {
+        await entry.session.close();
+      } catch {
+        // Best-effort: one session failing to close must not abort
+        // shutdown of the rest, and — since Engine.close awaits
+        // frontier.close() before wiki.close() — must not skip wiki
+        // teardown either. Mirrors WikiService.close()'s per-resource
+        // isolation.
+      }
     }
   }
 }
 
 export function registerFrontierMethods(engine: Engine): void {
+  // Default adapter, registered before any RPC handler so
+  // engine.frontier.start's "unknown frontier engine" check never fires for
+  // the un-overridden case. onResult wires the adapter's per-result hook to
+  // the models layer's CostMeter here (rather than in claude.ts) so the
+  // adapter itself never imports the models layer — see
+  // CreateClaudeAdapterOptions.onResult's doc comment. This never touches
+  // the meter during engine.frontier.prompt itself (that RPC handler stays
+  // meter-blind, per frontier-methods.test.ts); recording happens inside
+  // the adapter's own result-mapping, one record per `result` message.
+  engine.frontier.registerAdapter(
+    createClaudeAdapter({
+      onResult: (result, model) => {
+        engine.models.meter.record({
+          providerId: "claude-code",
+          kind: "frontier-claude",
+          model,
+          usage: result.usage,
+          costUsd: result.costUsd,
+          at: Date.now(),
+        });
+      },
+    }),
+  );
+
   registerMethod(engine.dispatcher, "engine.frontier.start", StartParamsSchema, async (params) => {
     const { projectDir } = params;
     requireHeadSha(projectDir);

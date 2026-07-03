@@ -59,6 +59,8 @@ export type {
   FrontierPromptHandle,
   FrontierSession,
 } from "./engines/types.js";
+export { createClaudeAdapter } from "./engines/claude.js";
+export type { CreateClaudeAdapterOptions } from "./engines/claude.js";
 export { WikiStore, openWikiStore } from "./wiki/store.js";
 export { WikiParser } from "./wiki/parser.js";
 export { buildIndex, getHeadSha } from "./wiki/indexer.js";
