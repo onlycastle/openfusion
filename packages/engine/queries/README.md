@@ -13,6 +13,14 @@
   comment marking where the typescript-specific additions begin.
 - `javascript/tags.scm` from `tree-sitter/tree-sitter-javascript` (v0.23.1),
   unmodified.
+- `python/tags.scm` from `tree-sitter/tree-sitter-python` (master),
+  unmodified.
+- `go/tags.scm` from `tree-sitter/tree-sitter-go` (master),
+  unmodified.
+- `rust/tags.scm` from `tree-sitter/tree-sitter-rust` (master),
+  unmodified.
+- `java/tags.scm` from `tree-sitter/tree-sitter-java` (master),
+  unmodified.
 
 ## Grammar wasm source
 
