@@ -76,4 +76,82 @@ describe("wiki RPC methods", () => {
     expect(res.error?.code).toBe(RpcErrorCodes.SERVER_ERROR);
     expect(existsSync(path.join(dir, ".openfusion"))).toBe(false);
   });
+
+  it("coalesces concurrent builds for the same project", async () => {
+    makeRepo();
+    const [a, b] = await Promise.all([
+      call("engine.wiki.build", { projectDir: dir }),
+      call("engine.wiki.build", { projectDir: dir }),
+    ]);
+    expect(a.error).toBeUndefined();
+    expect(b.error).toBeUndefined();
+    expect(a.result.headSha).toBe(b.result.headSha);
+  }, 30_000);
+
+  it("map returns a budgeted markdown map after build", async () => {
+    makeRepo();
+    await call("engine.wiki.build", { projectDir: dir });
+    const res = await call("engine.wiki.map", { projectDir: dir, budgetTokens: 256 });
+    expect(res.error).toBeUndefined();
+    expect(res.result.map).toContain("x.ts");
+    expect(res.result.truncated).toBe(false);
+  }, 30_000);
+
+  it("map on an unbuilt project returns SERVER_ERROR", async () => {
+    makeRepo();
+    const res = await call("engine.wiki.map", { projectDir: dir });
+    expect(res.error?.code).toBe(RpcErrorCodes.SERVER_ERROR);
+  }, 30_000);
+
+  it("status on a never-built project reports built:false without creating .openfusion", async () => {
+    makeRepo();
+    const res = await call("engine.wiki.status", { projectDir: dir });
+    expect(res.result.built).toBe(false);
+    expect(existsSync(path.join(dir, ".openfusion"))).toBe(false);
+  });
+
+  // Fix 2: after external deletion of .openfusion/cache (user `rm -rf`,
+  // another process's schema-recreate), a cached WikiStore handle would
+  // keep serving reads from its now-unlinked inode while engine.wiki.status
+  // reported built:false — a live-vs-cache split brain. getStore must
+  // revalidate the cache entry against the filesystem on every hit.
+  it("query does not serve stale data after external deletion of .openfusion", async () => {
+    makeRepo();
+    await call("engine.wiki.build", { projectDir: dir });
+    const before = await call("engine.wiki.query", { projectDir: dir, symbol: "xray" });
+    expect(before.result.definitions.length).toBeGreaterThanOrEqual(1);
+
+    rmSync(path.join(dir, ".openfusion"), { recursive: true, force: true });
+
+    const stale = await call("engine.wiki.query", { projectDir: dir, symbol: "xray" });
+    expect(stale.error).toBeUndefined();
+    expect(stale.result.definitions.length).toBe(0);
+
+    const rebuild = await call("engine.wiki.build", { projectDir: dir });
+    expect(rebuild.error).toBeUndefined();
+    expect(existsSync(path.join(dir, ".openfusion/cache/wiki.db"))).toBe(true);
+  }, 30_000);
+
+  it("map with low budget truncates and reports truncated:true", async () => {
+    makeRepo();
+    // Create 8+ .ts files with enough content to exceed 64-token budget when ranked
+    for (let i = 0; i < 10; i++) {
+      writeFileSync(
+        path.join(dir, `f${i}.ts`),
+        `// File ${i}: extensive content\n` +
+        `export function functionNameA${i}() { return ${i}; }\n` +
+        `export function functionNameB${i}() { return ${i * 2}; }\n` +
+        `export function functionNameC${i}() { return ${i * 3}; }\n` +
+        `export interface InterfaceType${i} { value: number; key: string; }\n`,
+      );
+    }
+    execFileSync("git", ["-C", dir, "add", "-A"]);
+    execFileSync("git", ["-C", dir, "commit", "-qm", "add files"]);
+
+    await call("engine.wiki.build", { projectDir: dir });
+    const res = await call("engine.wiki.map", { projectDir: dir, budgetTokens: 64 });
+    expect(res.error).toBeUndefined();
+    expect(res.result.truncated).toBe(true);
+    expect(res.result.files).toBeGreaterThanOrEqual(8);
+  }, 30_000);
 });

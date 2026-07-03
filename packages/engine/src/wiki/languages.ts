@@ -28,6 +28,10 @@ export const LANGUAGE_SPECS: LanguageSpec[] = [
     queryDir: "javascript",
     extensions: [".js", ".mjs", ".cjs", ".jsx"],
   },
+  { id: "python", wasmFile: "tree-sitter-python.wasm", queryDir: "python", extensions: [".py"] },
+  { id: "go", wasmFile: "tree-sitter-go.wasm", queryDir: "go", extensions: [".go"] },
+  { id: "rust", wasmFile: "tree-sitter-rust.wasm", queryDir: "rust", extensions: [".rs"] },
+  { id: "java", wasmFile: "tree-sitter-java.wasm", queryDir: "java", extensions: [".java"] },
 ];
 
 export function wasmDir(): string {

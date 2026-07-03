@@ -63,4 +63,16 @@ describe("registerMethod", () => {
     });
     expect(res?.error?.code).toBe(RpcErrorCodes.INTERNAL_ERROR);
   });
+
+  it("includes structured zod issues in error.data", async () => {
+    const res = await makeDispatcher().dispatch({
+      jsonrpc: "2.0",
+      id: 9,
+      method: "greet",
+      params: { who: 42 },
+    });
+    const data = res?.error?.data as { issues: Array<{ path: string[]; message: string }> };
+    expect(data.issues[0]?.path).toEqual(["who"]);
+    expect(typeof data.issues[0]?.message).toBe("string");
+  });
 });

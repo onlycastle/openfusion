@@ -12,9 +12,16 @@ export function registerMethod<S extends z.ZodType>(
   dispatcher.register(method, (params) => {
     const parsed = schema.safeParse(params);
     if (!parsed.success) {
+      const data = {
+        issues: parsed.error.issues.map((i) => ({
+          path: i.path.map(String),
+          message: i.message,
+        })),
+      };
       throw new RpcMethodError(
         RpcErrorCodes.INVALID_PARAMS,
         `invalid params for ${method}: ${parsed.error.message}`,
+        data,
       );
     }
     return handler(parsed.data as z.infer<S>);
