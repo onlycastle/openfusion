@@ -9,7 +9,12 @@ import { registerMethod } from "../rpc/register.js";
 import { getHeadSha } from "../wiki/indexer.js";
 import { wikiDbPath } from "../wiki/store.js";
 import { createClaudeAdapter } from "./claude.js";
-import type { FrontierAdapter, FrontierEvent, FrontierSession } from "./types.js";
+import type {
+  FrontierAdapter,
+  FrontierEvent,
+  FrontierPromptHandle,
+  FrontierSession,
+} from "./types.js";
 
 const StartParamsSchema = z.object({
   projectDir: z.string().min(1),
@@ -19,9 +24,26 @@ const StartParamsSchema = z.object({
 
 const SessionParamsSchema = z.object({ sessionId: z.string().min(1) });
 
+// engine.frontier.prompt's timeoutMs used to reuse models/methods.ts's
+// per-attempt schema verbatim (min 1000, max 600000) — a sensible bound for
+// a single model call, but frontier prompts are long-running agentic turns
+// (multiple tool calls / sub-agent loops), so the ceiling is widened to 1h.
+// Default stays at the old max (600_000 / 10m) so unspecified timeoutMs
+// behaves the same as before this task.
+//
+// The floor is dropped from models' 1000ms to 100ms deliberately: unlike
+// models' per-network-call timeout, this fires the "frontier prompt timed
+// out" abort path end-to-end (see engine.frontier.prompt below), and tests
+// covering that path need to force it quickly without resorting to fake
+// timers over an async-iterator-driven RPC. 100ms is still well above
+// "effectively zero" for a real caller while keeping the test suite fast.
+const DEFAULT_PROMPT_TIMEOUT_MS = 600_000;
+const MIN_PROMPT_TIMEOUT_MS = 100;
+const MAX_PROMPT_TIMEOUT_MS = 3_600_000;
+
 const PromptParamsSchema = SessionParamsSchema.extend({
   text: z.string().min(1),
-  timeoutMs: z.number().int().min(1000).max(600000).optional(),
+  timeoutMs: z.number().int().min(MIN_PROMPT_TIMEOUT_MS).max(MAX_PROMPT_TIMEOUT_MS).optional(),
 });
 
 const EmptyParamsSchema = z.object({});
@@ -65,6 +87,7 @@ export class FrontierService {
   #adapters = new Map<string, FrontierAdapter>();
   #sessions = new Map<string, SessionEntry>();
   #inFlight = new Set<string>();
+  #activeHandles = new Map<string, FrontierPromptHandle>();
 
   registerAdapter(adapter: FrontierAdapter): void {
     this.#adapters.set(adapter.kind, adapter);
@@ -106,11 +129,29 @@ export class FrontierService {
     this.#inFlight.delete(sessionId);
   }
 
+  // Records the FrontierPromptHandle for the prompt currently running on a
+  // session, so removeSession()/close() below can abort it before tearing
+  // the session down — without this, stopping (or closing the Engine)
+  // mid-prompt would leave the blocked engine.frontier.prompt call to hang
+  // on a session that's already gone rather than erroring out. Companion to
+  // tryBeginPrompt/endPrompt's #inFlight guard, which tracks occupancy only
+  // (not the handle itself).
+  setActiveHandle(sessionId: string, handle: FrontierPromptHandle): void {
+    this.#activeHandles.set(sessionId, handle);
+  }
+
+  clearActiveHandle(sessionId: string): void {
+    this.#activeHandles.delete(sessionId);
+  }
+
   async removeSession(sessionId: string): Promise<boolean> {
     const entry = this.#sessions.get(sessionId);
     if (entry === undefined) return false;
     this.#sessions.delete(sessionId);
     this.#inFlight.delete(sessionId);
+    const activeHandle = this.#activeHandles.get(sessionId);
+    this.#activeHandles.delete(sessionId);
+    activeHandle?.abort();
     await entry.session.close();
     return true;
   }
@@ -119,6 +160,9 @@ export class FrontierService {
     for (const [sessionId, entry] of [...this.#sessions.entries()]) {
       this.#sessions.delete(sessionId);
       this.#inFlight.delete(sessionId);
+      const activeHandle = this.#activeHandles.get(sessionId);
+      this.#activeHandles.delete(sessionId);
+      activeHandle?.abort();
       try {
         await entry.session.close();
       } catch {
@@ -191,6 +235,7 @@ export function registerFrontierMethods(engine: Engine): void {
     if (!engine.frontier.tryBeginPrompt(params.sessionId)) {
       throw new RpcMethodError(RpcErrorCodes.SERVER_ERROR, "prompt already in flight");
     }
+    const timeoutMs = params.timeoutMs ?? DEFAULT_PROMPT_TIMEOUT_MS;
     try {
       // Prompt text and streamed event payloads are user/model content and
       // must never reach engine.log (stderr diagnostics) — only the
@@ -200,17 +245,55 @@ export function registerFrontierMethods(engine: Engine): void {
         params.text,
         params.timeoutMs !== undefined ? { timeoutMs: params.timeoutMs } : undefined,
       );
+      // Tracked so engine.frontier.stop / Engine.close can abort THIS
+      // prompt before tearing the session down (see
+      // FrontierService.removeSession/close) — set as soon as the handle
+      // exists, before the first event, so a stop() racing in immediately
+      // after this RPC starts still finds it.
+      engine.frontier.setActiveHandle(params.sessionId, handle);
       let seq = 0;
       let events = 0;
       let resultEvent: Extract<FrontierEvent, { type: "result" }> | undefined;
-      for await (const event of handle.events) {
-        engine.notify("frontier.event", { sessionId: params.sessionId, seq, event });
-        seq += 1;
-        events += 1;
-        if (event.type === "result") {
-          resultEvent = event;
+
+      // Races the streamed-events loop against timeoutMs. On timeout: abort
+      // the handle, emit one final frontier.event error notification, and
+      // reject with the exact RpcMethodError below — deliberately NOT
+      // relying on the loop's own exit (which, depending on the adapter,
+      // might complete quietly or throw something unrelated) to produce
+      // this specific error message. Passing both promises to Promise.race
+      // means the loop's eventual settlement (after abort() unblocks it)
+      // still has a rejection handler attached even when this branch wins,
+      // so it can never surface as an unhandled rejection.
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const timeoutPromise = new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => {
+          handle.abort();
+          engine.notify("frontier.event", {
+            sessionId: params.sessionId,
+            seq,
+            event: { type: "error", message: "frontier prompt timed out" },
+          });
+          reject(new RpcMethodError(RpcErrorCodes.SERVER_ERROR, "frontier prompt timed out"));
+        }, timeoutMs);
+      });
+
+      const loopPromise = (async () => {
+        for await (const event of handle.events) {
+          engine.notify("frontier.event", { sessionId: params.sessionId, seq, event });
+          seq += 1;
+          events += 1;
+          if (event.type === "result") {
+            resultEvent = event;
+          }
         }
+      })();
+
+      try {
+        await Promise.race([loopPromise, timeoutPromise]);
+      } finally {
+        clearTimeout(timer);
       }
+
       if (resultEvent === undefined) {
         throw new RpcMethodError(
           RpcErrorCodes.SERVER_ERROR,
@@ -221,6 +304,7 @@ export function registerFrontierMethods(engine: Engine): void {
       engine.log(`frontier.prompt ${params.sessionId} done: ${events} events`);
       return { result, events };
     } finally {
+      engine.frontier.clearActiveHandle(params.sessionId);
       engine.frontier.endPrompt(params.sessionId);
     }
   });

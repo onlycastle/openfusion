@@ -52,6 +52,15 @@ interface FakeAdapterOptions {
   closeSpy?: { closed: boolean };
   gate?: Promise<void>;
   wikiMcpUrls?: (string | null)[];
+  // When true, the FIRST prompt() call on a session returns a generator
+  // that blocks (mid-stream, like a real adapter sitting on an in-flight
+  // tool call) until abort() fires, then ends its iteration without a
+  // result event — abort-aware, mirroring the real Claude adapter's
+  // query() ending once its AbortController fires. Subsequent prompt()
+  // calls on the same session behave normally, so tests can assert a
+  // session stays usable after its first prompt is aborted.
+  blockUntilAbort?: boolean;
+  abortSpy?: { count: number };
 }
 
 function makeFakeAdapter(opts: FakeAdapterOptions = {}): FrontierAdapter {
@@ -60,10 +69,29 @@ function makeFakeAdapter(opts: FakeAdapterOptions = {}): FrontierAdapter {
     kind,
     async createSession({ projectDir, wikiMcpUrl }): Promise<FrontierSession> {
       opts.wikiMcpUrls?.push(wikiMcpUrl);
+      let promptCalls = 0;
       return {
         id: "fake-inner-id",
         projectDir,
         prompt(): FrontierPromptHandle {
+          const callIndex = promptCalls;
+          promptCalls += 1;
+          if (opts.blockUntilAbort === true && callIndex === 0) {
+            let resolveAborted: () => void = () => {};
+            const aborted = new Promise<void>((resolve) => {
+              resolveAborted = resolve;
+            });
+            async function* gen(): AsyncGenerator<FrontierEvent> {
+              await aborted;
+            }
+            return {
+              events: gen(),
+              abort: () => {
+                if (opts.abortSpy !== undefined) opts.abortSpy.count += 1;
+                resolveAborted();
+              },
+            };
+          }
           async function* gen(): AsyncGenerator<FrontierEvent> {
             if (opts.gate !== undefined) await opts.gate;
             for (const e of FAKE_EVENTS) yield e;
@@ -292,4 +320,114 @@ describe("frontier RPC methods", () => {
     await expect(engine.frontier.close()).resolves.toBeUndefined();
     expect(okClose.closed).toBe(true);
   });
+
+  it("prompt timeoutMs schema accepts up to 3_600_000 and rejects below the 100ms floor", async () => {
+    dir = makeRepo();
+    engine = createEngine();
+    engine.frontier.registerAdapter(makeFakeAdapter());
+    const start = await call("engine.frontier.start", { projectDir: dir, attachWiki: false });
+    const { sessionId } = start.result;
+
+    const tooLow = await call("engine.frontier.prompt", { sessionId, text: "hi", timeoutMs: 50 });
+    expect(tooLow.error?.code).toBe(RpcErrorCodes.INVALID_PARAMS);
+
+    const tooHigh = await call("engine.frontier.prompt", {
+      sessionId,
+      text: "hi",
+      timeoutMs: 3_600_001,
+    });
+    expect(tooHigh.error?.code).toBe(RpcErrorCodes.INVALID_PARAMS);
+
+    // Above models/methods.ts's old 600_000 cap (which this schema used to
+    // reuse) but within the widened 3_600_000 frontier max — must not be
+    // rejected as INVALID_PARAMS. The fake's events resolve immediately, so
+    // this never actually waits out the timeout.
+    const widened = await call("engine.frontier.prompt", {
+      sessionId,
+      text: "hi",
+      timeoutMs: 601_000,
+    });
+    expect(widened.error).toBeUndefined();
+  });
+
+  it("prompt timeoutMs aborts the handle, emits a final frontier.event error, and errors SERVER_ERROR — session stays usable for the next prompt", async () => {
+    dir = makeRepo();
+    const notifications: Array<{ method: string; params: unknown }> = [];
+    engine = createEngine({ notify: (method, params) => notifications.push({ method, params }) });
+    const abortSpy = { count: 0 };
+    engine.frontier.registerAdapter(makeFakeAdapter({ blockUntilAbort: true, abortSpy }));
+
+    const start = await call("engine.frontier.start", { projectDir: dir, attachWiki: false });
+    const { sessionId } = start.result;
+
+    const timedOut = await call("engine.frontier.prompt", { sessionId, text: "hi", timeoutMs: 150 });
+    expect(timedOut.error?.code).toBe(RpcErrorCodes.SERVER_ERROR);
+    expect(timedOut.error?.message).toBe("frontier prompt timed out");
+    expect(abortSpy.count).toBe(1);
+
+    expect(notifications.length).toBeGreaterThan(0);
+    const last = notifications.at(-1)!;
+    expect(last.method).toBe("frontier.event");
+    expect((last.params as { event: FrontierEvent }).event).toEqual({
+      type: "error",
+      message: "frontier prompt timed out",
+    });
+
+    // Session must still be usable for the next prompt — not torn down.
+    const list = await call("engine.frontier.list", {});
+    expect(list.result.sessions).toEqual([{ sessionId, engine: "claude-code", projectDir: dir }]);
+
+    const second = await call("engine.frontier.prompt", { sessionId, text: "again" });
+    expect(second.error).toBeUndefined();
+    expect(second.result.events).toBe(3);
+  }, 5_000);
+
+  it("stop during an in-flight prompt aborts the handle before closing, so the prompt RPC errors instead of hanging", async () => {
+    dir = makeRepo();
+    engine = createEngine();
+    const closeSpy = { closed: false };
+    const abortSpy = { count: 0 };
+    engine.frontier.registerAdapter(makeFakeAdapter({ blockUntilAbort: true, closeSpy, abortSpy }));
+
+    const start = await call("engine.frontier.start", { projectDir: dir, attachWiki: false });
+    const { sessionId } = start.result;
+
+    const promptPromise = call("engine.frontier.prompt", { sessionId, text: "hi" });
+
+    const stop = await call("engine.frontier.stop", { sessionId });
+    expect(stop.error).toBeUndefined();
+    expect(stop.result.stopped).toBe(true);
+    expect(abortSpy.count).toBe(1);
+    expect(closeSpy.closed).toBe(true);
+
+    const promptResult = await promptPromise;
+    expect(promptResult.error).toBeDefined();
+
+    // Double-stop stays idempotent even when the first stop happened
+    // mid-prompt.
+    const stopAgain = await call("engine.frontier.stop", { sessionId });
+    expect(stopAgain.result.stopped).toBe(false);
+  }, 5_000);
+
+  it("Engine.close() with an in-flight prompt resolves within a bounded time (abort-then-close)", async () => {
+    dir = makeRepo();
+    engine = createEngine();
+    const closeSpy = { closed: false };
+    const abortSpy = { count: 0 };
+    engine.frontier.registerAdapter(makeFakeAdapter({ blockUntilAbort: true, closeSpy, abortSpy }));
+
+    const start = await call("engine.frontier.start", { projectDir: dir, attachWiki: false });
+    const { sessionId } = start.result;
+
+    const promptPromise = call("engine.frontier.prompt", { sessionId, text: "hi" });
+
+    const startedAt = Date.now();
+    await engine.close();
+    expect(Date.now() - startedAt).toBeLessThan(2_000);
+    expect(abortSpy.count).toBe(1);
+    expect(closeSpy.closed).toBe(true);
+
+    const promptResult = await promptPromise;
+    expect(promptResult.error).toBeDefined();
+  }, 5_000);
 });
