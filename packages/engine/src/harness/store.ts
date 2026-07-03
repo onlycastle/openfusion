@@ -106,30 +106,95 @@ async function atomicWriteFile(filePath: string, content: string): Promise<void>
 
 const WIKI_PAGE_EXT = ".md";
 const AGENT_DEF_EXT = ".yaml";
+const WIKI_SUBDIR = "wiki";
+const AGENTS_SUBDIR = "agents";
+const ROUTING_RELPATH = "routing.yaml";
 
-// Removes stale `*.md` files under wiki/ and stale `*.yaml` files under
-// agents/ that are NOT part of this generation's expected file set (e.g. an
-// agent removed from the bundle, or a wiki page renamed to a new slug).
-// Only ever called AFTER every new-content write in writeHarness has
-// already succeeded — a write failure must never reach here, or a file
-// belonging to the (still on-disk, still valid) OLD generation could be
-// deleted without the new content that was supposed to replace it. Leaves
-// cache/, .gitignore, and any non-.md/.yaml file untouched; missing
-// directories (e.g. a bundle with zero pages) are treated as "nothing to
-// prune", not an error.
-function pruneStaleArtifacts(projectDir: string, expected: { pages: WikiPage[]; agents: AgentDef[] }): void {
-  const expectedWikiFiles = new Set(expected.pages.map((page) => `${page.slug}${WIKI_PAGE_EXT}`));
-  pruneDir(wikiDir(projectDir), WIKI_PAGE_EXT, expectedWikiFiles);
-
-  const expectedAgentFiles = new Set(expected.agents.map((agent) => `${agent.name}${AGENT_DEF_EXT}`));
-  pruneDir(agentsDir(projectDir), AGENT_DEF_EXT, expectedAgentFiles);
+// Relative-POSIX-path artifact list this bundle will write, in the same
+// order as writeHarness's content writes (routing, then pages, then
+// agents). This is the exact list recorded into manifest.artifacts, and is
+// also diffed against the PRIOR manifest's artifacts to determine what's
+// safe to prune (see pruneRemovedArtifacts).
+function computeArtifactPaths(bundle: { pages: WikiPage[]; agents: AgentDef[] }): string[] {
+  return [
+    ROUTING_RELPATH,
+    ...bundle.pages.map((page) => `${WIKI_SUBDIR}/${page.slug}${WIKI_PAGE_EXT}`),
+    ...bundle.agents.map((agent) => `${AGENTS_SUBDIR}/${agent.name}${AGENT_DEF_EXT}`),
+  ];
 }
 
-function pruneDir(dirPath: string, ext: string, expectedFiles: Set<string>): void {
-  if (!existsSync(dirPath)) return;
-  for (const file of readdirSync(dirPath)) {
-    if (file.endsWith(ext) && !expectedFiles.has(file)) {
-      rmSync(path.join(dirPath, file), { force: true });
+// Reads the artifacts list off the manifest ALREADY on disk (if any),
+// before writeHarness writes anything new — this is "what the PRIOR
+// generation is on record as having written", the only set of files a
+// regeneration is ever allowed to prune. Never throws: a missing manifest,
+// unparseable JSON, or a manifest that fails schema validation all
+// conservatively resolve to `[]` (nothing known, so nothing pruned) rather
+// than blocking a new write over a problem with the OLD manifest.
+function readOldManifestArtifacts(projectDir: string): string[] {
+  const mPath = manifestPath(projectDir);
+  if (!existsSync(mPath)) return [];
+  try {
+    const json: unknown = JSON.parse(readFileSync(mPath, "utf8"));
+    const result = ManifestSchema.safeParse(json);
+    return result.success ? result.data.artifacts : [];
+  } catch {
+    return [];
+  }
+}
+
+// Resolves a manifest-recorded relative artifact path to an absolute path,
+// but ONLY if it lands inside wiki/ (as a .md file), agents/ (as a .yaml
+// file), or is exactly routing.yaml — the sole three locations writeHarness
+// itself ever writes content into. Returns null for anything else
+// (".." traversal, cache/, .gitignore, manifest.json, or anything outside
+// .openfusion entirely), which pruneRemovedArtifacts treats as "skip,
+// don't delete". This is an allowlist, not a denylist, specifically so a
+// malformed or hand-edited manifest.artifacts entry can never cause
+// deletion of something outside the three directories writeHarness owns.
+function resolvePrunablePath(projectDir: string, relPath: string): string | null {
+  const segments = relPath.split("/").filter((s) => s.length > 0 && s !== ".");
+  if (segments.length === 0 || segments.some((s) => s === "..")) return null;
+
+  const dir = harnessDir(projectDir);
+  const abs = path.resolve(dir, ...segments);
+
+  if (abs === routingPath(projectDir)) return abs;
+
+  const wDir = wikiDir(projectDir);
+  if ((abs === wDir || abs.startsWith(wDir + path.sep)) && abs.endsWith(WIKI_PAGE_EXT)) return abs;
+
+  const aDir = agentsDir(projectDir);
+  if ((abs === aDir || abs.startsWith(aDir + path.sep)) && abs.endsWith(AGENT_DEF_EXT)) return abs;
+
+  return null;
+}
+
+// Deletes every path in `oldArtifacts` that isn't in `newArtifacts` — i.e.
+// files the PRIOR manifest declared it wrote that THIS generation didn't
+// rewrite (an agent dropped from the bundle, a wiki page renamed to a new
+// slug). Only ever called AFTER the new manifest.json has been written
+// successfully: at that point this generation's own content is fully and
+// durably on disk, so pruning can only remove genuinely-stale prior-
+// generation files, never anything belonging to the generation that just
+// committed. A file never recorded in any manifest (hand-authored via the
+// Harness editor, spec §7.4) can never appear in `oldArtifacts` and is
+// therefore never a candidate for deletion here.
+//
+// Deliberately swallows all per-file errors (including a permission
+// failure or the file already being gone): a prune failure must never
+// throw out of writeHarness once the new manifest is committed — the new
+// generation already succeeded, and undoing that success (or leaving
+// writeHarness's caller thinking it failed) over a best-effort cleanup step
+// would be strictly worse than leaving one stale file behind.
+function pruneRemovedArtifacts(projectDir: string, oldArtifacts: string[], newArtifacts: ReadonlySet<string>): void {
+  for (const relPath of oldArtifacts) {
+    if (newArtifacts.has(relPath)) continue;
+    const absPath = resolvePrunablePath(projectDir, relPath);
+    if (absPath === null) continue;
+    try {
+      rmSync(absPath, { force: true });
+    } catch {
+      // Best-effort — see function header comment.
     }
   }
 }
@@ -229,28 +294,37 @@ function readRequiredDir(dirPath: string, describe: string): string[] {
 // partially written.
 //
 // manifest.json is deliberately written LAST, after every other artifact
-// (including the post-write prune below) has fully succeeded, because it is
-// the completion marker both readers rely on: harnessStatus() reads ONLY
-// manifest.json (cheap, poll-friendly) and reports it at face value, and
-// loadHarness() treats manifest.json's absence as the sole "nothing
-// generated yet" signal. If manifest.json were written first (or anywhere
-// but last) and a later artifact write failed, manifest.json would sit on
-// disk claiming `verification.structural: "pass"` over a wiki/agents/
-// routing set that's missing or stale — harnessStatus would report a broken
-// harness as healthy, and on the next regeneration attempt a Frankenstein
-// bundle (new manifest + leftover stale artifact) could load without error.
-// With manifest-last, manifest.json's mere presence reliably means this
-// generation's other artifacts are fully on disk; a failure anywhere before
-// it leaves the previous generation's manifest (and bundle) exactly as they
-// were.
+// has fully succeeded, because it is the completion marker both readers
+// rely on: harnessStatus() reads ONLY manifest.json (cheap, poll-friendly)
+// and reports it at face value, and loadHarness() treats manifest.json's
+// absence as the sole "nothing generated yet" signal. If manifest.json were
+// written first (or anywhere but last) and a later artifact write failed,
+// manifest.json would sit on disk claiming `verification.structural: "pass"`
+// over a wiki/agents/routing set that's missing or stale — harnessStatus
+// would report a broken harness as healthy, and on the next regeneration
+// attempt a Frankenstein bundle (new manifest + leftover stale artifact)
+// could load without error. With manifest-last, manifest.json's mere
+// presence reliably means this generation's other artifacts are fully on
+// disk; a failure anywhere before it leaves the previous generation's
+// manifest (and bundle) exactly as they were.
 //
-// Immediately before the manifest write (i.e. once every new-content write
-// above has succeeded), pruneStaleArtifacts removes wiki/*.md and
-// agents/*.yaml files that are on disk from a PRIOR generation but aren't
-// part of THIS bundle (an agent that was dropped, a page that was renamed)
-// — otherwise loadHarness would silently glob a stale orphan back into the
-// bundle it returns. Pruning only runs after all new-content writes
-// succeed, so a failed write never prunes-then-aborts and leaves a gap.
+// manifest.artifacts (schema.ts) records the exact relative-path set this
+// call writes (routing.yaml, wiki/<slug>.md per page, agents/<name>.yaml
+// per agent — never manifest.json itself, never cache/). Stale-artifact
+// pruning is driven entirely off that field rather than a raw directory
+// scan: readOldManifestArtifacts reads the manifest ALREADY on disk (i.e.
+// the prior generation's declared file set) BEFORE this call writes
+// anything, and pruneRemovedArtifacts — invoked only AFTER the NEW
+// manifest.json has been written successfully — deletes whatever's in that
+// old set but not in this generation's new set. Two consequences of doing
+// it this way, both required by review: (1) a file a user hand-added under
+// wiki/ or agents/ via the Harness editor (spec §7.4) was never in any
+// manifest.artifacts and can therefore never be a prune candidate, however
+// many regenerations run after it's added; (2) if the manifest write itself
+// fails, pruning — ordered strictly after it — never runs at all, so a
+// manifest-write failure can never cost the last known-good generation's
+// content (only a failed regeneration attempt, with the old manifest and
+// old bundle both left exactly as they were).
 //
 // Never touches `.openfusion/cache/` (the wiki symbol-index store) — this
 // function neither reads nor writes anything under that path.
@@ -260,6 +334,11 @@ export async function writeHarness(
 ): Promise<{ files: string[] }> {
   const parsed = HarnessBundleSchema.parse(bundle);
   const dir = harnessDir(projectDir);
+
+  // Must happen before any write below: this is the last chance to see what
+  // the PRIOR generation (if any) declared it wrote.
+  const oldArtifacts = readOldManifestArtifacts(projectDir);
+  const newArtifacts = computeArtifactPaths(parsed);
 
   ensureGitignoreGuard(dir);
 
@@ -280,13 +359,16 @@ export async function writeHarness(
     await atomicWriteFile(absPath, content);
   }
 
-  pruneStaleArtifacts(projectDir, { pages: parsed.pages, agents: parsed.agents });
-
+  const manifestWithArtifacts: Manifest = { ...parsed.manifest, artifacts: newArtifacts };
   const manifestWrite: [absPath: string, content: string] = [
     manifestPath(projectDir),
-    `${JSON.stringify(parsed.manifest, null, 2)}\n`,
+    `${JSON.stringify(manifestWithArtifacts, null, 2)}\n`,
   ];
   await atomicWriteFile(...manifestWrite);
+
+  // Only now — new manifest safely committed — is it safe to prune what the
+  // OLD manifest declared but this generation didn't rewrite.
+  pruneRemovedArtifacts(projectDir, oldArtifacts, new Set(newArtifacts));
 
   const writes = [...contentWrites, manifestWrite];
   return { files: writes.map(([absPath]) => path.relative(projectDir, absPath)) };

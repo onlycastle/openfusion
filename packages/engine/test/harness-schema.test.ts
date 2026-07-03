@@ -22,6 +22,7 @@ function validManifest(): Manifest {
     headSha: "abc123",
     generatedAt: "2026-07-03T12:00:00.000Z",
     verification: { structural: "pass", evals: "pending" },
+    artifacts: [],
   };
 }
 
@@ -117,6 +118,28 @@ describe("ManifestSchema", () => {
           ManifestSchema.safeParse({ ...validManifest(), verification: { structural, evals } }).success,
         ).toBe(true);
       }
+    }
+  });
+
+  it("accepts an explicit artifacts list of relative POSIX paths", () => {
+    const result = ManifestSchema.safeParse({
+      ...validManifest(),
+      artifacts: ["routing.yaml", "wiki/architecture.md", "agents/codegen-worker.yaml"],
+    });
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.artifacts).toEqual(["routing.yaml", "wiki/architecture.md", "agents/codegen-worker.yaml"]);
+    }
+  });
+
+  it("defaults artifacts to [] when the field is omitted (older-shaped manifest)", () => {
+    // Simulates a manifest written before this field existed: strip
+    // `artifacts` from an otherwise-valid manifest before parsing.
+    const { artifacts: _omitted, ...olderShapedManifest } = validManifest();
+    const result = ManifestSchema.safeParse(olderShapedManifest);
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.artifacts).toEqual([]);
     }
   });
 });

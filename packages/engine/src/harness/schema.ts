@@ -41,6 +41,18 @@ export const ManifestSchema = z.object({
     // runs baseline-vs-harness and flips it. Never silently trusted.
     evals: z.enum(["pending", "pass", "fail"]),
   }),
+  // Relative POSIX paths (under `.openfusion/`, e.g. "routing.yaml",
+  // "wiki/architecture.md", "agents/coder.yaml") of every harness artifact
+  // THIS generation wrote — excludes manifest.json itself and anything
+  // under cache/. store.ts's writeHarness populates this on every write and
+  // reads the PRIOR manifest's list back to know exactly which on-disk
+  // files it, itself, is responsible for and may prune on the next
+  // regeneration — as opposed to a file a user hand-added via the Harness
+  // editor (spec §7.4), which was never recorded here and must never be
+  // pruned. `.default([])` lets an older-shaped manifest (written before
+  // this field existed) still parse, as an empty — i.e. "prune nothing,
+  // I don't know what I wrote" — list.
+  artifacts: z.array(z.string()).default([]),
 });
 export type Manifest = z.infer<typeof ManifestSchema>;
 

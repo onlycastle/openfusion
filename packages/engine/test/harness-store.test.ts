@@ -48,6 +48,11 @@ function validManifest(overrides: Partial<Manifest> = {}): Manifest {
     headSha: "abc123",
     generatedAt: "2026-07-03T12:00:00.000Z",
     verification: { structural: "pass", evals: "pending" },
+    // writeHarness always overwrites this with the actual set of files it
+    // wrote (see expectedArtifacts below) — the value here is just a
+    // schema-satisfying placeholder for whatever bundle input a test
+    // constructs.
+    artifacts: [],
     ...overrides,
   };
 }
@@ -91,6 +96,20 @@ function validBundle(overrides: Partial<HarnessBundle> = {}): HarnessBundle {
     routing,
     ...overrides,
   };
+}
+
+// writeHarness overwrites manifest.artifacts with the relative-path set it
+// actually wrote (schema.ts's `Manifest.artifacts`), in routing → pages →
+// agents order — this mirrors that computation so round-trip assertions can
+// state what a freshly-written-and-reloaded bundle's manifest looks like,
+// independent of whatever (irrelevant, always overwritten) `artifacts`
+// value the input bundle happened to carry.
+function expectedArtifacts(bundle: Pick<HarnessBundle, "pages" | "agents">): string[] {
+  return [
+    "routing.yaml",
+    ...bundle.pages.map((p) => `wiki/${p.slug}.md`),
+    ...bundle.agents.map((a) => `agents/${a.name}.yaml`),
+  ];
 }
 
 describe("harnessDir", () => {
@@ -245,7 +264,55 @@ describe("writeHarness manifest-last ordering", () => {
 
     const manifestRaw = readFileSync(path.join(dir, ".openfusion/manifest.json"), "utf8");
     expect(JSON.parse(manifestRaw).headSha).toBe("abc123");
-    expect(loadHarness(dir)).toEqual(bundle);
+    expect(loadHarness(dir)).toEqual({
+      ...bundle,
+      manifest: { ...bundle.manifest, artifacts: expectedArtifacts(bundle) },
+    });
+  });
+
+  it("never prunes prior-generation content when the manifest write itself fails", async () => {
+    makeDir();
+    const agentA: AgentDef = {
+      name: "agent-a",
+      role: "worker",
+      description: "Agent A.",
+      prompt: "You are agent A.",
+      taskClasses: ["codegen"],
+      model: { kind: "deepseek", model: "deepseek-chat" },
+      escalation: { maxAttempts: 1 },
+    };
+    const agentB: AgentDef = {
+      name: "agent-b",
+      role: "worker",
+      description: "Agent B.",
+      prompt: "You are agent B.",
+      taskClasses: ["docs"],
+      model: { kind: "deepseek", model: "deepseek-chat" },
+      escalation: { maxAttempts: 1 },
+    };
+    const bundleA = validBundle({ agents: [agentA, agentB] });
+    await writeHarness(dir, bundleA);
+    expect(existsSync(path.join(dir, ".openfusion/agents/agent-b.yaml"))).toBe(true);
+
+    fsFailure.matchSubstring = ".manifest.json.tmp-";
+    // bundle B drops agent-b — if prune ran before the (failing) manifest
+    // write, agent-b.yaml would already be gone by the time the manifest
+    // write throws. It must not be: prune only runs AFTER the new manifest
+    // is safely committed, and this manifest write never commits.
+    const bundleB = validBundle({
+      manifest: validManifest({ headSha: "new-sha-999" }),
+      agents: [agentA],
+    });
+    await expect(writeHarness(dir, bundleB)).rejects.toThrow("injected write failure");
+
+    expect(existsSync(path.join(dir, ".openfusion/agents/agent-b.yaml"))).toBe(true);
+    expect(existsSync(path.join(dir, ".openfusion/agents/agent-a.yaml"))).toBe(true);
+
+    const manifestRaw = readFileSync(path.join(dir, ".openfusion/manifest.json"), "utf8");
+    expect(JSON.parse(manifestRaw).headSha).toBe("abc123");
+
+    const loaded = loadHarness(dir);
+    expect(loaded?.agents.map((a) => a.name).sort()).toEqual(["agent-a", "agent-b"]);
   });
 });
 
@@ -273,6 +340,13 @@ describe("writeHarness stale artifact pruning", () => {
     await writeHarness(dir, validBundle({ agents: [agentA, agentB] }));
     expect(existsSync(path.join(dir, ".openfusion/agents/agent-a.yaml"))).toBe(true);
     expect(existsSync(path.join(dir, ".openfusion/agents/agent-b.yaml"))).toBe(true);
+
+    // The manifest this generation just wrote must record agent-b.yaml as
+    // one of its artifacts — that's what makes it legitimately prunable on
+    // the NEXT regeneration (as opposed to a hand-authored file, which is
+    // never in any manifest.artifacts and must never be pruned).
+    const manifestAfterFirstWrite = JSON.parse(readFileSync(path.join(dir, ".openfusion/manifest.json"), "utf8"));
+    expect(manifestAfterFirstWrite.artifacts).toContain("agents/agent-b.yaml");
 
     await writeHarness(dir, validBundle({ agents: [agentA] }));
 
@@ -302,6 +376,32 @@ describe("writeHarness stale artifact pruning", () => {
     const loaded = loadHarness(dir);
     expect(loaded?.pages.map((p) => p.slug).sort()).toEqual(["architecture-renamed", "build-and-test"]);
   });
+
+  it("never prunes hand-authored wiki/agent files that were never recorded in any manifest", async () => {
+    makeDir();
+    const bundle = validBundle();
+    await writeHarness(dir, bundle);
+
+    // A user (via the Harness editor, spec §7.4) drops these directly into
+    // wiki/ and agents/ WITHOUT going through writeHarness — they were
+    // never part of ANY generation's manifest.artifacts.
+    writeFileSync(
+      path.join(dir, ".openfusion/agents/handmade.yaml"),
+      "name: handmade\nrole: worker\ndescription: Hand-authored via the Harness editor.\nprompt: You are a hand-authored agent.\ntaskClasses:\n  - custom\nmodel: frontier\nescalation:\n  maxAttempts: 1\n",
+    );
+    writeFileSync(
+      path.join(dir, ".openfusion/wiki/notes.md"),
+      "---\ntitle: Notes\ndigest: Hand-authored notes page.\n---\n\n# Notes\n\nHand-authored content.\n",
+    );
+
+    // Regenerate the SAME bundle again — neither hand-authored file is (or
+    // ever was) in bundle.pages/bundle.agents, so a manifest-driven prune
+    // must leave both alone.
+    await writeHarness(dir, bundle);
+
+    expect(existsSync(path.join(dir, ".openfusion/agents/handmade.yaml"))).toBe(true);
+    expect(existsSync(path.join(dir, ".openfusion/wiki/notes.md"))).toBe(true);
+  });
 });
 
 describe("loadHarness", () => {
@@ -315,7 +415,10 @@ describe("loadHarness", () => {
     const bundle = validBundle();
     await writeHarness(dir, bundle);
     const loaded = loadHarness(dir);
-    expect(loaded).toEqual(bundle);
+    expect(loaded).toEqual({
+      ...bundle,
+      manifest: { ...bundle.manifest, artifacts: expectedArtifacts(bundle) },
+    });
   });
 
   it("round-trips a digest at the 1200-char ceiling and a multi-line prompt/body", async () => {
@@ -325,7 +428,10 @@ describe("loadHarness", () => {
     bundle.pages[0]!.body = "line one\nline two\n\n- bullet\n- bullet 2\n";
     bundle.agents[0]!.prompt = "Line 1.\nLine 2.\n\nLine 4 after a blank line.";
     await writeHarness(dir, bundle);
-    expect(loadHarness(dir)).toEqual(bundle);
+    expect(loadHarness(dir)).toEqual({
+      ...bundle,
+      manifest: { ...bundle.manifest, artifacts: expectedArtifacts(bundle) },
+    });
   });
 
   it("throws HarnessValidationError when manifest.json is corrupt JSON", async () => {
