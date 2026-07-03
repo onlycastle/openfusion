@@ -4,6 +4,7 @@ import { HarnessService, registerHarnessMethods } from "./harness/methods.js";
 import { registerCoreMethods } from "./methods.js";
 import { ModelsService, registerModelsMethods } from "./models/methods.js";
 import { WikiService, registerWikiMethods } from "./wiki/methods.js";
+import { WorkerService, registerWorkerMethods } from "./worker/methods.js";
 
 export interface EngineOptions {
   log?: (message: string) => void;
@@ -23,6 +24,7 @@ export class Engine {
   readonly models = new ModelsService();
   readonly frontier = new FrontierService();
   readonly harness = new HarnessService();
+  readonly worker = new WorkerService();
 
   constructor(options: EngineOptions = {}) {
     this.log = options.log ?? (() => {});
@@ -32,6 +34,7 @@ export class Engine {
     registerModelsMethods(this);
     registerFrontierMethods(this);
     registerHarnessMethods(this);
+    registerWorkerMethods(this);
   }
 
   async close(): Promise<void> {
@@ -99,3 +102,10 @@ export {
   loadHarness,
   writeHarness,
 } from "./harness/store.js";
+export { WorkerService, registerWorkerMethods } from "./worker/methods.js";
+export { WorktreeManager } from "./worker/worktree.js";
+export type { Worktree } from "./worker/worktree.js";
+export { createWorkerTools } from "./worker/tools.js";
+export type { ToolContext } from "./worker/tools.js";
+export { runWorkerLoop } from "./worker/loop.js";
+export type { WorkerRunInput, WorkerRunResult } from "./worker/loop.js";

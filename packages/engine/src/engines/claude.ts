@@ -213,19 +213,34 @@ export function createClaudeAdapter(options: CreateClaudeAdapterOptions = {}): F
       // this is defense-in-depth at the trust boundary this adapter owns,
       // not the primary gate — and contributes nothing to writeScopeDirs,
       // so no write can ever land there.
+      //
+      // M5a task-1 (M4 T1 deferred, day-one critical for worker worktrees):
+      // the fallback below for a scope dir that doesn't exist yet used to
+      // be `resolved` itself — built off the RAW projectDir — compared
+      // against `canonicalProjectDir`, which IS realpath'd. On a symlinked
+      // project root (macOS os.tmpdir() -> /var/folders, really
+      // /private/var/folders; worker worktrees live under os.tmpdir()) that
+      // lexical-vs-canonical mismatch made the filter below drop every
+      // legitimate not-yet-existing scope dir, denying all writes to it —
+      // the exact scenario every worker worktree hits on session start,
+      // before its scope dirs exist. Fixed by re-anchoring `resolved`'s
+      // path relative to the raw project dir onto `canonicalProjectDir`
+      // instead, so the filter always compares canonical-vs-canonical
+      // regardless of whether realpath succeeded or a dir doesn't exist yet.
       let canonicalProjectDir: string;
       try {
         canonicalProjectDir = fs.realpathSync(projectDir);
       } catch {
         canonicalProjectDir = path.resolve(projectDir);
       }
+      const projectDirResolved = path.resolve(projectDir);
       const writeScopeDirs = (toolPolicy?.writeScope ?? [])
         .map((dir) => {
           const resolved = path.resolve(projectDir, dir);
           try {
             return fs.realpathSync(resolved);
           } catch {
-            return resolved;
+            return path.resolve(canonicalProjectDir, path.relative(projectDirResolved, resolved));
           }
         })
         .filter((realDir) => {
