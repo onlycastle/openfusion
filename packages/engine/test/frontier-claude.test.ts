@@ -1,4 +1,7 @@
-import { describe, expect, it } from "vitest";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync } from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { afterEach, describe, expect, it } from "vitest";
 import type { Options, Query, SDKMessage } from "@anthropic-ai/claude-agent-sdk";
 import { createClaudeAdapter } from "../src/engines/claude.js";
 import type { FrontierPromptHandle } from "../src/engines/types.js";
@@ -125,6 +128,21 @@ async function drain(handle: FrontierPromptHandle) {
 }
 
 const noopLog = () => {};
+
+// Shared by both write-scope describe blocks below (lexical containment and
+// symlink-canonical containment) so the two suites exercise canUseTool
+// through the exact same setup helper.
+const signalOpts = { signal: new AbortController().signal, toolUseID: "tu_1" };
+
+async function getCanUseTool(toolPolicy: { writeScope?: string[] } | undefined, projectDir = "/repo") {
+  const { queryFn, captured } = makeQueryFn([[RESULT_MSG]]);
+  const adapter = createClaudeAdapter({ queryFn });
+  const session = await adapter.createSession({ projectDir, wikiMcpUrl: null, log: noopLog, toolPolicy });
+  await drain(session.prompt("hi"));
+  const canUseTool = captured[0]?.canUseTool;
+  expect(typeof canUseTool).toBe("function");
+  return { canUseTool: canUseTool!, captured };
+}
 
 describe("createClaudeAdapter", () => {
   it("has kind claude-code", () => {
@@ -286,21 +304,6 @@ describe("createClaudeAdapter", () => {
 // appear in `allowedTools` even when writeScope is set, since that would
 // bypass canUseTool entirely.
 describe("canUseTool write-scope policy (toolPolicy.writeScope)", () => {
-  const signalOpts = { signal: new AbortController().signal, toolUseID: "tu_1" };
-
-  async function getCanUseTool(
-    toolPolicy: { writeScope?: string[] } | undefined,
-    projectDir = "/repo",
-  ) {
-    const { queryFn, captured } = makeQueryFn([[RESULT_MSG]]);
-    const adapter = createClaudeAdapter({ queryFn });
-    const session = await adapter.createSession({ projectDir, wikiMcpUrl: null, log: noopLog, toolPolicy });
-    await drain(session.prompt("hi"));
-    const canUseTool = captured[0]?.canUseTool;
-    expect(typeof canUseTool).toBe("function");
-    return { canUseTool: canUseTool!, captured };
-  }
-
   it("allows Write when file_path resolves inside a writeScope dir", async () => {
     const { canUseTool } = await getCanUseTool({ writeScope: ["/repo/scratch"] }, "/repo");
     const result = await canUseTool(
@@ -413,6 +416,73 @@ describe("canUseTool write-scope policy (toolPolicy.writeScope)", () => {
   });
 });
 
+// M4 task-1 review round 1, Finding 2 (Important): isPathInScope is purely
+// lexical — a symlink INSIDE a writeScope dir pointing OUTSIDE it let a
+// write "resolve inside scope" lexically while actually landing outside.
+// canUseTool now canonicalizes the target (walk up to the deepest existing
+// ancestor, fs.realpathSync it, re-join the non-existent tail — see
+// ./path-scope.ts's canonicalizePath) before the containment check, and the
+// scope dirs themselves are realpath'd once at session creation. Uses real
+// tmp dirs (not the "/repo" fixture the suite above uses) since this needs
+// actual symlinks and actual existing/non-existing paths on disk.
+describe("canUseTool symlink-canonical path checks (Finding 2)", () => {
+  let tmpRoot: string;
+
+  afterEach(() => {
+    if (tmpRoot !== undefined) rmSync(tmpRoot, { recursive: true, force: true });
+  });
+
+  it("denies a write whose path traverses a pre-existing symlink pointing outside the scope dir", async () => {
+    tmpRoot = mkdtempSync(path.join(os.tmpdir(), "of-claude-symlink-"));
+    const scopeDir = path.join(tmpRoot, "S");
+    const outsideDir = path.join(tmpRoot, "outside");
+    mkdirSync(scopeDir, { recursive: true });
+    mkdirSync(outsideDir, { recursive: true });
+    symlinkSync(outsideDir, path.join(scopeDir, "link"));
+
+    const { canUseTool } = await getCanUseTool({ writeScope: [scopeDir] }, tmpRoot);
+    const result = await canUseTool(
+      "Write",
+      { file_path: path.join(scopeDir, "link", "file.txt"), content: "x" },
+      signalOpts,
+    );
+    expect(result.behavior).toBe("deny");
+  });
+
+  it("allows a write to a not-yet-existing nested path inside scope (non-existent tail handled)", async () => {
+    tmpRoot = mkdtempSync(path.join(os.tmpdir(), "of-claude-symlink-"));
+    const scopeDir = path.join(tmpRoot, "S");
+    mkdirSync(scopeDir, { recursive: true });
+
+    const { canUseTool } = await getCanUseTool({ writeScope: [scopeDir] }, tmpRoot);
+    // "sub" does not exist yet — the target path's tail is created by the
+    // write itself, so containment must be checked against the deepest
+    // EXISTING ancestor (scopeDir) rather than failing to canonicalize.
+    const result = await canUseTool(
+      "Write",
+      { file_path: path.join(scopeDir, "sub", "new.txt"), content: "x" },
+      signalOpts,
+    );
+    expect(result).toEqual({ behavior: "allow" });
+  });
+
+  it("still allows writes when the scope dir itself is a symlink (scope dirs realpath'd at session creation)", async () => {
+    tmpRoot = mkdtempSync(path.join(os.tmpdir(), "of-claude-symlink-"));
+    const realScopeDir = path.join(tmpRoot, "real-scope");
+    const scopeLink = path.join(tmpRoot, "scope-link");
+    mkdirSync(realScopeDir, { recursive: true });
+    symlinkSync(realScopeDir, scopeLink);
+
+    const { canUseTool } = await getCanUseTool({ writeScope: [scopeLink] }, tmpRoot);
+    const result = await canUseTool(
+      "Write",
+      { file_path: path.join(scopeLink, "note.txt"), content: "x" },
+      signalOpts,
+    );
+    expect(result).toEqual({ behavior: "allow" });
+  });
+});
+
 // M4 task-1: rate-limit visibility. SDKAssistantMessage carries an optional
 // top-level `error?: SDKAssistantMessageError` tag (inspected in
 // @anthropic-ai/claude-agent-sdk@0.3.198's sdk.d.ts) — a bare string enum
@@ -430,6 +500,13 @@ describe("assistant-message API-error -> notice event mapping", () => {
     } as unknown as SDKMessage;
   }
 
+  // M4 task-1 review round 1, Finding 3 (Important): the old copy ("...the
+  // request will be retried automatically") asserted retry semantics never
+  // verified against the SDK — that belongs to SDKAPIRetryMessage, a
+  // different message type this adapter doesn't map. The notice message is
+  // now purely factual (no remediation claim), asserted here with an exact
+  // match rather than a loose substring so the copy can't drift back toward
+  // an unverified claim unnoticed.
   it("maps a rate_limit assistant error to a notice event, then continues to result", async () => {
     const { queryFn } = makeQueryFn([[assistantErrorMsg("rate_limit"), RESULT_MSG]]);
     const adapter = createClaudeAdapter({ queryFn });
@@ -441,7 +518,7 @@ describe("assistant-message API-error -> notice event mapping", () => {
     expect(events[0]).toEqual({
       type: "notice",
       kind: "rate_limit",
-      message: expect.stringContaining("rate limit") as unknown as string,
+      message: "Claude API rate limit reported for this turn.",
     });
   });
 
@@ -456,7 +533,7 @@ describe("assistant-message API-error -> notice event mapping", () => {
     expect(events[0]).toEqual({
       type: "notice",
       kind: "overloaded",
-      message: expect.stringContaining("overloaded") as unknown as string,
+      message: "Claude API overloaded for this turn.",
     });
   });
 

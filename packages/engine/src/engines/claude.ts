@@ -35,10 +35,21 @@
 // NotebookEdit calls whose target path resolves inside one of them —
 // `allowedTools` (READ_ONLY_ALLOWED_TOOLS) is untouched; write tools are
 // NEVER added to it, for exactly the reason documented above.
+//
+// M4 task-1 review round 1 hardened that containment check twice: (Finding
+// 1) the containment predicate is now the shared `isPathContained` in
+// ./path-scope.ts, also used by methods.ts's RPC-layer writeScope
+// validation, so a relative traversal entry can no longer establish
+// out-of-project scope at one layer while the other layer disagrees; and
+// (Finding 2) a target path is canonicalized (symlinks resolved) before the
+// containment check, so a pre-existing symlink inside a scope dir pointing
+// outside it can no longer be used to write out-of-scope.
 import { randomUUID } from "node:crypto";
+import fs from "node:fs";
 import path from "node:path";
 import { query } from "@anthropic-ai/claude-agent-sdk";
 import type { ModelUsage, Query, SDKAssistantMessageError } from "@anthropic-ai/claude-agent-sdk";
+import { canonicalizePath, isPathContained } from "./path-scope.js";
 import type { FrontierAdapter, FrontierEvent, FrontierPromptHandle, FrontierSession } from "./types.js";
 
 const CLAUDE_CODE_KIND = "claude-code";
@@ -76,14 +87,13 @@ function extractWriteTargetPath(input: Record<string, unknown>): string | null {
   return null;
 }
 
-// Prefix check with a path.sep guard: a scope of "/a/b" must NOT match
-// "/a/bad" (a naive `target.startsWith(scopeDir)` would, since "/a/b" is a
-// literal string prefix of "/a/bad"). Exact match also counts as in-scope
-// (writing the scope directory's own path itself, edge case but correct).
-function isPathInScope(resolvedTarget: string, scopeDirs: string[]): boolean {
-  return scopeDirs.some(
-    (scopeDir) => resolvedTarget === scopeDir || resolvedTarget.startsWith(scopeDir + path.sep),
-  );
+// Containment check delegated to the shared ./path-scope.ts helper (M4
+// task-1 review round 1, Finding 1) so this adapter's canUseTool policy and
+// methods.ts's RPC-layer writeScope validation share one predicate and
+// cannot drift apart. `canonicalTarget` is expected to already be
+// symlink-resolved by the caller (see canonicalizePath below, Finding 2).
+function isPathInScope(canonicalTarget: string, scopeDirs: string[]): boolean {
+  return scopeDirs.some((scopeDir) => isPathContained(canonicalTarget, scopeDir));
 }
 
 // SDKAssistantMessage carries an optional top-level `error?:
@@ -98,16 +108,22 @@ function isPathInScope(resolvedTarget: string, scopeDirs: string[]): boolean {
 function mapAssistantError(error: SDKAssistantMessageError): FrontierNoticeEvent {
   switch (error) {
     case "rate_limit":
+      // M4 task-1 review round 1, Finding 3 (Important): the previous copy
+      // ("...the request will be retried automatically") asserted retry
+      // semantics that were never verified against the SDK — that behavior,
+      // if it exists, belongs to SDKAPIRetryMessage (system/api_retry), a
+      // different message type this function doesn't map. Kept factual: no
+      // remediation claim, just what was observed.
       return {
         type: "notice",
         kind: "rate_limit",
-        message: "Claude API rate limit reached; the request will be retried automatically.",
+        message: "Claude API rate limit reported for this turn.",
       };
     case "overloaded":
       return {
         type: "notice",
         kind: "overloaded",
-        message: "Claude API is currently overloaded; the request will be retried automatically.",
+        message: "Claude API overloaded for this turn.",
       };
     default:
       return { type: "notice", kind: "api_error", message: `Claude API error: ${error}` };
@@ -162,7 +178,23 @@ export function createClaudeAdapter(options: CreateClaudeAdapterOptions = {}): F
       // projectDir-resolved entries — see types.ts's createSession opts doc)
       // and defensively anchors a hypothetically-relative one to projectDir
       // rather than process.cwd() for any other caller of this adapter.
-      const writeScopeDirs = (toolPolicy?.writeScope ?? []).map((dir) => path.resolve(projectDir, dir));
+      //
+      // Also realpath'd here (M4 task-1 review round 1, Finding 2): scope
+      // dirs generally exist by the time a session starts, so canonicalizing
+      // them up front means every canUseTool call below compares a
+      // canonicalized target against a canonicalized scope — not a
+      // canonicalized target against a merely-lexical scope dir (which would
+      // stay bypassable if the scope dir ITSELF were a symlink). A scope dir
+      // that doesn't exist yet falls back to its resolved (non-canonical)
+      // path — there's nothing to realpath.
+      const writeScopeDirs = (toolPolicy?.writeScope ?? []).map((dir) => {
+        const resolved = path.resolve(projectDir, dir);
+        try {
+          return fs.realpathSync(resolved);
+        } catch {
+          return resolved;
+        }
+      });
 
       return {
         id,
@@ -198,7 +230,17 @@ export function createClaudeAdapter(options: CreateClaudeAdapterOptions = {}): F
                   const targetPath = extractWriteTargetPath(input);
                   if (targetPath !== null) {
                     const resolvedTarget = path.resolve(projectDir, targetPath);
-                    if (isPathInScope(resolvedTarget, writeScopeDirs)) {
+                    // Canonicalize before the containment check (M4 task-1
+                    // review round 1, Finding 2): a purely lexical check over
+                    // resolvedTarget would treat `scope/link/file.txt` as
+                    // in-scope even when `scope/link` is a pre-existing
+                    // symlink pointing outside scope. canonicalizePath walks
+                    // up to the deepest existing ancestor, realpaths it, and
+                    // re-joins the (possibly not-yet-existing) tail — see
+                    // ./path-scope.ts for the residual TOCTOU caveat this
+                    // does NOT close.
+                    const canonicalTarget = canonicalizePath(resolvedTarget);
+                    if (isPathInScope(canonicalTarget, writeScopeDirs)) {
                       return { behavior: "allow" };
                     }
                   }

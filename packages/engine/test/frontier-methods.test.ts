@@ -661,4 +661,59 @@ describe("frontier RPC methods", () => {
     expect(start.error).toBeUndefined();
     expect(capturedToolPolicy).toEqual([undefined]);
   });
+
+  // M4 task-1 review round 1, Finding 1 (Important): the absolute-path
+  // refine above only catches entries that are already absolute. A RELATIVE
+  // traversal entry like "../../elsewhere" is still relative, so it passed
+  // that refine untouched, resolved outside projectDir, and became trusted
+  // write scope — a containment escape. Every resolved entry must now also
+  // be checked against projectDir itself (via the shared isPathContained
+  // helper in ./path-scope.ts, the same predicate claude.ts's canUseTool
+  // uses) and rejected as INVALID_PARAMS if it lands outside.
+  it("rejects a writeScope entry that escapes the project via relative traversal (../../elsewhere)", async () => {
+    dir = makeRepo();
+    engine = createEngine();
+    engine.frontier.registerAdapter(makeFakeAdapter());
+
+    const res = await call("engine.frontier.start", {
+      projectDir: dir,
+      attachWiki: false,
+      writeScope: ["../../elsewhere"],
+    });
+    expect(res.error?.code).toBe(RpcErrorCodes.INVALID_PARAMS);
+    expect(res.error?.message).toContain("writeScope entry resolves outside the project");
+  });
+
+  it("accepts '.' and '.openfusion' as writeScope entries (both resolve inside projectDir)", async () => {
+    dir = makeRepo();
+    engine = createEngine();
+    const capturedToolPolicy: Array<{ writeScope?: string[] } | undefined> = [];
+    engine.frontier.registerAdapter(makeFakeAdapter({ capturedToolPolicy }));
+
+    const start = await call("engine.frontier.start", {
+      projectDir: dir,
+      attachWiki: false,
+      writeScope: [".", ".openfusion"],
+    });
+    expect(start.error).toBeUndefined();
+    expect(capturedToolPolicy).toHaveLength(1);
+    expect(capturedToolPolicy[0]?.writeScope).toEqual([
+      path.resolve(dir),
+      path.resolve(dir, ".openfusion"),
+    ]);
+  });
+
+  it("rejects a writeScope entry that escapes the project via a same-prefix traversal (.openfusion/../..)", async () => {
+    dir = makeRepo();
+    engine = createEngine();
+    engine.frontier.registerAdapter(makeFakeAdapter());
+
+    const res = await call("engine.frontier.start", {
+      projectDir: dir,
+      attachWiki: false,
+      writeScope: [".openfusion/../.."],
+    });
+    expect(res.error?.code).toBe(RpcErrorCodes.INVALID_PARAMS);
+    expect(res.error?.message).toContain("writeScope entry resolves outside the project");
+  });
 });
