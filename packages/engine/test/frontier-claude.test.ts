@@ -276,3 +276,212 @@ describe("createClaudeAdapter", () => {
     expect(captured[1]?.resume).toBeUndefined();
   });
 });
+
+// M4 task-1: path-scoped write capability. `toolPolicy.writeScope` is
+// absent by default (today's read-only posture, unchanged); when present,
+// canUseTool allows Write/Edit/MultiEdit/NotebookEdit calls whose resolved
+// target path lands inside one of the scope directories, and keeps denying
+// everything else — including the same tools outside scope. Per the
+// corrected M3 tool-policy record in claude.ts, write tools must never
+// appear in `allowedTools` even when writeScope is set, since that would
+// bypass canUseTool entirely.
+describe("canUseTool write-scope policy (toolPolicy.writeScope)", () => {
+  const signalOpts = { signal: new AbortController().signal, toolUseID: "tu_1" };
+
+  async function getCanUseTool(
+    toolPolicy: { writeScope?: string[] } | undefined,
+    projectDir = "/repo",
+  ) {
+    const { queryFn, captured } = makeQueryFn([[RESULT_MSG]]);
+    const adapter = createClaudeAdapter({ queryFn });
+    const session = await adapter.createSession({ projectDir, wikiMcpUrl: null, log: noopLog, toolPolicy });
+    await drain(session.prompt("hi"));
+    const canUseTool = captured[0]?.canUseTool;
+    expect(typeof canUseTool).toBe("function");
+    return { canUseTool: canUseTool!, captured };
+  }
+
+  it("allows Write when file_path resolves inside a writeScope dir", async () => {
+    const { canUseTool } = await getCanUseTool({ writeScope: ["/repo/scratch"] }, "/repo");
+    const result = await canUseTool(
+      "Write",
+      { file_path: "/repo/scratch/notes.txt", content: "x" },
+      signalOpts,
+    );
+    expect(result).toEqual({ behavior: "allow" });
+  });
+
+  it("denies Write when file_path resolves outside every writeScope dir", async () => {
+    const { canUseTool } = await getCanUseTool({ writeScope: ["/repo/scratch"] }, "/repo");
+    const result = await canUseTool(
+      "Write",
+      { file_path: "/repo/other/notes.txt", content: "x" },
+      signalOpts,
+    );
+    expect(result).toEqual({
+      behavior: "deny",
+      message: expect.stringContaining("read-only") as unknown as string,
+    });
+  });
+
+  it("denies a `../` traversal that escapes the writeScope dir", async () => {
+    const { canUseTool } = await getCanUseTool({ writeScope: ["/repo/scratch"] }, "/repo");
+    const result = await canUseTool(
+      "Write",
+      { file_path: "/repo/scratch/../../etc/passwd", content: "x" },
+      signalOpts,
+    );
+    expect(result.behavior).toBe("deny");
+  });
+
+  it("does not treat a sibling dir sharing a string prefix as in-scope (/a/b vs /a/bad)", async () => {
+    const { canUseTool } = await getCanUseTool({ writeScope: ["/a/b"] }, "/a");
+    const result = await canUseTool("Write", { file_path: "/a/bad/file.txt", content: "x" }, signalOpts);
+    expect(result.behavior).toBe("deny");
+  });
+
+  it("allows Edit in-scope via file_path", async () => {
+    const { canUseTool } = await getCanUseTool({ writeScope: ["/repo/scratch"] }, "/repo");
+    const result = await canUseTool(
+      "Edit",
+      { file_path: "/repo/scratch/a.ts", old_string: "a", new_string: "b" },
+      signalOpts,
+    );
+    expect(result).toEqual({ behavior: "allow" });
+  });
+
+  it("allows MultiEdit in-scope via file_path", async () => {
+    const { canUseTool } = await getCanUseTool({ writeScope: ["/repo/scratch"] }, "/repo");
+    const result = await canUseTool(
+      "MultiEdit",
+      { file_path: "/repo/scratch/a.ts", edits: [{ old_string: "a", new_string: "b" }] },
+      signalOpts,
+    );
+    expect(result).toEqual({ behavior: "allow" });
+  });
+
+  it("allows NotebookEdit in-scope via notebook_path", async () => {
+    const { canUseTool } = await getCanUseTool({ writeScope: ["/repo/scratch"] }, "/repo");
+    const result = await canUseTool(
+      "NotebookEdit",
+      { notebook_path: "/repo/scratch/nb.ipynb", new_source: "print(1)", cell_id: "c1" },
+      signalOpts,
+    );
+    expect(result).toEqual({ behavior: "allow" });
+  });
+
+  it("denies NotebookEdit outside scope", async () => {
+    const { canUseTool } = await getCanUseTool({ writeScope: ["/repo/scratch"] }, "/repo");
+    const result = await canUseTool(
+      "NotebookEdit",
+      { notebook_path: "/repo/other/nb.ipynb", new_source: "print(1)" },
+      signalOpts,
+    );
+    expect(result.behavior).toBe("deny");
+  });
+
+  it("still denies non-write tools even inside the writeScope dir", async () => {
+    const { canUseTool } = await getCanUseTool({ writeScope: ["/repo/scratch"] }, "/repo");
+    const result = await canUseTool("Bash", { command: "rm -rf /repo/scratch" }, signalOpts);
+    expect(result.behavior).toBe("deny");
+  });
+
+  it("with no toolPolicy at all, still denies write tools (default deny-all unchanged)", async () => {
+    const { canUseTool } = await getCanUseTool(undefined, "/repo");
+    const result = await canUseTool("Write", { file_path: "/repo/anything.txt", content: "x" }, signalOpts);
+    expect(result).toEqual({
+      behavior: "deny",
+      message: expect.stringContaining("read-only") as unknown as string,
+    });
+  });
+
+  it("with toolPolicy set but writeScope empty/absent, still denies write tools", async () => {
+    const { canUseTool } = await getCanUseTool({}, "/repo");
+    const result = await canUseTool("Write", { file_path: "/repo/anything.txt", content: "x" }, signalOpts);
+    expect(result.behavior).toBe("deny");
+  });
+
+  it("never adds write tools to allowedTools even when writeScope is set", async () => {
+    const { captured } = await getCanUseTool({ writeScope: ["/repo/scratch"] }, "/repo");
+    expect(captured[0]?.allowedTools).toEqual([
+      "Read",
+      "Grep",
+      "Glob",
+      "mcp__wiki__wiki_query",
+      "mcp__wiki__wiki_map",
+    ]);
+  });
+});
+
+// M4 task-1: rate-limit visibility. SDKAssistantMessage carries an optional
+// top-level `error?: SDKAssistantMessageError` tag (inspected in
+// @anthropic-ai/claude-agent-sdk@0.3.198's sdk.d.ts) — a bare string enum
+// with no accompanying message text, unlike a typical error object. The
+// adapter maps that tag to a FrontierEvent `notice`, synthesizing its own
+// human-readable `message`. This is NOT terminal: the mapping loop keeps
+// running afterward (proven here by asserting the stream still reaches a
+// `result` event).
+describe("assistant-message API-error -> notice event mapping", () => {
+  function assistantErrorMsg(error: string): SDKMessage {
+    return {
+      type: "assistant",
+      message: { content: [] },
+      error,
+    } as unknown as SDKMessage;
+  }
+
+  it("maps a rate_limit assistant error to a notice event, then continues to result", async () => {
+    const { queryFn } = makeQueryFn([[assistantErrorMsg("rate_limit"), RESULT_MSG]]);
+    const adapter = createClaudeAdapter({ queryFn });
+    const session = await adapter.createSession({ projectDir: "/repo", wikiMcpUrl: null, log: noopLog });
+
+    const events = await drain(session.prompt("hi"));
+
+    expect(events.map((e) => e.type)).toEqual(["notice", "result"]);
+    expect(events[0]).toEqual({
+      type: "notice",
+      kind: "rate_limit",
+      message: expect.stringContaining("rate limit") as unknown as string,
+    });
+  });
+
+  it("maps an overloaded assistant error to a notice event, then continues to result", async () => {
+    const { queryFn } = makeQueryFn([[assistantErrorMsg("overloaded"), RESULT_MSG]]);
+    const adapter = createClaudeAdapter({ queryFn });
+    const session = await adapter.createSession({ projectDir: "/repo", wikiMcpUrl: null, log: noopLog });
+
+    const events = await drain(session.prompt("hi"));
+
+    expect(events.map((e) => e.type)).toEqual(["notice", "result"]);
+    expect(events[0]).toEqual({
+      type: "notice",
+      kind: "overloaded",
+      message: expect.stringContaining("overloaded") as unknown as string,
+    });
+  });
+
+  it("maps any other assistant-message error tag to kind api_error", async () => {
+    const { queryFn } = makeQueryFn([[assistantErrorMsg("server_error"), RESULT_MSG]]);
+    const adapter = createClaudeAdapter({ queryFn });
+    const session = await adapter.createSession({ projectDir: "/repo", wikiMcpUrl: null, log: noopLog });
+
+    const events = await drain(session.prompt("hi"));
+
+    expect(events.map((e) => e.type)).toEqual(["notice", "result"]);
+    expect(events[0]).toEqual({
+      type: "notice",
+      kind: "api_error",
+      message: expect.stringContaining("server_error") as unknown as string,
+    });
+  });
+
+  it("an assistant message without an error tag maps its content as before (no spurious notice)", async () => {
+    const { queryFn } = makeQueryFn([[ASSISTANT_MSG, RESULT_MSG]]);
+    const adapter = createClaudeAdapter({ queryFn });
+    const session = await adapter.createSession({ projectDir: "/repo", wikiMcpUrl: null, log: noopLog });
+
+    const events = await drain(session.prompt("hi"));
+
+    expect(events.map((e) => e.type)).toEqual(["text", "tool_use", "result"]);
+  });
+});

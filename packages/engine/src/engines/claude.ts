@@ -28,9 +28,17 @@
 // `canUseTool` policy (e.g. a path-scoped allow for a specific write tool),
 // never by adding a tool to `allowedTools` — anything placed there bypasses
 // `canUseTool`'s policy entirely, by design of the SDK itself.
+//
+// M4 task-1 builds exactly that: `toolPolicy.writeScope` (see
+// createSession's opts, ./types.ts) is a list of directories. When present
+// and non-empty, `canUseTool` below allows Write / Edit / MultiEdit /
+// NotebookEdit calls whose target path resolves inside one of them —
+// `allowedTools` (READ_ONLY_ALLOWED_TOOLS) is untouched; write tools are
+// NEVER added to it, for exactly the reason documented above.
 import { randomUUID } from "node:crypto";
+import path from "node:path";
 import { query } from "@anthropic-ai/claude-agent-sdk";
-import type { ModelUsage, Query } from "@anthropic-ai/claude-agent-sdk";
+import type { ModelUsage, Query, SDKAssistantMessageError } from "@anthropic-ai/claude-agent-sdk";
 import type { FrontierAdapter, FrontierEvent, FrontierPromptHandle, FrontierSession } from "./types.js";
 
 const CLAUDE_CODE_KIND = "claude-code";
@@ -42,7 +50,69 @@ const CLAUDE_CODE_KIND = "claude-code";
 // Bash entry would.
 const READ_ONLY_ALLOWED_TOOLS = ["Read", "Grep", "Glob", "mcp__wiki__wiki_query", "mcp__wiki__wiki_map"];
 
+// The write-capable tools canUseTool may allow when writeScope is set.
+// MultiEdit has no interface of its own in this SDK version's sdk-tools.d.ts
+// (@anthropic-ai/claude-agent-sdk@0.3.198 defines FileEditInput for Edit,
+// FileWriteInput for Write, and NotebookEditInput for NotebookEdit, but no
+// MultiEdit type at all) — included here anyway, defensively, since Claude
+// Code has historically shipped it with a `file_path` field matching Edit's;
+// extractWriteTargetPath below handles it via the same `file_path` lookup.
+const WRITE_TOOLS = new Set(["Write", "Edit", "MultiEdit", "NotebookEdit"]);
+
 type FrontierResultEvent = Extract<FrontierEvent, { type: "result" }>;
+type FrontierNoticeEvent = Extract<FrontierEvent, { type: "notice" }>;
+
+// Write/Edit tool inputs (FileWriteInput/FileEditInput in sdk-tools.d.ts)
+// name their target path `file_path`; NotebookEdit's (NotebookEditInput)
+// names it `notebook_path`. Neither uses a bare `path` field — that spelling
+// belongs to Glob/Grep's read-only "search root" input — but it's checked
+// last anyway as a defensive fallback per the M4 task-1 brief, in case a
+// future write tool (or SDK version) spells it differently.
+function extractWriteTargetPath(input: Record<string, unknown>): string | null {
+  for (const key of ["file_path", "notebook_path", "path"]) {
+    const value = input[key];
+    if (typeof value === "string" && value.length > 0) return value;
+  }
+  return null;
+}
+
+// Prefix check with a path.sep guard: a scope of "/a/b" must NOT match
+// "/a/bad" (a naive `target.startsWith(scopeDir)` would, since "/a/b" is a
+// literal string prefix of "/a/bad"). Exact match also counts as in-scope
+// (writing the scope directory's own path itself, edge case but correct).
+function isPathInScope(resolvedTarget: string, scopeDirs: string[]): boolean {
+  return scopeDirs.some(
+    (scopeDir) => resolvedTarget === scopeDir || resolvedTarget.startsWith(scopeDir + path.sep),
+  );
+}
+
+// SDKAssistantMessage carries an optional top-level `error?:
+// SDKAssistantMessageError` (sdk.d.ts) — a bare string enum with no
+// accompanying message text, unlike a typical JS error. rate_limit and
+// overloaded get their own FrontierEvent notice `kind`s (M3 inherit #2:
+// rate-limit visibility); every other tag (authentication_failed,
+// oauth_org_not_allowed, billing_error, invalid_request, model_not_found,
+// server_error, unknown, max_output_tokens) folds into kind "api_error" with
+// the raw tag interpolated into the message, since there's nothing more
+// specific to say generically for any of them.
+function mapAssistantError(error: SDKAssistantMessageError): FrontierNoticeEvent {
+  switch (error) {
+    case "rate_limit":
+      return {
+        type: "notice",
+        kind: "rate_limit",
+        message: "Claude API rate limit reached; the request will be retried automatically.",
+      };
+    case "overloaded":
+      return {
+        type: "notice",
+        kind: "overloaded",
+        message: "Claude API is currently overloaded; the request will be retried automatically.",
+      };
+    default:
+      return { type: "notice", kind: "api_error", message: `Claude API error: ${error}` };
+  }
+}
 
 export interface CreateClaudeAdapterOptions {
   /** DI for tests; defaults to the real SDK's query(). */
@@ -82,10 +152,17 @@ export function createClaudeAdapter(options: CreateClaudeAdapterOptions = {}): F
   return {
     kind: CLAUDE_CODE_KIND,
 
-    async createSession({ projectDir, wikiMcpUrl, log }): Promise<FrontierSession> {
+    async createSession({ projectDir, wikiMcpUrl, log, toolPolicy }): Promise<FrontierSession> {
       const id = randomUUID();
       let resumeSessionId: string | null = null;
       let activeQuery: Query | null = null;
+      // Resolved once per session (writeScope doesn't vary per-prompt).
+      // path.resolve(projectDir, dir) is a no-op past the base for an
+      // already-absolute dir (the RPC layer always sends absolute,
+      // projectDir-resolved entries — see types.ts's createSession opts doc)
+      // and defensively anchors a hypothetically-relative one to projectDir
+      // rather than process.cwd() for any other caller of this adapter.
+      const writeScopeDirs = (toolPolicy?.writeScope ?? []).map((dir) => path.resolve(projectDir, dir));
 
       return {
         id,
@@ -116,10 +193,21 @@ export function createClaudeAdapter(options: CreateClaudeAdapterOptions = {}): F
               allowedTools: READ_ONLY_ALLOWED_TOOLS,
               permissionMode: "default",
               abortController,
-              canUseTool: async () => ({
-                behavior: "deny",
-                message: "openfusion v1: read-only orchestration",
-              }),
+              canUseTool: async (toolName, input) => {
+                if (writeScopeDirs.length > 0 && WRITE_TOOLS.has(toolName)) {
+                  const targetPath = extractWriteTargetPath(input);
+                  if (targetPath !== null) {
+                    const resolvedTarget = path.resolve(projectDir, targetPath);
+                    if (isPathInScope(resolvedTarget, writeScopeDirs)) {
+                      return { behavior: "allow" };
+                    }
+                  }
+                }
+                return {
+                  behavior: "deny",
+                  message: "openfusion v1: read-only orchestration",
+                };
+              },
             },
           });
           activeQuery = q;
@@ -130,6 +218,16 @@ export function createClaudeAdapter(options: CreateClaudeAdapterOptions = {}): F
             // (nothing here) would be safe; this loop logs nothing.
             for await (const message of q) {
               if (message.type === "assistant") {
+                // Rate-limit visibility (M3 inherit #2): an API-error tag on
+                // an assistant message is not terminal — it's a mid-turn
+                // notice, so mapping it here and letting the loop fall
+                // through to the message's (likely empty, but not assumed
+                // so) content blocks below is deliberate; the RPC layer
+                // streams `notice` like any other event, with no special
+                // handling (methods.ts's prompt loop is event-type-agnostic).
+                if (message.error !== undefined) {
+                  yield mapAssistantError(message.error);
+                }
                 for (const block of message.message.content) {
                   if (block.type === "text") {
                     yield { type: "text", text: block.text };

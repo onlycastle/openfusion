@@ -16,7 +16,8 @@ export type FrontierEvent =
       durationMs: number;
       engineSessionId: string | null;
     }
-  | { type: "error"; message: string };
+  | { type: "error"; message: string }
+  | { type: "notice"; kind: "rate_limit" | "overloaded" | "api_error"; message: string };
 
 export interface FrontierPromptHandle {
   events: AsyncIterable<FrontierEvent>;
@@ -36,5 +37,14 @@ export interface FrontierAdapter {
     projectDir: string;
     wikiMcpUrl: string | null;
     log: (line: string) => void;
+    // Absent (or writeScope absent/empty) => today's read-only posture:
+    // canUseTool denies every write tool, unconditionally. When writeScope
+    // is a non-empty list, the adapter's canUseTool allows Write / Edit /
+    // MultiEdit / NotebookEdit calls whose resolved target path lands
+    // inside one of these directories, and keeps denying everything else.
+    // Entries are expected to already be absolute, resolved paths — the RPC
+    // layer (methods.ts) resolves relative writeScope entries against
+    // projectDir before calling createSession.
+    toolPolicy?: { writeScope?: string[] };
   }): Promise<FrontierSession>;
 }

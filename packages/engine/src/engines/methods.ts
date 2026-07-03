@@ -16,11 +16,24 @@ import type {
   FrontierSession,
 } from "./types.js";
 
-const StartParamsSchema = z.object({
-  projectDir: z.string().min(1),
-  engine: z.string().min(1).optional(),
-  attachWiki: z.boolean().optional(),
-});
+// M4 task-1: writeScope entries must be RELATIVE — they're resolved against
+// projectDir below, before being handed to the adapter as absolute paths
+// (createSession's toolPolicy.writeScope, ./types.ts). An absolute entry
+// would silently ignore that resolution step (path.resolve treats an
+// absolute second argument as authoritative, discarding projectDir
+// entirely) and let a caller name any directory on disk, defeating the
+// whole point of scoping — rejected here instead, at the RPC boundary.
+const StartParamsSchema = z
+  .object({
+    projectDir: z.string().min(1),
+    engine: z.string().min(1).optional(),
+    attachWiki: z.boolean().optional(),
+    writeScope: z.array(z.string().min(1)).optional(),
+  })
+  .refine((params) => (params.writeScope ?? []).every((entry) => !path.isAbsolute(entry)), {
+    message: "writeScope entries must be relative paths",
+    path: ["writeScope"],
+  });
 
 const SessionParamsSchema = z.object({ sessionId: z.string().min(1) });
 
@@ -238,7 +251,18 @@ export function registerFrontierMethods(engine: Engine): void {
       wikiAttached = true;
     }
 
-    const session = await adapter.createSession({ projectDir, wikiMcpUrl, log: engine.log });
+    // Resolved against projectDir here (RPC boundary), so every adapter
+    // always receives absolute paths regardless of what a caller sent —
+    // see createSession's toolPolicy.writeScope doc in ./types.ts. Absent
+    // writeScope keeps toolPolicy itself undefined, preserving today's
+    // deny-all default for every adapter unchanged.
+    const writeScope = params.writeScope?.map((entry) => path.resolve(projectDir, entry));
+    const session = await adapter.createSession({
+      projectDir,
+      wikiMcpUrl,
+      log: engine.log,
+      toolPolicy: writeScope !== undefined ? { writeScope } : undefined,
+    });
     const sessionId = randomUUID();
     engine.frontier.addSession(sessionId, { session, adapter });
     engine.log(`frontier.start ${sessionId} engine=${kind} wikiAttached=${wikiAttached}`);
