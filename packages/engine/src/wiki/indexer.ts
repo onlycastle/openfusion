@@ -53,6 +53,10 @@ export async function buildIndex(
 
   for (const relPath of tracked) {
     seen.add(relPath);
+    processed += 1;
+    if (processed % 25 === 0) {
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    }
     const absPath = path.join(projectDir, relPath);
     let size: number;
     try {
@@ -90,10 +94,6 @@ export async function buildIndex(
       refs: result.refs,
     });
     filesIndexed += 1;
-    processed += 1;
-    if (processed % 25 === 0) {
-      await new Promise<void>((resolve) => setImmediate(resolve));
-    }
   }
 
   const removals = store.listFiles().filter((known) => !seen.has(known));
