@@ -181,6 +181,25 @@ function makeEmptyWorkerMock(summary: string): MockLanguageModelV4 {
   return new MockLanguageModelV4({ doGenerate: async () => textStep(summary) });
 }
 
+// Attempt 1 completes normally (writes attempt1.txt, then a text summary —
+// a full, successful engine.worker.run call); attempt 2's very first model
+// call THROWS instead of returning a step, so engine.worker.run itself
+// rejects (mirrors worker-methods.test.ts's own "mid-loop model failure"
+// mock) — the fixture for Finding 2 (M5b Task 4 review round 1): a worker
+// failure on attempt >=2, after an earlier attempt's worktree was already
+// cleaned up.
+function makeAttempt1ThenThrowWorkerMock(): MockLanguageModelV4 {
+  let call = 0;
+  return new MockLanguageModelV4({
+    doGenerate: async () => {
+      call++;
+      if (call === 1) return toolCallStep("attempt1.txt", "first try");
+      if (call === 2) return textStep("Attempt 1 summary");
+      throw new Error("provider exploded on attempt 2");
+    },
+  });
+}
+
 // --- Scripted fake frontier adapter ----------------------------------------
 
 function resultEvent(overrides: Partial<Extract<FrontierEvent, { type: "result" }>> = {}): FrontierEvent {
@@ -216,7 +235,12 @@ interface FakeFrontierOptions {
   // simulating a frontier escalation that produces an empty diff.
   escalationWritesFile?: boolean;
   escalationCostUsd?: number;
-  createSessionCalls?: Array<{ toolPolicy?: { writeScope?: string[] }; resultLabel?: string }>;
+  createSessionCalls?: Array<{ projectDir: string; toolPolicy?: { writeScope?: string[] }; resultLabel?: string }>;
+  // Captures the raw prompt text sent to the ESCALATION session only (one
+  // entry per escalation prompt() call) — lets a test assert the routed
+  // agent's specialist framing (agent.prompt) and the "current working
+  // directory" wording actually reach the frontier turn.
+  escalationPrompts?: string[];
   reviewSessionStarts?: { count: number };
   closedSessions?: { count: number };
   // Mirrors engines/methods.ts's REAL onResult wiring (resultLabel
@@ -247,7 +271,7 @@ function makeFakeFrontierAdapter(opts: FakeFrontierOptions = {}): FrontierAdapte
   return {
     kind: "claude-code",
     async createSession({ projectDir, toolPolicy, resultLabel }): Promise<FrontierSession> {
-      opts.createSessionCalls?.push({ toolPolicy, resultLabel });
+      opts.createSessionCalls?.push({ projectDir, toolPolicy, resultLabel });
       const writeScope = toolPolicy?.writeScope ?? [];
       const isEscalation = writeScope.length > 0;
       if (!isEscalation && opts.reviewSessionStarts !== undefined) {
@@ -257,11 +281,24 @@ function makeFakeFrontierAdapter(opts: FakeFrontierOptions = {}): FrontierAdapte
       return {
         id: randomUUID(),
         projectDir,
-        prompt(_text: string): FrontierPromptHandle {
+        prompt(text: string): FrontierPromptHandle {
           if (isEscalation) {
+            opts.escalationPrompts?.push(text);
             async function* gen(): AsyncGenerator<FrontierEvent> {
               if (opts.escalationWritesFile !== false) {
-                writeFileSync(path.join(writeScope[0]!, "escalated.txt"), "written by frontier escalation\n");
+                // Writes RELATIVE TO the `projectDir` this session was
+                // actually created with — NOT writeScope[0] — because the
+                // whole point of this fake is to stand in for a REAL
+                // frontier, which edits files at paths resolved against its
+                // subprocess cwd (see claude.ts: `cwd: projectDir` in the
+                // query() options), not against writeScope. A real
+                // escalation only ever lands inside writeScope[0] when cwd
+                // (this `projectDir`) IS writeScope[0] — i.e. the worktree.
+                // Before the fix, orchestrate.ts's runEscalation created
+                // this session with the BASE repo as `projectDir`, so this
+                // write would land in the base repo and `manager.diff`
+                // (which reads the worktree) would see nothing.
+                writeFileSync(path.join(projectDir, "escalated.txt"), "written by frontier escalation\n");
                 yield { type: "tool_use", name: "Write", summary: "wrote escalated.txt" };
               }
               yield { type: "text", text: "Escalation complete" };
@@ -309,7 +346,8 @@ describe("engine.orchestrate — happy path", () => {
     engine = createEngine();
     engine.models.registry.configure({ id: "p1", kind: "deepseek", apiKey: TEST_API_KEY });
     engine.models.registry.setTestModel("p1", makeWorkerMock("hello.txt", "HELLO FROM WORKER", "Created hello.txt"));
-    const createSessionCalls: Array<{ toolPolicy?: { writeScope?: string[] }; resultLabel?: string }> = [];
+    const createSessionCalls: Array<{ projectDir: string; toolPolicy?: { writeScope?: string[] }; resultLabel?: string }> =
+      [];
     engine.frontier.registerAdapter(
       makeFakeFrontierAdapter({
         reviewVerdicts: [{ decision: "approve", reasons: [], severity: "none" }],
@@ -405,7 +443,9 @@ describe("engine.orchestrate — escalation", () => {
     engine = createEngine();
     engine.models.registry.configure({ id: "p1", kind: "deepseek", apiKey: TEST_API_KEY });
     engine.models.registry.setTestModel("p1", makeMultiAttemptWorkerMock());
-    const createSessionCalls: Array<{ toolPolicy?: { writeScope?: string[] }; resultLabel?: string }> = [];
+    const createSessionCalls: Array<{ projectDir: string; toolPolicy?: { writeScope?: string[] }; resultLabel?: string }> =
+      [];
+    const escalationPrompts: string[] = [];
     engine.frontier.registerAdapter(
       makeFakeFrontierAdapter({
         reviewVerdicts: [
@@ -413,6 +453,7 @@ describe("engine.orchestrate — escalation", () => {
           { decision: "request-changes", reasons: ["still nope"], severity: "major" },
         ],
         createSessionCalls,
+        escalationPrompts,
         meter: engine.models.meter,
       }),
     );
@@ -436,6 +477,20 @@ describe("engine.orchestrate — escalation", () => {
     expect(escalationCall).toBeDefined();
     expect(escalationCall!.toolPolicy!.writeScope).toEqual([result.worktree.path]);
     expect(escalationCall!.resultLabel).toBe("frontier-escalate");
+
+    // CRITICAL (Finding 1, M5b Task 4 review round 1): the escalation
+    // session's cwd (its `projectDir`, per claude.ts's `cwd: projectDir`)
+    // must be the WORKTREE, not the base repo — otherwise a real frontier's
+    // edits (at base-repo-relative paths) all resolve outside writeScope and
+    // get denied, and manager.diff (which reads the worktree) sees nothing.
+    expect(escalationCall!.projectDir).toBe(result.worktree.path);
+
+    // Minor (M5b Task 4 review round 1): the escalation turn is framed with
+    // the routed agent's own specialist prompt, and "current working
+    // directory" is now literally correct since cwd IS the worktree.
+    expect(escalationPrompts).toHaveLength(1);
+    expect(escalationPrompts[0]).toContain("You are a codegen specialist. Follow instructions exactly.");
+    expect(escalationPrompts[0]).toContain("current working directory");
 
     // Only 2 review sessions (no writeScope) + 1 escalation session (with
     // writeScope) were ever created.
@@ -649,6 +704,42 @@ describe("engine.orchestrate — failure semantics", () => {
     // — its worktree is still on disk and reported for inspection.
     expect(res.error.data?.worktree?.path).toBeDefined();
     expect(existsSync(res.error.data.worktree.path)).toBe(true);
+  });
+
+  it("attempt 1 rejected+cleaned, attempt 2's worker.run throws -> SERVER_ERROR's data.worktree is attempt 2's path, not stale null", async () => {
+    dir = makeRepo();
+    await writeTestHarness(dir, { failuresBeforeFrontier: 2 });
+    engine = createEngine();
+    engine.models.registry.configure({ id: "p1", kind: "deepseek", apiKey: TEST_API_KEY });
+    engine.models.registry.setTestModel("p1", makeAttempt1ThenThrowWorkerMock());
+    engine.frontier.registerAdapter(
+      makeFakeFrontierAdapter({
+        // Only attempt 1 ever reaches review (attempt 2 throws inside
+        // engine.worker.run itself, before any review session opens).
+        reviewVerdicts: [{ decision: "request-changes", reasons: ["needs work"], severity: "minor" }],
+      }),
+    );
+
+    const res = await call(engine, "engine.orchestrate", { projectDir: dir, task: "improve the widget" });
+    expect(res.result).toBeUndefined();
+    expect(res.error.code).toBe(RpcErrorCodes.SERVER_ERROR);
+
+    // Finding 2 (M5b Task 4 review round 1): before the fix, attempt 1's
+    // worktree was already cleaned (rejected verdict) so `lastWorktree` was
+    // null by the time attempt 2's engine.worker.run threw — that throw's
+    // OWN error carries attempt 2's real (still-on-disk) worktree path in
+    // its `data`, which the fix now lifts instead of reporting the stale
+    // null.
+    expect(res.error.data?.attempts).toHaveLength(1);
+    expect(res.error.data?.worktree?.path).toBeDefined();
+    const worktreePath = res.error.data.worktree.path as string;
+    expect(existsSync(worktreePath)).toBe(true);
+
+    // It's attempt 2's worktree specifically — attempt 1's is already gone.
+    const manager = await engine.worker.getManager(dir);
+    const worktrees = await manager.list();
+    expect(worktrees).toHaveLength(1);
+    expect(path.resolve(worktrees[0]!.path)).toBe(path.resolve(worktreePath));
   });
 });
 

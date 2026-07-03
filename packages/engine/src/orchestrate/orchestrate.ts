@@ -200,6 +200,29 @@ function progress(engine: Engine, stage: string, detail: string): void {
   engine.notify("orchestrate.progress", { stage, detail });
 }
 
+// Lifts the worktree breadcrumb a failed engine.worker.run (worker/
+// methods.ts) or runEscalation (below) call carries in its thrown
+// RpcMethodError's `data` — both leave the failed attempt's worktree ON
+// DISK for inspection (see each's own "never remove on a failure path" doc
+// comment), but only the error THEY threw reliably knows that attempt's
+// path; the caller's own `lastWorktree` local can already be stale/null by
+// the time this fires — e.g. an earlier attempt's worktree was cleaned up
+// (rejected verdict) before this LATER attempt threw — so trusting
+// `lastWorktree` instead of this lift would silently discard a real,
+// still-on-disk worktree (M5b Task 4 review round 1, Finding 2).
+function liftWorktreeFromError(err: unknown): { path: string; branch: string } | undefined {
+  if (
+    err instanceof RpcMethodError &&
+    err.data !== undefined &&
+    typeof err.data === "object" &&
+    err.data !== null &&
+    "worktree" in err.data
+  ) {
+    return (err.data as { worktree: { path: string; branch: string } }).worktree;
+  }
+  return undefined;
+}
+
 interface EscalationResult {
   worktree: { path: string; branch: string };
   diff: string;
@@ -222,9 +245,24 @@ async function runEscalation(engine: Engine, params: OrchestrateParams, agent: A
     if (adapter === undefined) {
       throw new RpcMethodError(RpcErrorCodes.SERVER_ERROR, `unknown frontier engine: ${FRONTIER_KIND}`);
     }
+    // wikiMcpUrl stays keyed off the BASE project (params.projectDir) — the
+    // escalation still wants the base repo's wiki context — independent of
+    // the session's cwd (below), which is now the worktree, not the base
+    // repo.
     const wikiMcpUrl = await attachedWikiMcpUrl(engine, params.projectDir);
     const session = await adapter.createSession({
-      projectDir: params.projectDir,
+      // FIX (M5b Task 4 review round 1, Finding 1 — CRITICAL): this
+      // `projectDir` becomes the session subprocess's cwd (claude.ts:
+      // `cwd: projectDir` in the query() options) — it MUST be the
+      // worktree, not the base repo. toolPolicy.writeScope is
+      // [worktree.path] below; a session whose cwd is the base repo has a
+      // REAL frontier editing files at their natural base-repo-relative
+      // paths, every one of which resolves OUTSIDE writeScope and gets
+      // DENIED by canUseTool — the worktree (and therefore manager.diff,
+      // below) stays untouched, so escalation could only ever produce a
+      // non-empty diff against a fake adapter that ignored cwd and wrote
+      // straight into writeScope[0].
+      projectDir: worktree.path,
       wikiMcpUrl,
       log: engine.log,
       toolPolicy: { writeScope: [worktree.path] },
@@ -233,7 +271,13 @@ async function runEscalation(engine: Engine, params: OrchestrateParams, agent: A
     try {
       const turn = await runFrontierTurn(
         session,
-        `Complete this task by editing files: ${params.task}`,
+        // Minor (M5b Task 4 review round 1): frame the turn with the routed
+        // agent's own specialist prompt — mirrors buildWorkerTask's
+        // identical framing for worker runs — so escalation gets the same
+        // specialist context a worker attempt would have had. "current
+        // working directory" is now literally correct: the session's cwd IS
+        // the worktree (see the createSession call above).
+        `${agent.prompt}\n\nComplete this task by editing files in the current working directory: ${params.task}`,
         params.reviewTimeoutMs,
       );
       const diff = await manager.diff(worktree);
@@ -348,13 +392,28 @@ export async function orchestrate(engine: Engine, params: OrchestrateParams): Pr
         const n = nextAttemptNumber();
         progress(engine, `worker:${n}`, `running worker attempt ${n}/${maxWorkerAttempts}`);
 
-        const workerResult = await callEngineMethod<WorkerRunResponse>(engine, "engine.worker.run", {
-          projectDir: params.projectDir,
-          task: buildWorkerTask(routed.agent, params.task),
-          providerId,
-          model,
-          timeoutMs: params.workerTimeoutMs,
-        });
+        let workerResult: WorkerRunResponse;
+        try {
+          workerResult = await callEngineMethod<WorkerRunResponse>(engine, "engine.worker.run", {
+            projectDir: params.projectDir,
+            task: buildWorkerTask(routed.agent, params.task),
+            providerId,
+            model,
+            timeoutMs: params.workerTimeoutMs,
+          });
+        } catch (err) {
+          // FIX (M5b Task 4 review round 1, Finding 2 — Important): a
+          // worker.run failure on attempt >=2 leaves ITS OWN worktree on
+          // disk (worker/methods.ts's own catch), but `lastWorktree` is
+          // guaranteed null right here whenever the PRIOR attempt was
+          // rejected and cleaned up above (see cleanupWorktree calls below)
+          // — lift the real path out of the thrown error's `data` instead
+          // of letting that stale null reach the outer catch. Mirrors the
+          // escalation catch's identical lift, below.
+          const worktree = liftWorktreeFromError(err);
+          if (worktree !== undefined) lastWorktree = worktree;
+          throw err;
+        }
         workerUsd = addCost(workerUsd, workerResult.costUsd);
         // Tentatively tracked as soon as it's known to exist — see the
         // `lastWorktree` doc comment above.
@@ -419,15 +478,9 @@ export async function orchestrate(engine: Engine, params: OrchestrateParams): Pr
     try {
       escalation = await runEscalation(engine, params, routed.agent);
     } catch (err) {
-      if (
-        err instanceof RpcMethodError &&
-        err.data !== undefined &&
-        typeof err.data === "object" &&
-        err.data !== null &&
-        "worktree" in err.data
-      ) {
-        lastWorktree = (err.data as { worktree: { path: string; branch: string } }).worktree;
-      }
+      // Mirrors the worker-attempt catch's identical lift, above.
+      const worktree = liftWorktreeFromError(err);
+      if (worktree !== undefined) lastWorktree = worktree;
       throw err;
     }
     frontierUsd = addCost(frontierUsd, escalation.costUsd);
