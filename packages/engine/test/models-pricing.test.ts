@@ -36,6 +36,14 @@ describe("normalizeUsage", () => {
       cacheReadTokens: 0,
     });
   });
+
+  it("guards non-finite numbers (NaN) to zero without dropping finite siblings", () => {
+    expect(normalizeUsage({ inputTokens: NaN, outputTokens: 5 })).toEqual({
+      inputTokens: 0,
+      outputTokens: 5,
+      cacheReadTokens: 0,
+    });
+  });
 });
 
 describe("estimateCostUsd", () => {
