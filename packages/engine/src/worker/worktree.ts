@@ -28,6 +28,12 @@ export interface Worktree {
   path: string;
   branch: string;
   base: string;
+  // The base repo's HEAD SHA at the moment this worktree's branch was
+  // created — NOT the repo path (that's `base`). `diff()`/`diffStat()`
+  // anchor to this SHA instead of HEAD so a worker `git commit` (moving
+  // HEAD) can no longer make the diff go blind. See `diff()`'s own doc
+  // comment for the full story.
+  baseSha: string;
 }
 
 function branchFor(taskId: string): string {
@@ -105,7 +111,14 @@ export class WorktreeManager {
     // explicitly is required — omitting it detaches HEAD instead of
     // creating `branch`.
     await git(this.baseRepo, ["worktree", "add", worktreePath, "-b", branch, "HEAD"]);
-    return { id: taskId, path: worktreePath, branch, base: this.baseRepo };
+    // Read the SHA back from the new worktree's own HEAD rather than
+    // re-querying the base repo's HEAD: `worktree add ... HEAD` already
+    // pinned the branch to a specific commit, so asking the worktree itself
+    // is exact and race-free (the base repo's HEAD could in principle move
+    // between the `worktree add` call above and a separate `rev-parse`
+    // against `this.baseRepo`).
+    const baseSha = (await git(worktreePath, ["rev-parse", "HEAD"])).trim();
+    return { id: taskId, path: worktreePath, branch, base: this.baseRepo, baseSha };
   }
 
   // Lists only the worktrees this manager owns (branch matching
@@ -116,6 +129,18 @@ export class WorktreeManager {
   // lexically rebuilt one sidesteps any symlink-canonicalization mismatch.
   async list(): Promise<Worktree[]> {
     const out = await git(this.baseRepo, ["worktree", "list", "--porcelain"]);
+    // list() reconstructs Worktree records from git's own porcelain output,
+    // which has no notion of "the SHA this branch started from" — only
+    // create() knows that exactly (it reads it straight back from the
+    // freshly created branch's HEAD). For a reconstructed entry, best-effort
+    // it as the merge-base of the worktree's HEAD and the base repo's
+    // CURRENT HEAD: for a worker branch that hasn't diverged via its own
+    // commits yet (the common case immediately after create()) this equals
+    // the true baseSha exactly; if the base repo's HEAD has since moved on,
+    // this is merely an approximation. Callers that need the exact baseSha
+    // (i.e. `diff`/`diffStat`) always receive the real one from create()'s
+    // return value, never a list()-reconstructed one.
+    const baseHeadSha = (await git(this.baseRepo, ["rev-parse", "HEAD"])).trim();
     const worktrees: Worktree[] = [];
     for (const block of out.split("\n\n")) {
       if (block.trim().length === 0) continue;
@@ -131,7 +156,13 @@ export class WorktreeManager {
       if (!match) continue;
       const id = match[1];
       if (id === undefined) continue;
-      worktrees.push({ id, path: worktreePath, branch, base: this.baseRepo });
+      let baseSha: string;
+      try {
+        baseSha = (await git(worktreePath, ["merge-base", "HEAD", baseHeadSha])).trim();
+      } catch {
+        baseSha = baseHeadSha;
+      }
+      worktrees.push({ id, path: worktreePath, branch, base: this.baseRepo, baseSha });
     }
     return worktrees;
   }
@@ -140,21 +171,43 @@ export class WorktreeManager {
   // brand-new files. A bare `git diff` only compares the working tree
   // against the INDEX, and never shows untracked files at all — so a
   // freshly-created file would be invisible. The robust approach: `add -A`
-  // to stage everything (including new and deleted files), then
-  // `diff --cached` to compare the index against HEAD. This DELIBERATELY
-  // leaves the change staged afterward (documented here rather than
-  // resetting it back to unstaged) — repeated calls to `diff`/`diffStat`
-  // are idempotent no-ops once staged, and staged-but-uncommitted is
-  // already the state a worker's edits are expected to sit in until a
-  // caller decides to commit, discard, or hand it to a review gate.
+  // to stage everything (including new and deleted files), then diff the
+  // index against a fixed point. This DELIBERATELY leaves the change staged
+  // afterward (documented here rather than resetting it back to unstaged) —
+  // repeated calls to `diff`/`diffStat` are idempotent no-ops once staged,
+  // and staged-but-uncommitted is already the state a worker's edits are
+  // expected to sit in until a caller decides to commit, discard, or hand it
+  // to a review gate.
+  //
+  // That fixed point is `worktree.baseSha` (the base repo's HEAD at the
+  // moment this worktree's branch was created), NOT `HEAD` — this is the
+  // load-bearing fix for a real failure mode: an open model driving the
+  // worker's bash tool has been observed running `git commit` UNPROMPTED.
+  // `git diff --cached` (index vs HEAD) goes blind the instant that
+  // happens, because `git commit` moves HEAD to match the index, so
+  // index == HEAD and the diff comes back "" — even though the branch
+  // carries a real change. Since this diff is M5a's headline deliverable
+  // and M5b's review gate's entire input, an empty diff here means the gate
+  // reviews nothing. Anchoring to `baseSha` instead of `HEAD` fixes this:
+  // `git diff --cached <baseSha>` compares the INDEX (synced to the working
+  // tree by the preceding `add -A`, so this captures working, staged, AND
+  // already-committed changes made since `baseSha`) against the fixed base
+  // commit, which a later `git commit` cannot move. Verified empirically
+  // (scratch repo) that `git diff --cached <baseSha>` and the uncached
+  // `git diff <baseSha>` produce byte-identical output in every case tested
+  // here (tracked-file edit, brand-new untracked file, and a `git commit`
+  // made mid-task) — `--cached` was kept because it's the smaller diff from
+  // the pre-fix code (same flags, just an explicit revision instead of the
+  // implicit HEAD) and keeps the "diff reflects the index we just staged"
+  // framing above accurate.
   async diff(worktree: Worktree): Promise<string> {
     await git(worktree.path, ["add", "-A"]);
-    return git(worktree.path, ["diff", "--cached"]);
+    return git(worktree.path, ["diff", "--cached", worktree.baseSha]);
   }
 
   async diffStat(worktree: Worktree): Promise<string> {
     await git(worktree.path, ["add", "-A"]);
-    return git(worktree.path, ["diff", "--cached", "--stat"]);
+    return git(worktree.path, ["diff", "--cached", "--stat", worktree.baseSha]);
   }
 
   // Manual teardown only — see the class-level doc comment. Never call this

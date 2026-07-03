@@ -34,6 +34,10 @@ describe("WorktreeManager.create", () => {
     expect(wt.id).toBe("t1");
     expect(wt.branch).toBe("worker/t1");
     expect(wt.base).toBe(realpathSync(dir));
+    // baseSha is the base repo's HEAD at creation time -- with a single
+    // commit on the base repo (makeBaseRepo's "init"), that's also the
+    // worktree's own current HEAD, since the branch was just cut from it.
+    expect(wt.baseSha).toBe(git(wt.path, "rev-parse", "HEAD"));
     expect(existsSync(wt.path)).toBe(true);
     expect(git(wt.path, "rev-parse", "--is-inside-work-tree")).toBe("true");
     expect(git(wt.path, "rev-parse", "--abbrev-ref", "HEAD")).toBe("worker/t1");
@@ -79,11 +83,16 @@ describe("WorktreeManager.list", () => {
     const wt = await manager.create("t1");
 
     const listed = await manager.list();
+    // list()'s baseSha is a best-effort reconstruction (see WorktreeManager
+    // .list's doc comment) -- for a worktree that was JUST created off the
+    // base repo's current HEAD, with no commits since on either side, it
+    // exactly equals create()'s own recorded baseSha.
     expect(listed).toContainEqual<Worktree>({
       id: "t1",
       path: wt.path,
       branch: "worker/t1",
       base: wt.base,
+      baseSha: wt.baseSha,
     });
   });
 
@@ -126,6 +135,30 @@ describe("WorktreeManager.diff / diffStat", () => {
 
     const diff = await manager.diff(wt);
     expect(diff.trim()).toBe("");
+  });
+
+  // Critical regression (M5a final review): an open model driving the
+  // worker's bash tool has been observed running `git commit` UNPROMPTED.
+  // The old implementation (`git add -A` + `git diff --cached`, i.e. index
+  // vs HEAD) goes blind the instant that happens: `git commit` moves HEAD to
+  // match the index, so index == HEAD and the diff comes back empty even
+  // though `worker/<taskId>` carries a real change. Since this diff is M5a's
+  // headline deliverable and M5b's review gate's entire input, an empty diff
+  // here means the gate reviews nothing. `diff()` must instead be anchored
+  // to the base SHA recorded at worktree creation, which a later commit
+  // cannot move.
+  it("still shows the change after the worker runs `git commit` (base-SHA-anchored, not HEAD-anchored)", async () => {
+    dir = makeBaseRepo();
+    const manager = new WorktreeManager(dir);
+    const wt = await manager.create("t1");
+
+    writeFileSync(path.join(wt.path, "a.txt"), "alpha\nbeta\n");
+    // Simulate the worker committing its own change against instructions.
+    git(wt.path, "commit", "-am", "worker committed");
+
+    const diff = await manager.diff(wt);
+    expect(diff).toContain("a.txt");
+    expect(diff).toContain("+beta");
   });
 });
 

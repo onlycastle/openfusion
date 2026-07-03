@@ -221,6 +221,63 @@ describe("engine.worker.run", () => {
     expect(worktreeList).not.toContain("worker/");
   });
 
+  // Final-review Fix 2 (consistency): a RAW (non-RpcMethodError) throw from
+  // getManager()/manager.create() — e.g. a git failure creating the
+  // worktree itself — used to fall through uncaught to the dispatcher's
+  // generic INTERNAL_ERROR (-32603), inconsistent with every other
+  // pre-worktree failure in this method (non-git projectDir, unconfigured
+  // provider), both of which are SERVER_ERROR (-32000). Before the fix this
+  // asserted RpcErrorCodes.INTERNAL_ERROR; confirmed RED against the
+  // pre-fix code, now GREEN against the wrapped setup path.
+  it("wraps a raw manager.create() failure into SERVER_ERROR with no worktree data", async () => {
+    dir = makeRepo();
+    engine = createEngine();
+    engine.models.registry.configure({ id: "p1", kind: "deepseek", apiKey: TEST_API_KEY });
+    engine.models.registry.setTestModel("p1", makeWorkerMock());
+
+    // Warm the manager cache, then monkeypatch create() to simulate an
+    // infrastructure failure (e.g. disk full, git worktree add failure)
+    // that throws a plain Error, not an RpcMethodError.
+    const manager = await engine.worker.getManager(dir);
+    manager.create = async () => {
+      throw new Error("disk exploded");
+    };
+
+    const res = await call(engine, "engine.worker.run", {
+      projectDir: dir,
+      task: "create hello.txt",
+      providerId: "p1",
+      model: "deepseek-v4-flash",
+    });
+
+    expect(res.result).toBeUndefined();
+    expect(res.error.code).toBe(RpcErrorCodes.SERVER_ERROR);
+    // No worktree was ever created on this path, so there's nothing to
+    // attach — unlike the main try/catch's worktree-preserving errors.
+    expect(res.error.data).toBeUndefined();
+  });
+
+  // Final-review Fix 2 (consistency): engine.worker.cleanup had no git-repo
+  // guard at all, so a non-git projectDir reached
+  // WorktreeManager.prune()'s `git worktree prune` call, whose raw Error
+  // fell through to INTERNAL_ERROR (-32603) — inconsistent with
+  // engine.worker.run's SERVER_ERROR (-32000) contract for the same class
+  // of input. Before the fix this asserted RpcErrorCodes.INTERNAL_ERROR;
+  // confirmed RED against the pre-fix code, now GREEN against the added
+  // requireHeadSha guard.
+  it("engine.worker.cleanup rejects a non-git projectDir with SERVER_ERROR", async () => {
+    dir = mkdtempSync(path.join(os.tmpdir(), "of-worker-cleanup-nongit-"));
+    engine = createEngine();
+
+    const res = await call(engine, "engine.worker.cleanup", {
+      projectDir: dir,
+      worktreePath: path.join(dir, "whatever"),
+    });
+
+    expect(res.result).toBeUndefined();
+    expect(res.error.code).toBe(RpcErrorCodes.SERVER_ERROR);
+  });
+
   it("on a mid-loop model failure, returns SERVER_ERROR with the worktree path in data and leaves it in place", async () => {
     dir = makeRepo();
     engine = createEngine();

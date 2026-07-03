@@ -142,7 +142,12 @@ function containmentGate(root: string, canonicalRoot: string, rawPath: string): 
 // call, because the model's most likely and most consequential mistake is
 // a relative-path typo or a stale path from prior context, not a
 // deliberately adversarial shell one-liner. Real isolation (containers/VMs)
-// is out of scope for this milestone -- see spec §7 / M7.
+// is out of scope for this milestone -- see spec §7 / M7. Separately, `bash`
+// inherits the engine process's own environment and can read any file the
+// engine's OS user can read -- not just paths under the worktree -- and
+// whatever it prints flows straight into a third-party model provider's
+// context, so the boundary this milestone provides is blast-radius/
+// isolation of WRITES (deferred fully to M7), not data confidentiality.
 export function createWorkerTools(ctx: ToolContext): Record<string, Tool> {
   const canonicalRoot = fs.realpathSync(ctx.root);
   const bashTimeoutMs = ctx.bashTimeoutMs ?? DEFAULT_BASH_TIMEOUT_MS;

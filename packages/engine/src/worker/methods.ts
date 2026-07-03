@@ -30,7 +30,7 @@ import { registerMethod } from "../rpc/register.js";
 import { getHeadSha } from "../wiki/indexer.js";
 import { runWorkerLoop } from "./loop.js";
 import { createWorkerTools } from "./tools.js";
-import { WorktreeManager } from "./worktree.js";
+import { WorktreeManager, type Worktree } from "./worktree.js";
 
 const RunParamsSchema = z.object({
   projectDir: z.string().min(1),
@@ -115,17 +115,40 @@ export function registerWorkerMethods(engine: Engine): void {
   registerMethod(engine.dispatcher, "engine.worker.run", RunParamsSchema, async (params) => {
     // Flow: git guard -> resolve model -> worktree -> tools -> loop -> diff
     // -> meter -> return.
-    requireHeadSha(params.projectDir);
+    //
+    // The git guard, model resolution, and worktree creation are wrapped in
+    // their own try/catch below: `requireHeadSha`/`registry.resolve`
+    // already throw a properly-coded `RpcMethodError` (SERVER_ERROR /
+    // INVALID_PARAMS) and pass through unchanged, but `getManager`/
+    // `manager.create` can fail with a raw `Error` (e.g. a `git worktree
+    // add` failure) that would otherwise fall through to the dispatcher's
+    // generic INTERNAL_ERROR (-32603) -- inconsistent with every other
+    // failure mode of this method, which is SERVER_ERROR (-32000). No
+    // worktree data is attached on this path (unlike the main try/catch
+    // below): by construction nothing here can fail after a worktree
+    // exists.
+    let languageModel: ReturnType<typeof engine.models.registry.resolve>;
+    let kind: string;
+    let manager: WorktreeManager;
+    let taskId: string;
+    let worktree: Worktree;
+    try {
+      requireHeadSha(params.projectDir);
 
-    // Resolved BEFORE the worktree is created: an unconfigured provider (or
-    // any other resolve()-time failure) must never leave an orphaned
-    // worktree behind.
-    const languageModel = engine.models.registry.resolve(params.providerId, params.model);
-    const kind = kindOf(engine, params.providerId);
+      // Resolved BEFORE the worktree is created: an unconfigured provider
+      // (or any other resolve()-time failure) must never leave an orphaned
+      // worktree behind.
+      languageModel = engine.models.registry.resolve(params.providerId, params.model);
+      kind = kindOf(engine, params.providerId);
 
-    const manager = await engine.worker.getManager(params.projectDir);
-    const taskId = randomUUID();
-    const worktree = await manager.create(taskId);
+      manager = await engine.worker.getManager(params.projectDir);
+      taskId = randomUUID();
+      worktree = await manager.create(taskId);
+    } catch (err) {
+      if (err instanceof RpcMethodError) throw err;
+      const message = err instanceof Error ? err.message : String(err);
+      throw new RpcMethodError(RpcErrorCodes.SERVER_ERROR, `worker setup failed: ${message}`);
+    }
 
     const tools = createWorkerTools({
       root: worktree.path,
@@ -211,6 +234,13 @@ export function registerWorkerMethods(engine: Engine): void {
   });
 
   registerMethod(engine.dispatcher, "engine.worker.cleanup", CleanupParamsSchema, async (params) => {
+    // Same git guard as engine.worker.run: without it, a non-git
+    // projectDir reaches `getManager` -> `WorktreeManager.prune()` -> a
+    // failing `git worktree prune` call, whose raw `Error` falls through to
+    // the dispatcher's generic INTERNAL_ERROR (-32603) instead of this
+    // method's SERVER_ERROR (-32000) contract.
+    requireHeadSha(params.projectDir);
+
     const manager = await engine.worker.getManager(params.projectDir);
     const resolvedTarget = path.resolve(params.worktreePath);
     const worktrees = await manager.list();

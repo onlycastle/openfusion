@@ -45,7 +45,10 @@ const ON_STEP_TEXT_TRUNCATE_CHARS = 200;
 const WORKER_INSTRUCTIONS =
   "You are a coding worker. Use the provided tools to make the requested " +
   "change in the working directory. Keep going until the task is done, " +
-  "then reply with a short summary of what you changed.";
+  "then reply with a short summary of what you changed. Do not run `git " +
+  "commit`, `git add`, or any git command that changes history or the " +
+  "index -- leave all your changes as uncommitted working-tree edits so " +
+  "they can be reviewed.";
 
 function truncate(s: string, max: number): string {
   if (s.length <= max) return s;
