@@ -59,10 +59,14 @@ function truncate(s: string, max: number): string {
 
 // Detail strings passed to onToolEvent are observability metadata ONLY
 // (surfaced in progress/logging UIs) -- never file content, replace text, or
-// command stdout/stderr. Truncated defensively in case a path or command is
-// itself huge (e.g. a generated one-liner or a deeply nested path).
+// command stdout/stderr. Control characters (newlines included) are
+// stripped BEFORE truncation so an embedded newline in a command/path can't
+// inject formatting into whatever consumes onToolEvent (e.g. a
+// line-oriented progress log). Truncated defensively in case a path or
+// command is itself huge (e.g. a generated one-liner or a deeply nested
+// path).
 function detail(s: string): string {
-  return truncate(s, DETAIL_TRUNCATE_CHARS);
+  return truncate(s.replace(/[\x00-\x1f]/g, " "), DETAIL_TRUNCATE_CHARS);
 }
 
 function runBash(command: string, cwd: string, timeoutMs: number): Promise<BashResult> {

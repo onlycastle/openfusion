@@ -93,6 +93,20 @@ describe("bash", () => {
     expect(events[0]?.detail).toBe("pwd");
     expect(events[0]?.detail).not.toContain(dir); // detail must not leak stdout
   });
+
+  // Fix 4: a command/path with an embedded newline (or other control char)
+  // must not be able to inject formatting into whatever consumes
+  // onToolEvent (e.g. a line-oriented progress log).
+  it("strips control characters (e.g. a newline) from the emitted onToolEvent detail", async () => {
+    dir = makeRoot();
+    const events: { tool: string; detail: string }[] = [];
+    const tools = createWorkerTools({ root: dir, onToolEvent: (e) => events.push(e) });
+
+    await getExecute(tools.bash)({ command: "echo hi\necho bye" }, FAKE_OPTS);
+
+    expect(events).toHaveLength(1);
+    expect(events[0]?.detail).not.toContain("\n");
+  });
 });
 
 describe("read_file", () => {
@@ -209,6 +223,87 @@ describe("symlink escape prevention", () => {
     expect(result.error).toBeTruthy();
     expect(result.content).toBeUndefined();
   });
+
+  // Fix 3: the one-level case above (`escape-link/pwned.txt`) exercises a
+  // symlink whose OWN parent-join target already doesn't exist. This case
+  // is deeper: a multi-level, not-yet-existing tail (`newdir/deeper/...`)
+  // hanging off the symlinked ancestor -- canonicalizePath must walk past
+  // ALL of the nonexistent tail segments up to `escape-link` itself (the
+  // deepest EXISTING ancestor), realpath that, then rejoin the whole tail.
+  // If a future edit only checked the immediate parent of the leaf (instead
+  // of walking to the deepest existing ancestor), this case would slip
+  // through where the one-level case would not.
+  it("denies write_file through a symlinked parent for a multi-level not-yet-existing tail", async () => {
+    dir = makeRoot();
+    outsideDir = makeRoot("of-tools-outside-");
+    symlinkSync(outsideDir, path.join(dir, "escape-link"));
+    const tools = createWorkerTools({ root: dir });
+
+    const result = await getExecute(tools.write_file)(
+      { path: "escape-link/newdir/deeper/newfile.txt", content: "pwned" },
+      FAKE_OPTS,
+    );
+
+    expect(result.error).toBeTruthy();
+    expect(existsSync(path.join(outsideDir, "newdir"))).toBe(false);
+    expect(existsSync(path.join(outsideDir, "newdir", "deeper"))).toBe(false);
+    expect(existsSync(path.join(outsideDir, "newdir", "deeper", "newfile.txt"))).toBe(false);
+  });
+});
+
+// Fix 1: `containmentGate` resolves `rawPath` via `path.resolve(root,
+// rawPath)`. Node's `path.resolve` semantics DISCARD every earlier argument
+// once it hits an absolute path -- so if `rawPath` is itself absolute,
+// `root` is silently thrown away and `resolved` becomes `rawPath` as-is.
+// The containment check downstream still correctly denies this (the
+// resolved path isn't under canonicalRoot), but nothing pins that this
+// denial actually happens -- a future switch to `path.join` (which does NOT
+// discard `root` the same way) could silently invert this without any test
+// failing.
+describe("absolute path escape (Fix 1)", () => {
+  it("denies read_file for an absolute path outside root and never reads it", async () => {
+    dir = makeRoot();
+    outsideDir = makeRoot("of-abs-escape-");
+    const target = path.join(outsideDir, "passwd");
+    writeFileSync(target, "TOP_SECRET_ABS");
+    const tools = createWorkerTools({ root: dir });
+
+    const result = await getExecute(tools.read_file)({ path: target }, FAKE_OPTS);
+
+    expect(result.error).toBeTruthy();
+    expect(result.content).toBeUndefined();
+  });
+
+  it("denies write_file for an absolute path outside root and never creates the file", async () => {
+    dir = makeRoot();
+    outsideDir = makeRoot("of-abs-escape-");
+    const target = path.join(outsideDir, "passwd");
+    const tools = createWorkerTools({ root: dir });
+
+    const result = await getExecute(tools.write_file)(
+      { path: target, content: "pwned" },
+      FAKE_OPTS,
+    );
+
+    expect(result.error).toBeTruthy();
+    expect(existsSync(target)).toBe(false);
+  });
+
+  it("denies edit for an absolute path outside root and never modifies the file", async () => {
+    dir = makeRoot();
+    outsideDir = makeRoot("of-abs-escape-");
+    const target = path.join(outsideDir, "passwd");
+    writeFileSync(target, "original content");
+    const tools = createWorkerTools({ root: dir });
+
+    const result = await getExecute(tools.edit)(
+      { path: target, find: "original", replace: "PWNED" },
+      FAKE_OPTS,
+    );
+
+    expect(result.error).toBeTruthy();
+    expect(readFileSync(target, "utf8")).toBe("original content");
+  });
 });
 
 describe("edit", () => {
@@ -260,5 +355,64 @@ describe("edit", () => {
 
     expect(result.error).toBeTruthy();
     expect(readFileSync(path.join(outsideDir, "a.txt"), "utf8")).toBe("foo bar");
+  });
+
+  // Fix 4: edit's onToolEvent detail must be built from the path only --
+  // never from `find`/`replace`, which can carry arbitrary (possibly
+  // sensitive) file content. Distinctive sentinels make an accidental leak
+  // unmissable instead of blending into ordinary-looking text.
+  it("fires onToolEvent whose detail never contains find or replace text", async () => {
+    dir = makeRoot();
+    const findSentinel = "FIND_SENTINEL_9f3a";
+    const replaceSentinel = "REPLACE_SENTINEL_7c1e";
+    writeFileSync(path.join(dir, "a.txt"), `foo ${findSentinel} baz`);
+    const events: { tool: string; detail: string }[] = [];
+    const tools = createWorkerTools({ root: dir, onToolEvent: (e) => events.push(e) });
+
+    const result = await getExecute(tools.edit)(
+      { path: "a.txt", find: findSentinel, replace: replaceSentinel },
+      FAKE_OPTS,
+    );
+
+    expect(result.ok).toBe(true);
+    expect(events.length).toBeGreaterThan(0);
+    for (const e of events) {
+      expect(e.detail).not.toContain(findSentinel);
+      expect(e.detail).not.toContain(replaceSentinel);
+    }
+  });
+});
+
+// Fix 2: a path containing a NUL byte must degrade to a plain error result,
+// never an uncaught throw / rejected promise -- a NUL byte makes several
+// underlying `fs` calls throw a synchronous TypeError
+// (ERR_INVALID_ARG_VALUE), and nothing today pins that these three tools
+// catch it rather than let it propagate.
+describe("NUL-byte path handling (Fix 2)", () => {
+  it("read_file resolves to an error result (not a rejected promise) for a NUL-byte path", async () => {
+    dir = makeRoot();
+    const tools = createWorkerTools({ root: dir });
+
+    await expect(
+      getExecute(tools.read_file)({ path: "a\0b.txt" }, FAKE_OPTS),
+    ).resolves.toMatchObject({ error: expect.any(String) });
+  });
+
+  it("write_file resolves to an error result (not a rejected promise) for a NUL-byte path", async () => {
+    dir = makeRoot();
+    const tools = createWorkerTools({ root: dir });
+
+    await expect(
+      getExecute(tools.write_file)({ path: "a\0b.txt", content: "hi" }, FAKE_OPTS),
+    ).resolves.toMatchObject({ error: expect.any(String) });
+  });
+
+  it("edit resolves to an error result (not a rejected promise) for a NUL-byte path", async () => {
+    dir = makeRoot();
+    const tools = createWorkerTools({ root: dir });
+
+    await expect(
+      getExecute(tools.edit)({ path: "a\0b.txt", find: "x", replace: "y" }, FAKE_OPTS),
+    ).resolves.toMatchObject({ error: expect.any(String) });
   });
 });
