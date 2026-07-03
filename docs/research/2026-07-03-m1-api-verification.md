@@ -5,9 +5,14 @@ Pre-plan verification for the wiki milestone. Versions pulled live from npm
 
 ## Tree-sitter: web-tree-sitter (wasm), NOT node-tree-sitter
 
-- `web-tree-sitter@0.26.10` (active) + `tree-sitter-wasms@0.1.13` (34
-  prebuilt grammar wasms under `out/`, incl. typescript/tsx/javascript/
-  python/go/rust/java/c/cpp/ruby/php/swift/kotlin/bash/html/css/json/yaml).
+- `web-tree-sitter@0.26.10` (active) + ~~`tree-sitter-wasms@0.1.13`~~
+  **CORRECTION (M1a Task 4, empirical):** tree-sitter-wasms' prebuilt wasms
+  use an old emscripten dylink ABI and DO NOT load in web-tree-sitter 0.26
+  (Query construction memory-faults even after section renaming). Use
+  **`@vscode/tree-sitter-wasm@^0.3`** (Microsoft, actively maintained,
+  `wasm/tree-sitter-<lang>.wasm` layout) — verified working with 0.26.
+  M1b: check its grammar coverage for python/go/rust/java before planning;
+  gaps need per-language wasm builds or another verified source.
 - Native `tree-sitter` npm pkg is >1yr stale and has per-OS/arch/ABI rebuild
   pain — wrong choice for a Tauri-shipped sidecar.
 - Grammar wasm packages ship NO `.scm` queries. Official per-language source
