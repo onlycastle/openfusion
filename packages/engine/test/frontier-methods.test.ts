@@ -61,6 +61,10 @@ interface FakeAdapterOptions {
   // session stays usable after its first prompt is aborted.
   blockUntilAbort?: boolean;
   abortSpy?: { count: number };
+  // Captures the `opts` argument each prompt() call receives, so tests can
+  // assert what the RPC handler forwards (or, post-fix, deliberately does
+  // NOT forward) to the adapter — see the timeoutMs single-authority test.
+  capturedOpts?: Array<{ timeoutMs?: number } | undefined>;
 }
 
 function makeFakeAdapter(opts: FakeAdapterOptions = {}): FrontierAdapter {
@@ -73,7 +77,8 @@ function makeFakeAdapter(opts: FakeAdapterOptions = {}): FrontierAdapter {
       return {
         id: "fake-inner-id",
         projectDir,
-        prompt(): FrontierPromptHandle {
+        prompt(_text, promptOpts): FrontierPromptHandle {
+          opts.capturedOpts?.push(promptOpts);
           const callIndex = promptCalls;
           promptCalls += 1;
           if (opts.blockUntilAbort === true && callIndex === 0) {
@@ -430,4 +435,88 @@ describe("frontier RPC methods", () => {
     const promptResult = await promptPromise;
     expect(promptResult.error).toBeDefined();
   }, 5_000);
+
+  // Review finding 1 (Important): the Claude adapter (claude.ts) already
+  // arms its own setTimeout from opts.timeoutMs, and the RPC handler used to
+  // ALSO forward params.timeoutMs into entry.session.prompt(text, { timeoutMs
+  // }) — two competing timers racing the same deadline. If the adapter's
+  // timer fired first, the RPC-level timeoutPromise (which is the only path
+  // that emits the mandated "frontier prompt timed out" frontier.event +
+  // RpcMethodError) could be skipped entirely. Fix: the RPC layer is the
+  // single timeout authority — it must call prompt() with no timeoutMs at
+  // all, regardless of what the caller passed.
+  it("prompt does not forward timeoutMs to the adapter — the RPC timer is the single authority", async () => {
+    dir = makeRepo();
+    engine = createEngine();
+    const capturedOpts: Array<{ timeoutMs?: number } | undefined> = [];
+    engine.frontier.registerAdapter(makeFakeAdapter({ capturedOpts }));
+
+    const start = await call("engine.frontier.start", { projectDir: dir, attachWiki: false });
+    const { sessionId } = start.result;
+
+    const res = await call("engine.frontier.prompt", { sessionId, text: "hi", timeoutMs: 5000 });
+    expect(res.error).toBeUndefined();
+
+    expect(capturedOpts).toHaveLength(1);
+    expect(capturedOpts[0]?.timeoutMs).toBeUndefined();
+  });
+
+  // Review finding 2 (Important): main.ts used to await pipeline.drain()
+  // before engine.close() with no way to bound an in-flight frontier
+  // prompt's own (up to 1h) timer once the client (stdin) is already gone.
+  // FrontierService.abortAll() aborts every active prompt handle WITHOUT
+  // closing sessions — full teardown remains close()'s job, called
+  // separately right after drain() resolves in main.ts.
+  it("abortAll() aborts in-flight prompts without closing sessions, so drain() stays bounded", async () => {
+    dir = makeRepo();
+    engine = createEngine();
+    const abortSpy = { count: 0 };
+    const closeSpy = { closed: false };
+    engine.frontier.registerAdapter(makeFakeAdapter({ blockUntilAbort: true, abortSpy, closeSpy }));
+
+    const start = await call("engine.frontier.start", { projectDir: dir, attachWiki: false });
+    const { sessionId } = start.result;
+
+    const promptPromise = call("engine.frontier.prompt", { sessionId, text: "hi" });
+
+    engine.frontier.abortAll();
+
+    const promptResult = await promptPromise;
+    expect(promptResult.error).toBeDefined();
+    expect(abortSpy.count).toBe(1);
+
+    // abortAll() must not close the session — only stop()/close() do that.
+    expect(closeSpy.closed).toBe(false);
+    const list = await call("engine.frontier.list", {});
+    expect(list.result.sessions).toEqual([{ sessionId, engine: "claude-code", projectDir: dir }]);
+  }, 5_000);
+
+  // Review finding 4 (Minor): removeSession()'s `await entry.session.close()`
+  // was unguarded (unlike close()'s per-session try/catch over the same
+  // call), so a throwing adapter close() turned engine.frontier.stop into an
+  // RPC error even though the session entry was already deleted from our
+  // bookkeeping. stop() should stay tolerant of a throwing close(), exactly
+  // like close() already is.
+  it("stop tolerates a throwing session close() — returns {stopped: true}, no RPC error", async () => {
+    dir = makeRepo();
+    engine = createEngine();
+    engine.frontier.registerAdapter(makeFakeAdapter());
+    const adapter = engine.frontier.getAdapter("claude-code")!;
+
+    const throwingSession: FrontierSession = {
+      id: "throwing-inner-id",
+      projectDir: dir,
+      prompt(): FrontierPromptHandle {
+        throw new Error("not used in this test");
+      },
+      close: async () => {
+        throw new Error("boom");
+      },
+    };
+    engine.frontier.addSession("throwing-session", { session: throwingSession, adapter });
+
+    const stop = await call("engine.frontier.stop", { sessionId: "throwing-session" });
+    expect(stop.error).toBeUndefined();
+    expect(stop.result.stopped).toBe(true);
+  });
 });

@@ -152,8 +152,26 @@ export class FrontierService {
     const activeHandle = this.#activeHandles.get(sessionId);
     this.#activeHandles.delete(sessionId);
     activeHandle?.abort();
-    await entry.session.close();
+    try {
+      await entry.session.close();
+    } catch {
+      // Best-effort, mirrors close()'s per-session isolation below: the
+      // session entry is already deleted from our bookkeeping above, so a
+      // throwing adapter close() must not turn engine.frontier.stop into an
+      // RPC error — the caller only cares that the session is gone.
+    }
     return true;
+  }
+
+  // Aborts every in-flight prompt's handle WITHOUT closing sessions or
+  // adapters — full teardown remains close()'s job. Called from main.ts once
+  // stdin closes: the client is gone, so any prompt blocked mid-stream
+  // should error out promptly instead of leaving pipeline.drain() waiting on
+  // that prompt's own (possibly up to 1h) timeout.
+  abortAll(): void {
+    for (const handle of this.#activeHandles.values()) {
+      handle.abort();
+    }
   }
 
   async close(): Promise<void> {
@@ -241,10 +259,15 @@ export function registerFrontierMethods(engine: Engine): void {
       // must never reach engine.log (stderr diagnostics) — only the
       // lifecycle line above (frontier.start) and below (frontier.prompt
       // done) are logged, and neither includes prompt text or event bodies.
-      const handle = entry.session.prompt(
-        params.text,
-        params.timeoutMs !== undefined ? { timeoutMs: params.timeoutMs } : undefined,
-      );
+      //
+      // Deliberately NOT forwarding params.timeoutMs here: the RPC-level
+      // timer below is the single authority over this prompt's deadline. The
+      // Claude adapter (claude.ts) also arms its own setTimeout when given
+      // an opts.timeoutMs — forwarding would race two independent timers
+      // against the same deadline, and if the adapter's fired first, the
+      // mandated "frontier prompt timed out" notification/error below could
+      // be silently skipped.
+      const handle = entry.session.prompt(params.text);
       // Tracked so engine.frontier.stop / Engine.close can abort THIS
       // prompt before tearing the session down (see
       // FrontierService.removeSession/close) — set as soon as the handle
@@ -265,6 +288,8 @@ export function registerFrontierMethods(engine: Engine): void {
       // still has a rejection handler attached even when this branch wins,
       // so it can never surface as an unhandled rejection.
       let timer: ReturnType<typeof setTimeout> | undefined;
+      // deliberately ref'd: drain() must wait for this prompt's settlement;
+      // .unref() would let the process exit mid-abort
       const timeoutPromise = new Promise<never>((_resolve, reject) => {
         timer = setTimeout(() => {
           handle.abort();

@@ -29,6 +29,8 @@ async function main(): Promise<void> {
       pipeline.handleDecoded(line);
     }
   }
+  // stdin closed: client is gone — abort in-flight frontier prompts so drain() is bounded
+  engine.frontier.abortAll();
   await pipeline.drain();
   await engine.close();
 }
