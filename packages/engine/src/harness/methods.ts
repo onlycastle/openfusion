@@ -102,10 +102,20 @@ export function registerHarnessMethods(engine: Engine): void {
     // generateHarness itself enforces at write time) — a bundle that loads
     // but fails that check (e.g. hand-edited via the Harness editor into a
     // dangling routing reference) is just as unexportable as no harness at
-    // all, so both collapse to the same error rather than exporters.ts
-    // having to defend against a referentially-broken bundle itself.
-    if (bundle === null || validateHarness(bundle).length > 0) {
+    // all, so both collapse to the same error MESSAGE. They are NOT
+    // identical failures, though: the loadHarness-null case genuinely has
+    // nothing to report, but a validateHarness failure has concrete issues
+    // that would otherwise be silently discarded — those are carried in
+    // error.data.issues so a caller can see exactly what's broken instead of
+    // re-running validateHarness itself to find out.
+    if (bundle === null) {
       throw new RpcMethodError(RpcErrorCodes.SERVER_ERROR, "no valid harness; run engine.harness.generate first");
+    }
+    const structuralIssues = validateHarness(bundle);
+    if (structuralIssues.length > 0) {
+      throw new RpcMethodError(RpcErrorCodes.SERVER_ERROR, "no valid harness; run engine.harness.generate first", {
+        issues: structuralIssues,
+      });
     }
     const result = await exportHarness(projectDir, bundle, format);
     engine.log(`harness.export ${projectDir} (${format}): ${result.files.length} files`);

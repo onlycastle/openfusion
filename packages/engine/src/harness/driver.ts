@@ -185,7 +185,6 @@ export async function promptForJson<S extends z.ZodType>(
 
     const handle = session.prompt(currentPrompt);
     let text = "";
-    let loopCompleted = false;
     try {
       for await (const event of handle.events) {
         switch (event.type) {
@@ -204,7 +203,6 @@ export async function promptForJson<S extends z.ZodType>(
             break;
         }
       }
-      loopCompleted = true;
     } catch (err) {
       handle.abort();
       throw err;

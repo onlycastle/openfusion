@@ -27,8 +27,24 @@ export interface HarnessExportResult {
 const UNVERIFIED_CAVEAT =
   '> **UNVERIFIED**: this harness has not yet passed its eval gate (`manifest.verification.evals` is not `"pass"`). Treat the agent roster, prompts, and routing below as unverified until `engine.harness.generate`’s eval loop confirms they do not regress quality versus an all-frontier baseline.';
 
+// Same caveat, but as a YAML COMMENT for claude-subagents' per-agent
+// frontmatter (see renderSubagentMd below) — a user who exports ONLY
+// subagents (never AGENTS.md) would otherwise get trusted-looking files
+// with no ETH-gate caveat anywhere in them. A comment, not a real
+// frontmatter field, so it never pollutes the agent's actual config.
+const UNVERIFIED_SUBAGENT_COMMENT =
+  "# UNVERIFIED: this harness has not passed evals (openfusion M6); review before trusting";
+
 function findPage(bundle: HarnessBundle, slug: string): WikiPage | undefined {
   return bundle.pages.find((p) => p.slug === slug);
+}
+
+// Table cells are `|`-delimited — an unescaped `|` or embedded newline in
+// model-generated text (role, taskClasses, etc.) would otherwise split a
+// row in two or break the table entirely. Escapes both hazards; applied to
+// every dynamic (model-sourced) cell value in renderAgentsMd's roster table.
+function escapeCell(s: string): string {
+  return s.replace(/\|/g, "\\|").replace(/\r\n|\r|\n/g, " ");
 }
 
 // Claude Code's own `model:` frontmatter field expects one of ITS model
@@ -88,7 +104,11 @@ function renderAgentsMd(bundle: HarnessBundle): string {
   lines.push("| Name | Role | Task classes | Model |");
   lines.push("| --- | --- | --- | --- |");
   for (const agent of bundle.agents) {
-    lines.push(`| ${agent.name} | ${agent.role} | ${agent.taskClasses.join(", ")} | ${renderModelHint(agent)} |`);
+    const name = escapeCell(agent.name);
+    const role = escapeCell(agent.role);
+    const taskClasses = escapeCell(agent.taskClasses.join(", "));
+    const model = escapeCell(renderModelHint(agent));
+    lines.push(`| ${name} | ${role} | ${taskClasses} | ${model} |`);
   }
   lines.push("");
 
@@ -121,7 +141,9 @@ function renderSubagentMd(agent: AgentDef, bundle: HarnessBundle): string {
     description: agent.description,
     tools: READ_ONLY_TOOLS_LINE,
   });
-  const header = `---\n${frontmatter}# suggested worker: ${renderModelHint(agent)}\n---\n`;
+  const unverifiedComment =
+    bundle.manifest.verification.evals !== "pass" ? `${UNVERIFIED_SUBAGENT_COMMENT}\n` : "";
+  const header = `---\n${frontmatter}${unverifiedComment}# suggested worker: ${renderModelHint(agent)}\n---\n`;
 
   const body: string[] = [agent.prompt.trim(), "", "## Project wiki digest", ""];
   for (const page of bundle.pages) {

@@ -118,6 +118,11 @@ describe("engine.harness.export — no valid harness", () => {
     const res = await call("engine.harness.export", { projectDir: dir, format: "agents-md" });
     expect(res.error?.code).toBe(RpcErrorCodes.SERVER_ERROR);
     expect(res.error?.message).toMatch(/no valid harness/i);
+    // Unlike the loadHarness-null case (nothing on disk to report), THIS
+    // failure is a validateHarness cross-check with concrete issues — the
+    // error must carry them in data.issues rather than discarding them.
+    expect(Array.isArray(res.error?.data?.issues)).toBe(true);
+    expect(res.error?.data?.issues.length).toBeGreaterThan(0);
   });
 });
 
@@ -212,6 +217,47 @@ describe("engine.harness.export — agents-md", () => {
     expect(second).toContain("solo-worker");
     expect(second).not.toContain("codegen-worker");
     expect(second).not.toContain("docs-worker");
+  });
+
+  it("escapes pipe characters in roster table cells so a `|` in model output can't break the table", async () => {
+    makeDir();
+    engine = createEngine();
+    await writeHarness(
+      dir,
+      validBundle({
+        agents: [
+          {
+            name: "codegen-worker",
+            role: "a | b",
+            description: "Writes and edits code for codegen tasks.",
+            prompt: "You are a codegen specialist.",
+            taskClasses: ["codegen"],
+            model: { kind: "deepseek", model: "deepseek-chat" },
+            escalation: { maxAttempts: 2 },
+          },
+        ],
+        routing: {
+          version: 1,
+          taskClasses: { codegen: { agent: "codegen-worker" } },
+          escalation: { failuresBeforeFrontier: 2 },
+          defaults: { agent: "codegen-worker" },
+        },
+      }),
+    );
+
+    const res = await call("engine.harness.export", { projectDir: dir, format: "agents-md" });
+    expect(res.error).toBeUndefined();
+
+    const content = readFileSync(path.join(dir, "AGENTS.md"), "utf8");
+    const rosterLines = content.split("\n").filter((l) => l.startsWith("| codegen-worker"));
+    // The unescaped "|" in role would otherwise split this into two broken
+    // table rows — exactly one row must remain, with the pipe escaped.
+    expect(rosterLines).toHaveLength(1);
+    expect(rosterLines[0]).toContain("a \\| b");
+    // Count of un-escaped "|" delimiters must still be exactly 5 (4 cells):
+    // strip every escaped "\|" first so only real column delimiters remain.
+    const delimiterCount = (rosterLines[0]!.replace(/\\\|/g, "").match(/\|/g) ?? []).length;
+    expect(delimiterCount).toBe(5);
   });
 });
 
@@ -310,5 +356,37 @@ describe("engine.harness.export — claude-subagents", () => {
     const content = readFileSync(path.join(dir, ".claude", "agents", "codegen-worker.md"), "utf8");
     expect(content).toContain("UPDATED PROMPT BODY after regeneration.");
     expect(content).not.toContain("Follow the wiki digest and keep diffs minimal.");
+  });
+
+  it("adds an UNVERIFIED comment to frontmatter when the harness has not passed evals", async () => {
+    makeDir();
+    engine = createEngine();
+    // validBundle()'s default manifest has verification.evals: "pending".
+    await writeHarness(dir, validBundle());
+
+    await call("engine.harness.export", { projectDir: dir, format: "claude-subagents" });
+
+    for (const name of ["codegen-worker", "docs-worker"]) {
+      const content = readFileSync(path.join(dir, ".claude", "agents", `${name}.md`), "utf8");
+      // A YAML COMMENT inside the frontmatter block, not a real field — an
+      // agent exported alone (without AGENTS.md) must still carry the
+      // ETH-gate caveat somewhere a reviewer will actually see it.
+      expect(content).toMatch(/^# UNVERIFIED:.*evals.*$/m);
+      expect(content).not.toMatch(/^unverified:/im);
+    }
+  });
+
+  it("omits the UNVERIFIED comment once the harness has passed evals", async () => {
+    makeDir();
+    engine = createEngine();
+    await writeHarness(
+      dir,
+      validBundle({ manifest: validManifest({ verification: { structural: "pass", evals: "pass" } }) }),
+    );
+
+    await call("engine.harness.export", { projectDir: dir, format: "claude-subagents" });
+
+    const content = readFileSync(path.join(dir, ".claude", "agents", "codegen-worker.md"), "utf8");
+    expect(content).not.toMatch(/UNVERIFIED/);
   });
 });

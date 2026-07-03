@@ -287,6 +287,7 @@ export async function generateHarness(engine: Engine, projectDir: string): Promi
     notify("overview", "exploring repository structure via the wiki");
     const overviewResult = await promptForJson(session, buildOverviewPrompt(), OverviewSchema, {
       stage: "overview",
+      notify: (n) => notify("overview", `${n.kind}: ${n.detail}`),
     });
     costUsd = addCost(costUsd, overviewResult.costUsd);
     const overview = overviewResult.value;
@@ -297,6 +298,7 @@ export async function generateHarness(engine: Engine, projectDir: string): Promi
       notify(stage, `generating the "${slug}" wiki page`);
       const pageResult = await promptForJson(session, buildPagePrompt(slug, overview), PageContentSchema, {
         stage,
+        notify: (n) => notify(stage, `${n.kind}: ${n.detail}`),
       });
       costUsd = addCost(costUsd, pageResult.costUsd);
       pages.push({ slug, ...pageResult.value });
@@ -308,7 +310,10 @@ export async function generateHarness(engine: Engine, projectDir: string): Promi
       session,
       buildAgentsRoutingPrompt(overview, workerModels),
       AgentsRoutingSchema,
-      { stage: "agents-routing" },
+      {
+        stage: "agents-routing",
+        notify: (n) => notify("agents-routing", `${n.kind}: ${n.detail}`),
+      },
     );
     costUsd = addCost(costUsd, agentsResult.costUsd);
     const { agents, routing } = agentsResult.value;

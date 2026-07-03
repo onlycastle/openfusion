@@ -207,9 +207,15 @@ describe("engine.harness.generate — happy path (scripted fake adapter)", () =>
     expect(bundle!.routing.escalation.failuresBeforeFrontier).toBe(2);
 
     // Stage notification sequence, in order — exactly the 8 stages the task
-    // brief enumerates, one each.
+    // brief enumerates, one each, though a stage may now emit MORE than one
+    // notification (its own START line plus promptForJson's per-attempt
+    // "attempt" notice relayed via opts.notify) — dedupe consecutive
+    // same-stage entries to assert the STAGE TRANSITION order stays exactly
+    // as before.
     const harnessNotices = notifications.filter((n) => n.method === "harness.progress");
-    expect(harnessNotices.map((n) => (n.params as { stage: string }).stage)).toEqual([
+    const stageSeq = harnessNotices.map((n) => (n.params as { stage: string }).stage);
+    const dedupedStageSeq = stageSeq.filter((s, i) => s !== stageSeq[i - 1]);
+    expect(dedupedStageSeq).toEqual([
       "wiki-check",
       "overview",
       "page:architecture",
@@ -220,6 +226,14 @@ describe("engine.harness.generate — happy path (scripted fake adapter)", () =>
       "write",
       "verify",
     ]);
+    // Every promptForJson-backed stage (overview, the 4 pages,
+    // agents-routing) now emits at least one extra "attempt: ..." relay on
+    // top of its own START line.
+    for (const stage of ["overview", "page:architecture", "page:subsystems", "page:conventions", "page:build-and-test", "agents-routing"]) {
+      const forStage = harnessNotices.filter((n) => (n.params as { stage: string }).stage === stage);
+      expect(forStage.length).toBeGreaterThanOrEqual(2);
+      expect(forStage.some((n) => (n.params as { detail: string }).detail.startsWith("attempt:"))).toBe(true);
+    }
     for (const n of harnessNotices) {
       expect((n.params as { projectDir: string }).projectDir).toBe(dir);
       expect(typeof (n.params as { detail: string }).detail).toBe("string");
@@ -347,6 +361,46 @@ describe("engine.harness.generate — hard failure (retry exhaustion)", () => {
     expect(res.error?.data?.stage).toBe("write");
     expect(loadHarness(dir)).toBeNull();
     expect(closeSpy.closed).toBe(true);
+  }, 30_000);
+});
+
+describe("engine.harness.generate — driver notice passthrough", () => {
+  it("surfaces a mid-stage frontier notice (e.g. rate limit) as an extra harness.progress notification", async () => {
+    dir = makeRepo();
+    const notifications: Array<{ method: string; params: unknown }> = [];
+    engine = createEngine({ notify: (method, params) => notifications.push({ method, params }) });
+    // Overview's turn includes a mid-stage "notice" event (as a real
+    // provider-throttled turn would) before its JSON answer — the driver
+    // forwards this as a DriverNotice{kind:"notice"}, which generate.ts must
+    // now relay onward as an EXTRA harness.progress notification for the
+    // "overview" stage (not a replacement for the stage's own START line).
+    const scripts: FrontierEvent[][] = [
+      [
+        {
+          type: "notice",
+          kind: "rate_limit",
+          message: "rate_limit: Claude API rate limit reported for this turn.",
+        },
+        textEvent("```json\n" + JSON.stringify(OVERVIEW) + "\n```"),
+        resultEvent(),
+      ],
+      ...WIKI_PAGE_SLUGS.map((slug) => jsonScript(pageValue(slug))),
+      jsonScript(AGENTS_ROUTING),
+    ];
+    engine.frontier.registerAdapter(makeScriptedAdapter({ scripts }));
+
+    const res = await call("engine.harness.generate", { projectDir: dir });
+    expect(res.error).toBeUndefined();
+
+    const harnessNotices = notifications.filter((n) => n.method === "harness.progress");
+    const overviewNotices = harnessNotices.filter((n) => (n.params as { stage: string }).stage === "overview");
+    // The stage's own START notification, PLUS the driver-notice-forwarded
+    // notification — a rate-limited run must not look identical to a normal
+    // one.
+    expect(overviewNotices.length).toBeGreaterThanOrEqual(2);
+    expect(
+      overviewNotices.some((n) => (n.params as { detail: string }).detail.includes("rate_limit")),
+    ).toBe(true);
   }, 30_000);
 });
 
