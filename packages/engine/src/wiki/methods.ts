@@ -6,6 +6,7 @@ import type { Engine } from "../engine.js";
 import { RpcMethodError } from "../rpc/errors.js";
 import { registerMethod } from "../rpc/register.js";
 import { buildIndex, getHeadSha, type IndexStats } from "./indexer.js";
+import { McpWikiServer } from "./mcp.js";
 import { WikiParser } from "./parser.js";
 import { rankFiles, renderRepoMap } from "./rank.js";
 import { openWikiStore, type WikiStore } from "./store.js";
@@ -17,6 +18,7 @@ const QueryParamsSchema = ProjectParamsSchema.extend({
 const MapParamsSchema = ProjectParamsSchema.extend({
   budgetTokens: z.number().int().min(64).max(32768).optional(),
 });
+const EmptyParamsSchema = z.object({});
 
 // Resolve to the canonical, symlink-free path so distinct spellings of the
 // same directory (or a symlinked one) share one store and one in-flight
@@ -35,6 +37,7 @@ export class WikiService {
   #stores = new Map<string, WikiStore>();
   #parserPromise: Promise<WikiParser> | undefined;
   #building = new Map<string, Promise<IndexStats>>();
+  #mcpServers = new Map<string, McpWikiServer>();
 
   getStore(projectDir: string): WikiStore {
     const key = keyFor(projectDir);
@@ -44,6 +47,30 @@ export class WikiService {
       this.#stores.set(key, store);
     }
     return store;
+  }
+
+  getMcpServers(): McpWikiServer[] {
+    return [...this.#mcpServers.values()];
+  }
+
+  // Idempotent per resolved root: a second start() for the same project
+  // returns the already-running server instead of binding a second port.
+  async startMcpServer(engine: Engine, projectDir: string): Promise<McpWikiServer> {
+    const key = keyFor(projectDir);
+    const existing = this.#mcpServers.get(key);
+    if (existing !== undefined) return existing;
+    const server = await McpWikiServer.start(engine, key);
+    this.#mcpServers.set(key, server);
+    return server;
+  }
+
+  async stopMcpServer(projectDir: string): Promise<boolean> {
+    const key = keyFor(projectDir);
+    const server = this.#mcpServers.get(key);
+    if (server === undefined) return false;
+    this.#mcpServers.delete(key);
+    await server.stop();
+    return true;
   }
 
   getParser(): Promise<WikiParser> {
@@ -70,6 +97,15 @@ export class WikiService {
   }
 
   async close(): Promise<void> {
+    for (const server of this.#mcpServers.values()) {
+      try {
+        await server.stop();
+      } catch {
+        // Best-effort: one server failing to stop must not block the rest
+        // of shutdown (store/parser disposal below).
+      }
+    }
+    this.#mcpServers.clear();
     for (const store of this.#stores.values()) {
       try {
         store.close();
@@ -165,4 +201,32 @@ export function registerWikiMethods(engine: Engine): void {
       return { map, files: ranked.length, truncated: rendered < ranked.length };
     },
   );
+
+  registerMethod(
+    engine.dispatcher,
+    "engine.mcp.start",
+    ProjectParamsSchema,
+    async ({ projectDir }) => {
+      requireHeadSha(projectDir);
+      const server = await engine.wiki.startMcpServer(engine, projectDir);
+      return { url: server.url };
+    },
+  );
+
+  registerMethod(
+    engine.dispatcher,
+    "engine.mcp.stop",
+    ProjectParamsSchema,
+    async ({ projectDir }) => {
+      const stopped = await engine.wiki.stopMcpServer(projectDir);
+      return { stopped };
+    },
+  );
+
+  registerMethod(engine.dispatcher, "engine.mcp.status", EmptyParamsSchema, () => {
+    const servers = engine.wiki
+      .getMcpServers()
+      .map((s) => ({ projectDir: s.projectDir, url: s.url }));
+    return { servers };
+  });
 }

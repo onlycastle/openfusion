@@ -37,3 +37,4 @@ export { WikiService } from "./wiki/methods.js";
 export { WikiStore, openWikiStore } from "./wiki/store.js";
 export { WikiParser } from "./wiki/parser.js";
 export { buildIndex, getHeadSha } from "./wiki/indexer.js";
+export { McpWikiServer } from "./wiki/mcp.js";
