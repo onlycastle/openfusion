@@ -63,6 +63,8 @@ export class WikiParser {
     try {
       const symbols: SymbolEntry[] = [];
       const refs: SymbolEntry[] = [];
+      const seenSymbols = new Set<string>();
+      const seenRefs = new Set<string>();
       for (const match of loaded.query.matches(tree.rootNode)) {
         let nameNode: { text: string; startPosition: { row: number; column: number } } | null =
           null;
@@ -83,7 +85,12 @@ export class WikiParser {
           row: nameNode.startPosition.row,
           col: nameNode.startPosition.column,
         };
-        (tag.isDefinition ? symbols : refs).push(entry);
+        const isDefinition = tag.isDefinition;
+        const seen = isDefinition ? seenSymbols : seenRefs;
+        const key = `${entry.name}\0${entry.row}\0${entry.col}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        (isDefinition ? symbols : refs).push(entry);
       }
       return { symbols, refs };
     } finally {

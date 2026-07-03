@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 import process from "node:process";
 import { createEngine } from "./engine.js";
-import { NdjsonDecoder, encodeNdjson } from "./rpc/ndjson.js";
+import { NdjsonDecoder } from "./rpc/ndjson.js";
+import { StdioPipeline } from "./rpc/stdio.js";
 
 // stdout carries JSON-RPC only; all diagnostics go to stderr (spec §4.1).
 async function main(): Promise<void> {
@@ -11,16 +12,17 @@ async function main(): Promise<void> {
   const decoder = new NdjsonDecoder();
   process.stdin.setEncoding("utf8");
   process.stderr.write(`openfusion-engine started (pid ${process.pid})\n`);
+  const pipeline = new StdioPipeline(
+    engine.dispatcher,
+    (line) => void process.stdout.write(line),
+    (err) => engine.log(`pipeline error: ${err instanceof Error ? err.message : String(err)}`),
+  );
   for await (const chunk of process.stdin) {
     for (const line of decoder.push(chunk as string)) {
-      const response = line.ok
-        ? await engine.dispatcher.dispatch(line.value)
-        : engine.dispatcher.parseError();
-      if (response !== null) {
-        process.stdout.write(encodeNdjson(response));
-      }
+      pipeline.handleDecoded(line);
     }
   }
+  await pipeline.drain();
   await engine.close();
 }
 

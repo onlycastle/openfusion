@@ -154,4 +154,15 @@ describe("wiki RPC methods", () => {
     expect(res.result.truncated).toBe(true);
     expect(res.result.files).toBeGreaterThanOrEqual(8);
   }, 30_000);
+
+  it("map is not marked truncated when only empty-symbol leaf files are skipped", async () => {
+    makeRepo();
+    writeFileSync(path.join(dir, "leaf.ts"), "import './x.js';\nxray();\n");
+    execFileSync("git", ["-C", dir, "add", "-A"]);
+    execFileSync("git", ["-C", dir, "commit", "-qm", "leaf"]);
+    await call("engine.wiki.build", { projectDir: dir });
+    const res = await call("engine.wiki.map", { projectDir: dir, budgetTokens: 32768 });
+    expect(res.error).toBeUndefined();
+    expect(res.result.truncated).toBe(false);
+  }, 30_000);
 });

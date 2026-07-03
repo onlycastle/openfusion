@@ -22,6 +22,14 @@
 - `java/tags.scm` from `tree-sitter/tree-sitter-java`
   (e10607b45ff745f5f876bfa3e94fbcc6b44bdc11), unmodified.
 
+## Known upstream query gaps
+
+- **Go**: Top-level `const` and `var` declarations are not captured by the
+  upstream query. These are valid module-level symbols but fall outside the
+  current tag query scope. Additionally, type self-references (e.g., type
+  assertions or embedded `(*Typ).method` receivers) may appear as references,
+  creating noise in the call graph.
+
 ## Grammar wasm source
 
 Grammar wasm binaries are loaded at runtime from `@vscode/tree-sitter-wasm`

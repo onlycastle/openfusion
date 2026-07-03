@@ -47,11 +47,16 @@ export async function buildIndex(
   let filesIndexed = 0;
   let filesSkipped = 0;
   let filesFailed = 0;
+  let processed = 0;
   const seen = new Set<string>();
   const updates: FileUpdate[] = [];
 
   for (const relPath of tracked) {
     seen.add(relPath);
+    processed += 1;
+    if (processed % 25 === 0) {
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    }
     const absPath = path.join(projectDir, relPath);
     let size: number;
     try {

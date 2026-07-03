@@ -57,4 +57,11 @@ describe("multi-language parsing", () => {
     expect(result).not.toBeNull();
     expect(result!.refs.map((r) => r.name)).toContain("b");
   });
+
+  it("dedupes double-captured definitions (rust method/function)", () => {
+    const result = parser.parseFile("test.rs", "struct S;\nimpl S { fn m(&self) {} }\n");
+    expect(result).not.toBeNull();
+    const mSymbols = result!.symbols.filter((s) => s.name === "m");
+    expect(mSymbols).toHaveLength(1);
+  });
 });
