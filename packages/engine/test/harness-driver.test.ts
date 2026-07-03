@@ -265,4 +265,107 @@ describe("promptForJson — error events", () => {
     // path.
     expect(prompts).toHaveLength(1);
   });
+
+  it("aborts the prompt handle when an error event occurs", async () => {
+    let abortCalled = false;
+    const session: FrontierSession = {
+      id: "fake-session",
+      projectDir: "/fake/project",
+      prompt(text: string): FrontierPromptHandle {
+        async function* gen(): AsyncGenerator<FrontierEvent> {
+          yield { type: "error", message: "session error" };
+        }
+        return {
+          events: gen(),
+          abort: () => {
+            abortCalled = true;
+          },
+        };
+      },
+      async close(): Promise<void> {},
+    };
+
+    await expect(promptForJson(session, "p", PointSchema)).rejects.toThrow(/session error/);
+    expect(abortCalled).toBe(true);
+  });
+
+  it("does not abort the handle on a successful completion", async () => {
+    let abortCalled = false;
+    const session: FrontierSession = {
+      id: "fake-session",
+      projectDir: "/fake/project",
+      prompt(text: string): FrontierPromptHandle {
+        async function* gen(): AsyncGenerator<FrontierEvent> {
+          yield textEvent('```json\n{"a": 1}\n```');
+          yield resultEvent();
+        }
+        return {
+          events: gen(),
+          abort: () => {
+            abortCalled = true;
+          },
+        };
+      },
+      async close(): Promise<void> {},
+    };
+
+    const result = await promptForJson(session, "p", PointSchema);
+    expect(result.value).toEqual({ a: 1 });
+    expect(abortCalled).toBe(false);
+  });
+});
+
+describe("promptForJson — json fence extraction", () => {
+  it("does not extract a json5 fence as a json block (falls back to whole-text)", async () => {
+    const { session } = makeScriptedSession([
+      [textEvent("Some text\n```json5\n{\"a\": 1}\n```"), resultEvent()],
+    ]);
+
+    // The json5 fence should not be extracted, so the parser falls back to
+    // whole-text, which is "Some text\n```json5\n{\"a\": 1}\n```", which is
+    // not valid JSON, so it should fail.
+    await expect(promptForJson(session, "p", PointSchema)).rejects.toBeInstanceOf(HarnessGenError);
+  });
+
+  it("does not extract a jsonc fence as a json block (falls back to whole-text)", async () => {
+    const { session } = makeScriptedSession([
+      [textEvent("Some text\n```jsonc\n{\"a\": 1}\n```"), resultEvent()],
+    ]);
+
+    // The jsonc fence should not be extracted, so it falls back to whole-text
+    // which fails to parse.
+    await expect(promptForJson(session, "p", PointSchema)).rejects.toBeInstanceOf(HarnessGenError);
+  });
+
+  it("extracts a normal json fence correctly", async () => {
+    const { session } = makeScriptedSession([
+      [textEvent("```json\n{\"a\": 1}\n```"), resultEvent()],
+    ]);
+
+    const result = await promptForJson(session, "p", PointSchema);
+    expect(result.value).toEqual({ a: 1 });
+  });
+
+  it("uses the last of two json blocks", async () => {
+    const { session } = makeScriptedSession([
+      [
+        textEvent(
+          'First: ```json\n{"a": 999}\n```\n\nSecond: ```json\n{"a": 1}\n```',
+        ),
+        resultEvent(),
+      ],
+    ]);
+
+    const result = await promptForJson(session, "p", PointSchema);
+    expect(result.value).toEqual({ a: 1 });
+  });
+
+  it("extracts json fence without trailing newline before the closing fence", async () => {
+    const { session } = makeScriptedSession([
+      [textEvent("```json\n{\"a\": 2}```"), resultEvent()],
+    ]);
+
+    const result = await promptForJson(session, "p", PointSchema);
+    expect(result.value).toEqual({ a: 2 });
+  });
 });

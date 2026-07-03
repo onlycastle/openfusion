@@ -73,8 +73,10 @@ interface Issue {
 // is taken as the actual answer, matching the brief. Returns null (not the
 // original text) when no fence is present at all, so the caller can fall
 // back to a whole-text JSON.parse attempt instead of trying to parse prose.
+// The json tag must sit at a line boundary (followed by \r?\n or end-of-string)
+// to prevent partial matches like ```json5 or ```jsonc.
 function extractLastJsonFence(text: string): string | null {
-  const fenceRe = /```json([\s\S]*?)```/gi;
+  const fenceRe = /```json(?:\r?\n|$)([\s\S]*?)```/gi;
   let match: RegExpExecArray | null;
   let last: string | null = null;
   while ((match = fenceRe.exec(text)) !== null) {
@@ -183,22 +185,29 @@ export async function promptForJson<S extends z.ZodType>(
 
     const handle = session.prompt(currentPrompt);
     let text = "";
-    for await (const event of handle.events) {
-      switch (event.type) {
-        case "text":
-          text += event.text;
-          break;
-        case "result":
-          costUsd = addCost(costUsd, event.costUsd);
-          break;
-        case "notice":
-          notify({ kind: "notice", detail: event.message });
-          break;
-        case "error":
-          throw new Error(`frontier session error: ${event.message}`);
-        case "tool_use":
-          break;
+    let loopCompleted = false;
+    try {
+      for await (const event of handle.events) {
+        switch (event.type) {
+          case "text":
+            text += event.text;
+            break;
+          case "result":
+            costUsd = addCost(costUsd, event.costUsd);
+            break;
+          case "notice":
+            notify({ kind: "notice", detail: event.message });
+            break;
+          case "error":
+            throw new Error(`frontier session error: ${event.message}`);
+          case "tool_use":
+            break;
+        }
       }
+      loopCompleted = true;
+    } catch (err) {
+      handle.abort();
+      throw err;
     }
 
     const attemptResult = parseJsonCandidate(text, schema);
