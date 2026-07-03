@@ -47,3 +47,5 @@ export { ProviderRegistry, ProviderConfigSchema } from "./models/providers.js";
 export type { ProviderConfig } from "./models/providers.js";
 export { PRICING, lookupPricing, estimateCostUsd, normalizeUsage } from "./models/pricing.js";
 export type { ModelPricing, NormalizedUsage } from "./models/pricing.js";
+export { CostMeter } from "./models/meter.js";
+export type { UsageRecord, MeterTotals, ModelTotals } from "./models/meter.js";
