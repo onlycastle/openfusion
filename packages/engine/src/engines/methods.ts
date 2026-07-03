@@ -9,6 +9,7 @@ import { registerMethod } from "../rpc/register.js";
 import { getHeadSha } from "../wiki/indexer.js";
 import { wikiDbPath } from "../wiki/store.js";
 import { createClaudeAdapter } from "./claude.js";
+import { isPathContained } from "./path-scope.js";
 import type {
   FrontierAdapter,
   FrontierEvent,
@@ -16,11 +17,32 @@ import type {
   FrontierSession,
 } from "./types.js";
 
-const StartParamsSchema = z.object({
-  projectDir: z.string().min(1),
-  engine: z.string().min(1).optional(),
-  attachWiki: z.boolean().optional(),
-});
+// M4 task-1: writeScope entries must be RELATIVE — they're resolved against
+// projectDir below, before being handed to the adapter as absolute paths
+// (createSession's toolPolicy.writeScope, ./types.ts). An absolute entry
+// would silently ignore that resolution step (path.resolve treats an
+// absolute second argument as authoritative, discarding projectDir
+// entirely) and let a caller name any directory on disk, defeating the
+// whole point of scoping — rejected here instead, at the RPC boundary.
+//
+// M4 task-1 review round 1, Finding 1 (Important): rejecting absolute
+// entries here is NOT sufficient on its own — a relative traversal entry
+// like "../../elsewhere" is still relative, passes this refine untouched,
+// and resolves outside projectDir. That containment check (against the
+// RESOLVED path, which requires projectDir — not available to a bare
+// per-field zod refine) lives in the engine.frontier.start handler below,
+// via the shared isPathContained helper.
+const StartParamsSchema = z
+  .object({
+    projectDir: z.string().min(1),
+    engine: z.string().min(1).optional(),
+    attachWiki: z.boolean().optional(),
+    writeScope: z.array(z.string().min(1)).optional(),
+  })
+  .refine((params) => (params.writeScope ?? []).every((entry) => !path.isAbsolute(entry)), {
+    message: "writeScope entries must be relative paths",
+    path: ["writeScope"],
+  });
 
 const SessionParamsSchema = z.object({ sessionId: z.string().min(1) });
 
@@ -229,6 +251,35 @@ export function registerFrontierMethods(engine: Engine): void {
       throw new RpcMethodError(RpcErrorCodes.SERVER_ERROR, `unknown frontier engine: ${kind}`);
     }
 
+    // Resolved against projectDir here (RPC boundary), so every adapter
+    // always receives absolute paths regardless of what a caller sent — see
+    // createSession's toolPolicy.writeScope doc in ./types.ts. Absent
+    // writeScope keeps toolPolicy itself undefined, preserving today's
+    // deny-all default for every adapter unchanged.
+    //
+    // M4 task-1 review round 1, Finding 1 (Important): the schema-level
+    // refine above only rejects entries that are already absolute — a
+    // RELATIVE traversal entry like "../../elsewhere" passes it untouched,
+    // then used to resolve outside projectDir and become trusted write
+    // scope (a containment escape). Every resolved entry is now additionally
+    // checked against projectDir itself, via the same isPathContained
+    // predicate claude.ts's canUseTool uses (./path-scope.ts) so the two
+    // checks can't drift — an entry that resolves outside the project is
+    // rejected here, before it ever reaches an adapter or has a side effect
+    // (e.g. starting the wiki MCP server below), rather than merely being
+    // denied later at write time.
+    const projectDirResolved = path.resolve(projectDir);
+    const writeScope = params.writeScope?.map((entry) => {
+      const resolved = path.resolve(projectDir, entry);
+      if (!isPathContained(resolved, projectDirResolved)) {
+        throw new RpcMethodError(
+          RpcErrorCodes.INVALID_PARAMS,
+          `writeScope entry resolves outside the project: ${entry}`,
+        );
+      }
+      return resolved;
+    });
+
     const attachWiki = params.attachWiki ?? true;
     let wikiMcpUrl: string | null = null;
     let wikiAttached = false;
@@ -238,7 +289,12 @@ export function registerFrontierMethods(engine: Engine): void {
       wikiAttached = true;
     }
 
-    const session = await adapter.createSession({ projectDir, wikiMcpUrl, log: engine.log });
+    const session = await adapter.createSession({
+      projectDir,
+      wikiMcpUrl,
+      log: engine.log,
+      toolPolicy: writeScope !== undefined ? { writeScope } : undefined,
+    });
     const sessionId = randomUUID();
     engine.frontier.addSession(sessionId, { session, adapter });
     engine.log(`frontier.start ${sessionId} engine=${kind} wikiAttached=${wikiAttached}`);

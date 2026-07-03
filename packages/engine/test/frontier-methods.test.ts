@@ -65,6 +65,12 @@ interface FakeAdapterOptions {
   // assert what the RPC handler forwards (or, post-fix, deliberately does
   // NOT forward) to the adapter — see the timeoutMs single-authority test.
   capturedOpts?: Array<{ timeoutMs?: number } | undefined>;
+  // Captures the `toolPolicy` argument each createSession() call receives —
+  // M4 task-1: proves engine.frontier.start resolves writeScope entries
+  // against projectDir (RESOLVED absolute paths) before handing them to the
+  // adapter, and that omitting writeScope leaves toolPolicy undefined
+  // (today's deny-all default, unchanged).
+  capturedToolPolicy?: Array<{ writeScope?: string[] } | undefined>;
   // When set, prompt()'s events generator throws this value (via `throw`,
   // not `yield`) on its very first iteration instead of yielding any events.
   // Mirrors a real adapter surfacing an operational failure mid-stream (a
@@ -86,8 +92,9 @@ function makeFakeAdapter(opts: FakeAdapterOptions = {}): FrontierAdapter {
   const kind = opts.kind ?? "claude-code";
   return {
     kind,
-    async createSession({ projectDir, wikiMcpUrl }): Promise<FrontierSession> {
+    async createSession({ projectDir, wikiMcpUrl, toolPolicy }): Promise<FrontierSession> {
       opts.wikiMcpUrls?.push(wikiMcpUrl);
+      opts.capturedToolPolicy?.push(toolPolicy);
       let promptCalls = 0;
       return {
         id: "fake-inner-id",
@@ -605,5 +612,108 @@ describe("frontier RPC methods", () => {
     const stop = await call("engine.frontier.stop", { sessionId: "throwing-session" });
     expect(stop.error).toBeUndefined();
     expect(stop.result.stopped).toBe(true);
+  });
+
+  // M4 task-1: engine.frontier.start gains an optional writeScope param.
+  // Entries must be relative (resolved against projectDir before reaching
+  // the adapter) — an absolute entry is rejected as INVALID_PARAMS by the
+  // schema, matching every other malformed-params case in this file.
+  it("start rejects an absolute writeScope entry with INVALID_PARAMS", async () => {
+    dir = makeRepo();
+    engine = createEngine();
+    engine.frontier.registerAdapter(makeFakeAdapter());
+
+    const res = await call("engine.frontier.start", {
+      projectDir: dir,
+      attachWiki: false,
+      writeScope: ["/etc"],
+    });
+    expect(res.error?.code).toBe(RpcErrorCodes.INVALID_PARAMS);
+  });
+
+  it("start resolves relative writeScope entries against projectDir before passing them to the adapter", async () => {
+    dir = makeRepo();
+    engine = createEngine();
+    const capturedToolPolicy: Array<{ writeScope?: string[] } | undefined> = [];
+    engine.frontier.registerAdapter(makeFakeAdapter({ capturedToolPolicy }));
+
+    const start = await call("engine.frontier.start", {
+      projectDir: dir,
+      attachWiki: false,
+      writeScope: ["scratch", "nested/dir"],
+    });
+    expect(start.error).toBeUndefined();
+
+    expect(capturedToolPolicy).toHaveLength(1);
+    expect(capturedToolPolicy[0]?.writeScope).toEqual([
+      path.resolve(dir, "scratch"),
+      path.resolve(dir, "nested/dir"),
+    ]);
+  });
+
+  it("start with no writeScope leaves toolPolicy undefined for the adapter (deny-all default unchanged)", async () => {
+    dir = makeRepo();
+    engine = createEngine();
+    const capturedToolPolicy: Array<{ writeScope?: string[] } | undefined> = [];
+    engine.frontier.registerAdapter(makeFakeAdapter({ capturedToolPolicy }));
+
+    const start = await call("engine.frontier.start", { projectDir: dir, attachWiki: false });
+    expect(start.error).toBeUndefined();
+    expect(capturedToolPolicy).toEqual([undefined]);
+  });
+
+  // M4 task-1 review round 1, Finding 1 (Important): the absolute-path
+  // refine above only catches entries that are already absolute. A RELATIVE
+  // traversal entry like "../../elsewhere" is still relative, so it passed
+  // that refine untouched, resolved outside projectDir, and became trusted
+  // write scope — a containment escape. Every resolved entry must now also
+  // be checked against projectDir itself (via the shared isPathContained
+  // helper in ./path-scope.ts, the same predicate claude.ts's canUseTool
+  // uses) and rejected as INVALID_PARAMS if it lands outside.
+  it("rejects a writeScope entry that escapes the project via relative traversal (../../elsewhere)", async () => {
+    dir = makeRepo();
+    engine = createEngine();
+    engine.frontier.registerAdapter(makeFakeAdapter());
+
+    const res = await call("engine.frontier.start", {
+      projectDir: dir,
+      attachWiki: false,
+      writeScope: ["../../elsewhere"],
+    });
+    expect(res.error?.code).toBe(RpcErrorCodes.INVALID_PARAMS);
+    expect(res.error?.message).toContain("writeScope entry resolves outside the project");
+  });
+
+  it("accepts '.' and '.openfusion' as writeScope entries (both resolve inside projectDir)", async () => {
+    dir = makeRepo();
+    engine = createEngine();
+    const capturedToolPolicy: Array<{ writeScope?: string[] } | undefined> = [];
+    engine.frontier.registerAdapter(makeFakeAdapter({ capturedToolPolicy }));
+
+    const start = await call("engine.frontier.start", {
+      projectDir: dir,
+      attachWiki: false,
+      writeScope: [".", ".openfusion"],
+    });
+    expect(start.error).toBeUndefined();
+    expect(capturedToolPolicy).toHaveLength(1);
+    expect(capturedToolPolicy[0]?.writeScope).toEqual([
+      path.resolve(dir),
+      path.resolve(dir, ".openfusion"),
+    ]);
+  });
+
+  it("rejects a writeScope entry that escapes the project via a same-prefix traversal (.openfusion/../..)", async () => {
+    dir = makeRepo();
+    engine = createEngine();
+    engine.frontier.registerAdapter(makeFakeAdapter());
+
+    const res = await call("engine.frontier.start", {
+      projectDir: dir,
+      attachWiki: false,
+      writeScope: [".openfusion/../.."],
+    });
+    expect(res.error?.code).toBe(RpcErrorCodes.INVALID_PARAMS);
+    expect(res.error?.message).toContain("writeScope entry resolves outside the project");
   });
 });

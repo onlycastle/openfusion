@@ -1,5 +1,6 @@
 import { RpcDispatcher } from "./rpc/dispatcher.js";
 import { FrontierService, registerFrontierMethods } from "./engines/methods.js";
+import { HarnessService, registerHarnessMethods } from "./harness/methods.js";
 import { registerCoreMethods } from "./methods.js";
 import { ModelsService, registerModelsMethods } from "./models/methods.js";
 import { WikiService, registerWikiMethods } from "./wiki/methods.js";
@@ -21,6 +22,7 @@ export class Engine {
   readonly wiki = new WikiService();
   readonly models = new ModelsService();
   readonly frontier = new FrontierService();
+  readonly harness = new HarnessService();
 
   constructor(options: EngineOptions = {}) {
     this.log = options.log ?? (() => {});
@@ -29,6 +31,7 @@ export class Engine {
     registerWikiMethods(this);
     registerModelsMethods(this);
     registerFrontierMethods(this);
+    registerHarnessMethods(this);
   }
 
   async close(): Promise<void> {
@@ -72,3 +75,27 @@ export { PRICING, lookupPricing, estimateCostUsd, normalizeUsage } from "./model
 export type { ModelPricing, NormalizedUsage } from "./models/pricing.js";
 export { CostMeter } from "./models/meter.js";
 export type { UsageRecord, MeterTotals, ModelTotals } from "./models/meter.js";
+export { HarnessService, registerHarnessMethods } from "./harness/methods.js";
+export { generateHarness } from "./harness/generate.js";
+export type { GenerateHarnessResult } from "./harness/generate.js";
+export { HarnessGenError, promptForJson } from "./harness/driver.js";
+export type { DriverNotice, PromptForJsonOpts } from "./harness/driver.js";
+export { exportHarness } from "./harness/exporters.js";
+export type { HarnessExportFormat, HarnessExportResult } from "./harness/exporters.js";
+export {
+  AgentDefSchema,
+  HarnessBundleSchema,
+  ManifestSchema,
+  RoutingSchema,
+  WIKI_PAGE_SLUGS,
+  WikiPageSchema,
+  validateHarness,
+} from "./harness/schema.js";
+export type { AgentDef, HarnessBundle, HarnessIssue, Manifest, Routing, WikiPage } from "./harness/schema.js";
+export {
+  HarnessValidationError,
+  harnessDir,
+  harnessStatus,
+  loadHarness,
+  writeHarness,
+} from "./harness/store.js";
