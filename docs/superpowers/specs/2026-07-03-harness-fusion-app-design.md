@@ -128,6 +128,21 @@ useful even without the app (OSS adoption lever).
 6. Cost meter logs every call against the pricing table; UI shows running
    savings vs an all-frontier counterfactual.
 
+**Realized in the engine (M5b):** `engine.orchestrate` implements steps 2–4
+headlessly — classify (keyword heuristic over `routing.yaml`) → route (agent
++ model resolution) → open-model worker (isolated git worktree) → read-only
+frontier review (structured approve/request-changes verdict) → retry once →
+escalate to a write-scoped frontier session. `engine.orchestrate.apply`
+implements step 5's mechanics (`git apply --3way`, no commit/merge); the
+actual UI approval gate itself is still a shell concern (M7). Step 6's cost
+meter exists (`engine.models.usage`, `bySource`) and `engine.orchestrate`
+reports its own worker/frontier split, tagged `estimate-class` — see
+README's "How the loop works" for the full flow and its caveats.
+`engine.worker.list`/`engine.worker.gc` close the worktree-lifecycle gap step
+4's isolation implies but doesn't fully resolve: orchestrate cleans up its
+own rejected attempts and leaves the surviving worktree for apply, but a
+crash mid-run needs an explicit sweep.
+
 ## 6. Eval Loop
 
 After generation (and after major refreshes), run micro-evals
@@ -201,6 +216,21 @@ built-in editor.
    any claude.ai login flow is prohibited by provider terms. Mitigation:
    revisit before public DMG release (M8) to confirm terms permit embedded
    official CLI usage under user subscription.
+6. **v1 orchestrate is single-worker-per-task** — `engine.orchestrate` (M5b)
+   runs exactly one worker attempt at a time per task, with no parallel
+   decomposition into sub-tasks/sub-worktrees; a task that would benefit from
+   fan-out gets none of that benefit in v1. Mitigation: deferred by design —
+   the routing/review/escalation plumbing this milestone built is the
+   prerequisite for a later fan-out layer, not a replacement for it.
+7. **Review-gate quality bounds the cost-savings claim** — the whole
+   cost-at-held-quality thesis depends on the frontier review gate actually
+   catching worker mistakes; a review gate that rubber-stamps bad diffs
+   converts "cheaper" into "cheaper AND worse," which the cost meter alone
+   cannot detect (it prices calls, not correctness). Mitigation: the M6 eval
+   loop (baseline-vs-harness report card) is the first point this gets
+   measured rather than assumed; until then, review-gate quality — and by
+   extension the savings claim — is UNVERIFIED, same status as the harness
+   itself.
 
 ## Appendix: Research Summary
 

@@ -21,7 +21,7 @@ import { z } from "zod";
 import { RpcErrorCodes } from "@openfusion/shared";
 import type { Engine } from "../engine.js";
 import { RpcMethodError } from "../rpc/errors.js";
-import { getHeadSha } from "../wiki/indexer.js";
+import { requireGitRepo } from "../rpc/guards.js";
 import { wikiDbPath } from "../wiki/store.js";
 import { ENGINE_VERSION } from "../version.js";
 import { PRICING } from "../models/pricing.js";
@@ -187,7 +187,7 @@ function buildAgentsRoutingPrompt(overview: Overview, workerModels: WorkerModelO
     "```json\n" + JSON.stringify(overview, null, 2) + "\n```",
     "Configured worker models (cost is per million tokens):",
     modelMenu,
-    "Propose 2 to 5 specialist agents, each mapped to one or more task classes (cover at minimum: codegen, docs, tests, search, refactor), each assigned the CHEAPEST worker model adequate for its task classes — or the literal string \"frontier\" if no configured worker model is adequate.",
+    "Propose 2 to 5 specialist agents, each mapped to one or more task classes (cover at minimum: codegen, docs, tests, search, refactor), each assigned the CHEAPEST worker model adequate for its task classes — including that model's providerId from the menu above — or the literal string \"frontier\" if no configured worker model is adequate.",
     "Also produce the routing.yaml content: every task class maps to exactly one agent, escalation.failuresBeforeFrontier defaults to 2, and defaults.agent names a sensible fallback agent.",
     "Respond with ONLY a single JSON code block matching this exact shape:",
     "```json\n" +
@@ -200,7 +200,7 @@ function buildAgentsRoutingPrompt(overview: Overview, workerModels: WorkerModelO
               description: "string",
               prompt: "string — the system prompt this agent will run with",
               taskClasses: ["codegen"],
-              model: { kind: "string", model: "string" },
+              model: { kind: "string", model: "string", providerId: "string" },
               escalation: { maxAttempts: 2 },
             },
           ],
@@ -215,21 +215,8 @@ function buildAgentsRoutingPrompt(overview: Overview, workerModels: WorkerModelO
         2,
       ) +
       "\n```",
-    'model may also be the literal string "frontier" instead of an object.',
+    'model may also be the literal string "frontier" instead of an object. providerId is optional but should be set to the providerId from the model menu above whenever a specific worker model is assigned.',
   ].join("\n\n");
-}
-
-// Mirrors engines/methods.ts's own (unexported) requireHeadSha — same
-// intentional duplication as that file documents (wiki/methods.ts has a
-// third copy): "not a git repository" should read identically from every
-// engine.* surface, and this three-line guard isn't worth widening any of
-// those modules' public exports to share.
-function requireHeadSha(projectDir: string): string {
-  try {
-    return getHeadSha(projectDir);
-  } catch {
-    throw new RpcMethodError(RpcErrorCodes.SERVER_ERROR, `not a git repository: ${projectDir}`);
-  }
 }
 
 // Mirrors engine.wiki.status's own built/stale gate (wiki/methods.ts):
@@ -255,7 +242,7 @@ function addCost(total: number | null, next: number | null): number | null {
 // (./methods.ts) is what coalesces concurrent calls for the same project;
 // this function always runs a full generation from scratch.
 export async function generateHarness(engine: Engine, projectDir: string): Promise<GenerateHarnessResult> {
-  const headSha = requireHeadSha(projectDir);
+  const headSha = requireGitRepo(projectDir);
 
   const adapter = engine.frontier.getAdapter(FRONTIER_KIND);
   if (adapter === undefined) {
@@ -279,6 +266,13 @@ export async function generateHarness(engine: Engine, projectDir: string): Promi
     projectDir,
     wikiMcpUrl: mcpServer.url,
     log: engine.log,
+    // Final review Fix 2: an hour-long, ONE-TIME harness-generation run is
+    // not per-task review overhead — tag it distinctly so
+    // engines/methods.ts's onResult hook meters it under source
+    // "frontier-generate" instead of the "frontier-review" default, which
+    // otherwise breaks M6's per-task cost amortization math (see
+    // models/meter.ts's UsageSource doc comment).
+    resultLabel: "frontier-generate",
   });
 
   try {

@@ -69,12 +69,17 @@ function detail(s: string): string {
   return truncate(s.replace(/[\x00-\x1f]/g, " "), DETAIL_TRUNCATE_CHARS);
 }
 
-function runBash(command: string, cwd: string, timeoutMs: number): Promise<BashResult> {
+function runBash(
+  command: string,
+  cwd: string,
+  timeoutMs: number,
+  abortSignal: AbortSignal | undefined,
+): Promise<BashResult> {
   return new Promise((resolve) => {
     execFile(
       "/bin/sh",
       ["-c", command],
-      { cwd, timeout: timeoutMs, maxBuffer: BASH_MAX_BUFFER },
+      { cwd, timeout: timeoutMs, maxBuffer: BASH_MAX_BUFFER, signal: abortSignal },
       (error, stdout, stderr) => {
         const out = truncate(stdout, OUTPUT_TRUNCATE_CHARS);
         const err = truncate(stderr, OUTPUT_TRUNCATE_CHARS);
@@ -86,16 +91,32 @@ function runBash(command: string, cwd: string, timeoutMs: number): Promise<BashR
         // to completion and exited nonzero (the normal case a worker reads,
         // e.g. `exit 3` -> code 3 -- returned below with no `error` field,
         // since a nonzero exit is not itself a tool failure). Anything else
-        // (a signal-kill from our own timeout, ENOENT from a bad
-        // interpreter, an over-maxBuffer abort) means there is no real exit
-        // code to report -- normalize to -1 and attach an explanatory
-        // message so the model can tell the difference.
+        // (a signal-kill from our own timeout, an abort from the AI SDK's
+        // merged options.abortSignal, ENOENT from a bad interpreter, an
+        // over-maxBuffer abort) means there is no real exit code to report
+        // -- normalize to -1 and attach an explanatory message so the model
+        // can tell the difference.
         const e = error as NodeJS.ErrnoException & {
           killed?: boolean;
           signal?: NodeJS.Signals | null;
         };
         if (typeof e.code === "number") {
           resolve({ stdout: out, stderr: err, exitCode: e.code });
+          return;
+        }
+        // execFile's `signal` option kills the child and rejects/errors with
+        // an AbortError (name === "AbortError") when the passed AbortSignal
+        // fires -- distinct from our own `timeout` option's SIGTERM kill
+        // (which sets `e.killed` but not this name). Surfacing "aborted"
+        // here (rather than folding it into the generic message branch)
+        // lets a caller distinguish "the deadline/abort fired" from
+        // "bashTimeoutMs itself elapsed", even though both are reported the
+        // same way to the model (a normal tool result, not a throw) --
+        // whichever aborted the child, generateText's own abort handling is
+        // what actually ends the run; this is just a clean result in the
+        // meantime.
+        if (e.name === "AbortError" || abortSignal?.aborted) {
+          resolve({ stdout: out, stderr: err, exitCode: -1, error: "aborted" });
           return;
         }
         const message = e.killed
@@ -160,16 +181,17 @@ export function createWorkerTools(ctx: ToolContext): Record<string, Tool> {
       "tools, bash does not enforce path containment. A nonzero exit code " +
       "is a normal result, not a failure of this tool.",
     inputSchema: z.object({ command: z.string().min(1) }),
-    execute: async ({ command }): Promise<BashResult> => {
+    execute: async ({ command }, { abortSignal }): Promise<BashResult> => {
       ctx.onToolEvent?.({ tool: "bash", detail: detail(command) });
-      return runBash(command, ctx.root, bashTimeoutMs);
+      return runBash(command, ctx.root, bashTimeoutMs, abortSignal);
     },
   });
 
   const read_file = tool({
     description: "Read a UTF-8 text file at a path relative to the worktree root.",
     inputSchema: z.object({ path: z.string().min(1) }),
-    execute: async ({ path: rawPath }): Promise<ReadResult | FileErrorResult> => {
+    execute: async ({ path: rawPath }, { abortSignal }): Promise<ReadResult | FileErrorResult> => {
+      if (abortSignal?.aborted) return { error: "aborted" };
       ctx.onToolEvent?.({ tool: "read_file", detail: detail(rawPath) });
       const gate = containmentGate(ctx.root, canonicalRoot, rawPath);
       if (!gate.ok) return { error: gate.error };
@@ -188,7 +210,11 @@ export function createWorkerTools(ctx: ToolContext): Record<string, Tool> {
       "Write (create or overwrite) a UTF-8 text file at a path relative to " +
       "the worktree root, creating parent directories as needed.",
     inputSchema: z.object({ path: z.string().min(1), content: z.string() }),
-    execute: async ({ path: rawPath, content }): Promise<WriteResult | FileErrorResult> => {
+    execute: async (
+      { path: rawPath, content },
+      { abortSignal },
+    ): Promise<WriteResult | FileErrorResult> => {
+      if (abortSignal?.aborted) return { error: "aborted" };
       ctx.onToolEvent?.({ tool: "write_file", detail: detail(rawPath) });
       const gate = containmentGate(ctx.root, canonicalRoot, rawPath);
       if (!gate.ok) return { error: gate.error };
@@ -213,7 +239,11 @@ export function createWorkerTools(ctx: ToolContext): Record<string, Tool> {
       find: z.string().min(1),
       replace: z.string(),
     }),
-    execute: async ({ path: rawPath, find, replace }): Promise<EditResult | FileErrorResult> => {
+    execute: async (
+      { path: rawPath, find, replace },
+      { abortSignal },
+    ): Promise<EditResult | FileErrorResult> => {
+      if (abortSignal?.aborted) return { error: "aborted" };
       ctx.onToolEvent?.({ tool: "edit", detail: detail(rawPath) });
       const gate = containmentGate(ctx.root, canonicalRoot, rawPath);
       if (!gate.ok) return { error: gate.error };

@@ -6,8 +6,9 @@ import { RpcErrorCodes } from "@openfusion/shared";
 import type { Engine } from "../engine.js";
 import { RpcMethodError } from "../rpc/errors.js";
 import { registerMethod } from "../rpc/register.js";
-import { getHeadSha } from "../wiki/indexer.js";
+import { requireGitRepo } from "../rpc/guards.js";
 import { wikiDbPath } from "../wiki/store.js";
+import type { UsageSource } from "../models/meter.js";
 import { createClaudeAdapter } from "./claude.js";
 import { isPathContained } from "./path-scope.js";
 import type {
@@ -16,6 +17,29 @@ import type {
   FrontierPromptHandle,
   FrontierSession,
 } from "./types.js";
+
+// Final review Fix 2: maps a createSession `resultLabel` (engines/types.ts)
+// to the UsageSource its onResult -> meter.record call below tags each
+// result with. Centralized here (rather than inlined in the onResult
+// closure) so every label this file knows about is enumerated in ONE place —
+// see models/meter.ts's UsageSource doc comment for what each source means.
+// An unrecognized/absent label falls back to "frontier-review", matching
+// this hook's pre-existing default; every real call site (harness/generate.ts,
+// this file's own engine.frontier.start handler, and orchestrate.ts's review/
+// escalate sessions) now sets one of the other three explicitly, so that
+// fallback is only ever reached by a caller that predates this mapping.
+function mapResultLabelToSource(resultLabel: string | undefined): UsageSource {
+  switch (resultLabel) {
+    case "frontier-escalate":
+      return "frontier-escalate";
+    case "frontier-generate":
+      return "frontier-generate";
+    case "frontier-interactive":
+      return "frontier-interactive";
+    default:
+      return "frontier-review";
+  }
+}
 
 // M4 task-1: writeScope entries must be RELATIVE — they're resolved against
 // projectDir below, before being handed to the adapter as absolute paths
@@ -73,21 +97,6 @@ const EmptyParamsSchema = z.object({});
 interface SessionEntry {
   session: FrontierSession;
   adapter: FrontierAdapter;
-}
-
-// Mirrors wiki/methods.ts's own (unexported) requireHeadSha guard, including
-// its error shape — engine.frontier.* operates against a project checkout
-// the same way engine.wiki.* does, so "not a git repository" should read
-// identically from either surface. Not imported from wiki/methods.ts because
-// that helper isn't exported there; kept as a narrow, intentional
-// duplication rather than widening wiki's public surface for one shared
-// three-line guard.
-function requireHeadSha(projectDir: string): void {
-  try {
-    getHeadSha(projectDir);
-  } catch {
-    throw new RpcMethodError(RpcErrorCodes.SERVER_ERROR, `not a git repository: ${projectDir}`);
-  }
 }
 
 // Mirrors engine.wiki.status's own built-check: gate on existsSync(wikiDbPath)
@@ -228,7 +237,7 @@ export function registerFrontierMethods(engine: Engine): void {
   // the adapter's own result-mapping, one record per `result` message.
   engine.frontier.registerAdapter(
     createClaudeAdapter({
-      onResult: (result, model) => {
+      onResult: (result, model, resultLabel) => {
         engine.models.meter.record({
           providerId: "claude-code",
           kind: "frontier-claude",
@@ -236,6 +245,14 @@ export function registerFrontierMethods(engine: Engine): void {
           usage: result.usage,
           costUsd: result.costUsd,
           at: Date.now(),
+          // M5b Task 4 / Final review Fix 2: every caller of this SAME
+          // registered adapter tags its own createSession call with an
+          // explicit `resultLabel` (types.ts) so results from each distinct
+          // purpose land in a distinct UsageSource bucket instead of all
+          // being folded into "frontier-review" — see
+          // mapResultLabelToSource's own doc comment above for the full
+          // label -> source table.
+          source: mapResultLabelToSource(resultLabel),
         });
       },
     }),
@@ -243,7 +260,7 @@ export function registerFrontierMethods(engine: Engine): void {
 
   registerMethod(engine.dispatcher, "engine.frontier.start", StartParamsSchema, async (params) => {
     const { projectDir } = params;
-    requireHeadSha(projectDir);
+    requireGitRepo(projectDir);
 
     const kind = params.engine ?? "claude-code";
     const adapter = engine.frontier.getAdapter(kind);
@@ -294,6 +311,12 @@ export function registerFrontierMethods(engine: Engine): void {
       wikiMcpUrl,
       log: engine.log,
       toolPolicy: writeScope !== undefined ? { writeScope } : undefined,
+      // Final review Fix 2: this is the raw, interactive engine.frontier.*
+      // RPC surface (no orchestrator/generator wrapping it) — its cost is
+      // NOT per-task review overhead, so it gets its own UsageSource rather
+      // than falling into the "frontier-review" default (see
+      // mapResultLabelToSource above).
+      resultLabel: "frontier-interactive",
     });
     const sessionId = randomUUID();
     engine.frontier.addSession(sessionId, { session, adapter });

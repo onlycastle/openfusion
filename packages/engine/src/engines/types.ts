@@ -46,5 +46,20 @@ export interface FrontierAdapter {
     // layer (methods.ts) resolves relative writeScope entries against
     // projectDir before calling createSession.
     toolPolicy?: { writeScope?: string[] };
+    // Opaque label forwarded verbatim to the adapter's own onResult hook
+    // (see claude.ts's CreateClaudeAdapterOptions) as a third argument
+    // whenever a `result` event fires on a prompt made through THIS
+    // session. The adapter itself has no notion of what a label MEANS —
+    // kept meter-agnostic by design (see claude.ts's onResult doc comment)
+    // — this exists purely so a caller that drives multiple purposes
+    // through the SAME registered adapter (M5b Task 4's orchestrator: one
+    // "claude-code" adapter serves both a read-only REVIEW session and a
+    // write-scoped ESCALATION session) can tell its own onResult hook which
+    // purpose produced a given result, without the adapter needing to know
+    // "review" or "escalate" mean anything. Absent -> onResult's third
+    // argument is undefined; registerFrontierMethods' default wiring
+    // (engines/methods.ts) treats that the same as its pre-existing
+    // "frontier-review" default.
+    resultLabel?: string;
   }): Promise<FrontierSession>;
 }

@@ -201,6 +201,26 @@ describe("AgentDefSchema", () => {
     expect(AgentDefSchema.safeParse(validAgent({ model: "frontier" })).success).toBe(true);
   });
 
+  it("accepts a concrete model without providerId (backward compatible)", () => {
+    const result = AgentDefSchema.safeParse(
+      validAgent({ model: { kind: "deepseek", model: "deepseek-chat" } }),
+    );
+    expect(result.success).toBe(true);
+    if (result.success && result.data.model !== "frontier") {
+      expect(result.data.model.providerId).toBeUndefined();
+    }
+  });
+
+  it("accepts a concrete model with providerId (M5b routing)", () => {
+    const result = AgentDefSchema.safeParse(
+      validAgent({ model: { kind: "deepseek", model: "deepseek-chat", providerId: "deepseek-prod" } }),
+    );
+    expect(result.success).toBe(true);
+    if (result.success && result.data.model !== "frontier") {
+      expect(result.data.model.providerId).toBe("deepseek-prod");
+    }
+  });
+
   it("rejects an unrecognized model literal", () => {
     expect(AgentDefSchema.safeParse(validAgent({ model: "cheap" as never })).success).toBe(false);
   });

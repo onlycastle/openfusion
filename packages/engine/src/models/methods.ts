@@ -3,6 +3,7 @@ import { z } from "zod";
 import { RpcErrorCodes } from "@openfusion/shared";
 import type { Engine } from "../engine.js";
 import { RpcMethodError } from "../rpc/errors.js";
+import { providerKindOf } from "../rpc/guards.js";
 import { registerMethod } from "../rpc/register.js";
 import { CostMeter } from "./meter.js";
 import { estimateCostUsd, lookupPricing, normalizeUsage, type NormalizedUsage } from "./pricing.js";
@@ -148,15 +149,6 @@ function timeoutAttemptMessage(err: unknown, timeoutMs: number): string {
     : `model call timed out after ${timeoutMs}ms: ${raw}`;
 }
 
-// Looks up the provider kind recorded at `configure()` time. Falls back to
-// the providerId itself (which simply fails pricing lookups harmlessly) for
-// the — unsupported in practice — case of a resolve()-able provider that was
-// never configured.
-function kindOf(engine: Engine, providerId: string): string {
-  const registered = engine.models.registry.list().find((p) => p.id === providerId);
-  return registered?.kind ?? providerId;
-}
-
 async function runComplete(
   engine: Engine,
   params: CompleteParams,
@@ -176,7 +168,7 @@ async function runComplete(
   for (let i = 0; i < candidates.length; i++) {
     const candidate = candidates[i]!;
     const { providerId, model } = candidate;
-    const kind = kindOf(engine, providerId);
+    const kind = providerKindOf(engine.models.registry, providerId);
 
     try {
       const languageModel = engine.models.registry.resolve(providerId, model);
@@ -206,7 +198,7 @@ async function runComplete(
       const pricing = lookupPricing(kind, model);
       const costUsd = pricing !== null ? estimateCostUsd(pricing, usage) : null;
 
-      engine.models.meter.record({ providerId, kind, model, usage, costUsd, at: Date.now() });
+      engine.models.meter.record({ providerId, kind, model, usage, costUsd, at: Date.now(), source: "complete" });
       attempts.push({ providerId, model });
 
       engine.log(`models.complete ${kind}/${model} ${i === 0 ? "ok" : "failover"}`);

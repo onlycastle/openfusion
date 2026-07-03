@@ -42,6 +42,34 @@ function promptText(options: { prompt: Array<{ content: unknown }> }): string {
     .join("\n");
 }
 
+// Simulates a hung model call: the returned promise never settles on its
+// own, mirroring a provider that accepted the request but never responds.
+// It DOES honor the `abortSignal` generateText attaches to the call (real
+// provider adapters reject when their signal fires, via fetch) so that
+// runWorkerLoop's `abortSignal` plumbing has something real to abort --
+// MockLanguageModelV4 itself does not race the signal against its
+// doGenerate implementation, so without this the promise would hang forever
+// regardless of the signal (mirrors models-complete.test.ts's own
+// `hungFetch` helper, one layer up the stack).
+function makeHangingModel(): MockLanguageModelV4 {
+  return new MockLanguageModelV4({
+    // `return`ed (not `await`ed then fallen off the end) so the arrow
+    // function's inferred return type stays `Promise<never>` -- which IS
+    // structurally assignable to the doGenerate contract's
+    // `PromiseLike<LanguageModelV4GenerateResult>` (never being the bottom
+    // type), whereas `await`-then-implicit-return infers `Promise<void>`,
+    // which is not.
+    doGenerate: async ({ abortSignal }) =>
+      new Promise<never>((_resolve, reject) => {
+        if (abortSignal?.aborted) {
+          reject(abortSignal.reason);
+          return;
+        }
+        abortSignal?.addEventListener("abort", () => reject(abortSignal.reason), { once: true });
+      }),
+  });
+}
+
 const USAGE_A = {
   inputTokens: { total: 100, noCache: 100, cacheRead: undefined, cacheWrite: undefined },
   outputTokens: { total: 50, text: 0, reasoning: undefined },
@@ -246,5 +274,32 @@ describe("runWorkerLoop", () => {
     const withoutDigestPrompt = promptText(withoutDigest.doGenerateCalls[0]!);
     expect(withoutDigestPrompt).toContain(taskSentinel);
     expect(withoutDigestPrompt).not.toContain(digestSentinel);
+  });
+
+  // M5b Task 0: runWorkerLoop must accept an `abortSignal` and actually wire
+  // it into generateText -- without this, a hung model call has no way to
+  // be interrupted, and engine.worker.run's timeoutMs / close-abort (built
+  // on top of this) would have nothing to fire.
+  it("rejects when the given abortSignal fires mid-generate, instead of hanging forever", async () => {
+    dir = makeRoot();
+    const tools = createWorkerTools({ root: dir });
+    const model = makeHangingModel();
+    const controller = new AbortController();
+
+    const resultPromise = runWorkerLoop({
+      model,
+      task: "hang forever",
+      tools,
+      abortSignal: controller.signal,
+    });
+
+    // Let the mock's doGenerate actually start and register its abort
+    // listener before firing the signal, so this exercises the "abort
+    // arrives while in flight" path rather than the "already aborted"
+    // shortcut.
+    await new Promise((r) => setTimeout(r, 20));
+    controller.abort(new Error("test abort"));
+
+    await expect(resultPromise).rejects.toThrow();
   });
 });

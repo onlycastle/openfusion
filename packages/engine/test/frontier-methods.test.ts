@@ -71,6 +71,12 @@ interface FakeAdapterOptions {
   // adapter, and that omitting writeScope leaves toolPolicy undefined
   // (today's deny-all default, unchanged).
   capturedToolPolicy?: Array<{ writeScope?: string[] } | undefined>;
+  // Final review Fix 2: captures createSession's `resultLabel` argument so
+  // tests can assert engine.frontier.start tags interactive sessions
+  // "frontier-interactive" (not the pre-fix default of "frontier-review",
+  // which mislabeled interactive frontier.start cost as per-task review
+  // overhead).
+  capturedResultLabel?: Array<string | undefined>;
   // When set, prompt()'s events generator throws this value (via `throw`,
   // not `yield`) on its very first iteration instead of yielding any events.
   // Mirrors a real adapter surfacing an operational failure mid-stream (a
@@ -92,9 +98,10 @@ function makeFakeAdapter(opts: FakeAdapterOptions = {}): FrontierAdapter {
   const kind = opts.kind ?? "claude-code";
   return {
     kind,
-    async createSession({ projectDir, wikiMcpUrl, toolPolicy }): Promise<FrontierSession> {
+    async createSession({ projectDir, wikiMcpUrl, toolPolicy, resultLabel }): Promise<FrontierSession> {
       opts.wikiMcpUrls?.push(wikiMcpUrl);
       opts.capturedToolPolicy?.push(toolPolicy);
+      opts.capturedResultLabel?.push(resultLabel);
       let promptCalls = 0;
       return {
         id: "fake-inner-id",
@@ -189,6 +196,23 @@ describe("frontier RPC methods", () => {
     engine.frontier.registerAdapter(makeFakeAdapter());
     const res = await call("engine.frontier.start", { projectDir: dir });
     expect(res.error?.code).toBe(RpcErrorCodes.SERVER_ERROR);
+  });
+
+  // Final review Fix 2 (Important): engine.frontier.start's createSession
+  // call used to pass no resultLabel at all, so engines/methods.ts's onResult
+  // hook defaulted every interactive-session result to source
+  // "frontier-review" — mislabeling interactive frontier.start usage as
+  // per-task review overhead, which breaks M6's amortization math. Confirmed
+  // RED against pre-fix code (capturedResultLabel was [undefined]).
+  it("start opens the session with resultLabel \"frontier-interactive\" so interactive cost is metered separately from review", async () => {
+    dir = makeRepo();
+    engine = createEngine();
+    const capturedResultLabel: Array<string | undefined> = [];
+    engine.frontier.registerAdapter(makeFakeAdapter({ capturedResultLabel }));
+
+    const start = await call("engine.frontier.start", { projectDir: dir, attachWiki: false });
+    expect(start.error).toBeUndefined();
+    expect(capturedResultLabel).toEqual(["frontier-interactive"]);
   });
 
   it("start with an unregistered adapter kind returns SERVER_ERROR", async () => {

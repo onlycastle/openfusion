@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { MockLanguageModelV4 } from "ai/test";
@@ -80,6 +80,33 @@ function makeWorkerMock(): MockLanguageModelV4 {
   });
 }
 
+// Simulates a hung model call: the returned promise never settles on its
+// own, mirroring a provider that accepted the request but never responds.
+// It DOES honor the `abortSignal` generateText attaches to the call so that
+// timeoutMs -> AbortSignal.timeout() -> runWorkerLoop's abortSignal plumbing
+// (and WorkerService.close()'s own abort) has something real to interrupt --
+// MockLanguageModelV4 does not race the signal against its doGenerate
+// implementation itself (mirrors worker-loop.test.ts's own makeHangingModel
+// and models-complete.test.ts's hungFetch, one layer up the stack).
+function makeHangingWorkerMock(): MockLanguageModelV4 {
+  return new MockLanguageModelV4({
+    // `return`ed (not `await`ed then fallen off the end) so the arrow
+    // function's inferred return type stays `Promise<never>` -- which IS
+    // structurally assignable to the doGenerate contract's
+    // `PromiseLike<LanguageModelV4GenerateResult>` (never being the bottom
+    // type), whereas `await`-then-implicit-return infers `Promise<void>`,
+    // which is not. See worker-loop.test.ts's own makeHangingModel.
+    doGenerate: async ({ abortSignal }) =>
+      new Promise<never>((_resolve, reject) => {
+        if (abortSignal?.aborted) {
+          reject(abortSignal.reason);
+          return;
+        }
+        abortSignal?.addEventListener("abort", () => reject(abortSignal.reason), { once: true });
+      }),
+  });
+}
+
 describe("engine.worker.run", () => {
   it("produces a reviewable diff, summary, usage, and priced cost, and leaves the worktree in place", async () => {
     dir = makeRepo();
@@ -134,6 +161,15 @@ describe("engine.worker.run", () => {
     expect(usage.result.outputTokens).toBe(80);
     expect(usage.result.byModel["deepseek/deepseek-v4-flash"]).toBeDefined();
     expect(usage.result.byModel["deepseek/deepseek-v4-flash"].calls).toBe(1);
+    // M5b Task 1: engine.worker.run records under source "worker", and
+    // engine.models.usage carries that breakdown alongside byModel — the
+    // same ledger entry, sliced a different way.
+    expect(usage.result.bySource["worker"]).toEqual({
+      calls: 1,
+      inputTokens: 300,
+      outputTokens: 80,
+      costUsd: usage.result.byModel["deepseek/deepseek-v4-flash"].costUsd,
+    });
   });
 
   it("emits worker.progress notifications for both tool and step events", async () => {
@@ -373,5 +409,257 @@ describe("engine.worker.run", () => {
     const failedWorktreePath = failRes.error.data.worktree.path as string;
     // NOT auto-removed — the worktree is still on disk for inspection.
     expect(existsSync(failedWorktreePath)).toBe(true);
+  });
+
+  // M5b Task 0: a hung model call must not hang engine.worker.run forever.
+  // timeoutMs -> AbortSignal.timeout() -> runWorkerLoop's abortSignal fires
+  // the deadline; the existing failure path (SERVER_ERROR + worktree
+  // breadcrumb, no auto-remove) already does the right thing once the
+  // signal actually interrupts the loop.
+  it("timeoutMs: a hung model call fails fast as SERVER_ERROR containing \"timed out\", leaving the worktree in place", async () => {
+    dir = makeRepo();
+    engine = createEngine();
+    engine.models.registry.configure({ id: "p1", kind: "deepseek", apiKey: TEST_API_KEY });
+    engine.models.registry.setTestModel("p1", makeHangingWorkerMock());
+
+    const start = Date.now();
+    const res = await call(engine, "engine.worker.run", {
+      projectDir: dir,
+      task: "create hello.txt",
+      providerId: "p1",
+      model: "deepseek-v4-flash",
+      // 500ms is comfortably under the schema floor's neighbor (1000ms is
+      // the actual floor) -- picked small so this test itself stays fast
+      // while still asserting a real deadline fired, not an immediate
+      // synchronous rejection.
+      timeoutMs: 1000,
+    });
+    const elapsed = Date.now() - start;
+
+    expect(res.result).toBeUndefined();
+    expect(res.error.code).toBe(RpcErrorCodes.SERVER_ERROR);
+    expect(res.error.message).toContain("timed out");
+    // Bounds this as "fired the deadline", not "hung until some larger
+    // default/afterEach timeout saved us".
+    expect(elapsed).toBeLessThan(5000);
+
+    const worktreePath = res.error.data?.worktree?.path as string | undefined;
+    expect(typeof worktreePath).toBe("string");
+    expect(existsSync(worktreePath!)).toBe(true);
+  }, 10_000);
+
+  // M5b Task 0: engine.close() must abort an in-flight worker run rather
+  // than hang behind it (or wait out that run's own, possibly much larger,
+  // timeoutMs) -- this is what lets escalation/orchestration end a worker
+  // run on demand.
+  it("engine.close() aborts an in-flight run instead of hanging behind it", async () => {
+    dir = makeRepo();
+    engine = createEngine();
+    engine.models.registry.configure({ id: "p1", kind: "deepseek", apiKey: TEST_API_KEY });
+    engine.models.registry.setTestModel("p1", makeHangingWorkerMock());
+
+    const runPromise = call(engine, "engine.worker.run", {
+      projectDir: dir,
+      task: "create hello.txt",
+      providerId: "p1",
+      model: "deepseek-v4-flash",
+      // Deliberately large -- big enough that ONLY engine.close()'s abort
+      // (not this run's own timeoutMs) could plausibly end this run within
+      // the test's own bounds below.
+      timeoutMs: 1_800_000,
+    });
+
+    // Let the run actually start (worktree created, controller registered
+    // with WorkerService) before racing engine.close() against it.
+    await new Promise((r) => setTimeout(r, 50));
+
+    const closeStart = Date.now();
+    await engine.close();
+    const closeElapsed = Date.now() - closeStart;
+    // Bounds this as "close() aborted the run", not "close() happened to
+    // wait for something else".
+    expect(closeElapsed).toBeLessThan(2000);
+
+    const res = await runPromise;
+    expect(res.result).toBeUndefined();
+    expect(res.error.code).toBe(RpcErrorCodes.SERVER_ERROR);
+    expect(res.error.message).toContain("aborted");
+    // afterEach calls engine.close() again -- must be harmless once the
+    // in-flight set this test emptied out is already empty.
+  });
+});
+
+// M5b Task 5: the worktree lifecycle policy's discovery (list) and sweep
+// (gc) surface. Neither method runs a worker loop -- worktrees are created
+// directly via WorktreeManager.create through the SAME cached manager
+// engine.worker.run itself uses (engine.worker.getManager), which is the
+// realistic path (worker.run's own worktree ends up in that same manager's
+// list()).
+describe("engine.worker.list", () => {
+  it("lists worktrees created via the cached WorktreeManager, mapped to {path, branch}", async () => {
+    dir = makeRepo();
+    engine = createEngine();
+
+    const manager = await engine.worker.getManager(dir);
+    const w1 = await manager.create("task-1");
+    const w2 = await manager.create("task-2");
+
+    const res = await call(engine, "engine.worker.list", { projectDir: dir });
+    expect(res.error).toBeUndefined();
+    expect(res.result.worktrees).toEqual(
+      expect.arrayContaining([
+        { path: w1.path, branch: w1.branch },
+        { path: w2.path, branch: w2.branch },
+      ]),
+    );
+    expect(res.result.worktrees).toHaveLength(2);
+  });
+
+  it("returns an empty list for a clean project with no worker worktrees", async () => {
+    dir = makeRepo();
+    engine = createEngine();
+
+    const res = await call(engine, "engine.worker.list", { projectDir: dir });
+    expect(res.error).toBeUndefined();
+    expect(res.result.worktrees).toEqual([]);
+  });
+
+  it("rejects a non-git projectDir with SERVER_ERROR", async () => {
+    dir = mkdtempSync(path.join(os.tmpdir(), "of-worker-list-nongit-"));
+    engine = createEngine();
+
+    const res = await call(engine, "engine.worker.list", { projectDir: dir });
+    expect(res.result).toBeUndefined();
+    expect(res.error.code).toBe(RpcErrorCodes.SERVER_ERROR);
+  });
+});
+
+describe("engine.worker.gc", () => {
+  it("removes all worker worktrees and deletes their branches when no keep list is given", async () => {
+    dir = makeRepo();
+    engine = createEngine();
+
+    const manager = await engine.worker.getManager(dir);
+    const w1 = await manager.create("task-1");
+    const w2 = await manager.create("task-2");
+
+    const res = await call(engine, "engine.worker.gc", { projectDir: dir });
+    expect(res.error).toBeUndefined();
+    expect(res.result.removed).toEqual(expect.arrayContaining([w1.path, w2.path]));
+    expect(res.result.removed).toHaveLength(2);
+    expect(res.result.failed).toEqual([]);
+
+    expect(existsSync(w1.path)).toBe(false);
+    expect(existsSync(w2.path)).toBe(false);
+    expect(git(dir, "branch", "--list", w1.branch)).toBe("");
+    expect(git(dir, "branch", "--list", w2.branch)).toBe("");
+  });
+
+  it("keeps exactly the worktree whose path is in `keep`, removing and branch-deleting the rest", async () => {
+    dir = makeRepo();
+    engine = createEngine();
+
+    const manager = await engine.worker.getManager(dir);
+    const w1 = await manager.create("task-1");
+    const survivor = await manager.create("task-2");
+
+    const res = await call(engine, "engine.worker.gc", { projectDir: dir, keep: [survivor.path] });
+    expect(res.error).toBeUndefined();
+    expect(res.result.removed).toEqual([w1.path]);
+    expect(res.result.failed).toEqual([]);
+
+    expect(existsSync(w1.path)).toBe(false);
+    expect(git(dir, "branch", "--list", w1.branch)).toBe("");
+
+    expect(existsSync(survivor.path)).toBe(true);
+    expect(git(dir, "branch", "--list", survivor.branch)).toContain(survivor.branch);
+  });
+
+  it("returns an empty removed list for a clean project with no worker worktrees", async () => {
+    dir = makeRepo();
+    engine = createEngine();
+
+    const res = await call(engine, "engine.worker.gc", { projectDir: dir });
+    expect(res.error).toBeUndefined();
+    expect(res.result.removed).toEqual([]);
+    expect(res.result.failed).toEqual([]);
+  });
+
+  // Final review Fix 1 (Important): the per-worktree remove loop had no
+  // try/catch — a mid-sweep manager.remove() throw (e.g. an OS-level
+  // failure removing one worktree) used to escape as a raw Error, falling
+  // through to the dispatcher's generic INTERNAL_ERROR, and losing the
+  // partial `removed` list for every worktree ALREADY swept before the
+  // failing one. Confirmed RED against pre-fix code (the whole RPC call
+  // rejected with INTERNAL_ERROR instead of returning `{removed, failed}`).
+  it("isolates a mid-sweep remove failure: the other worktrees are still removed, and the failure is reported in `failed` instead of aborting the whole call", async () => {
+    dir = makeRepo();
+    engine = createEngine();
+
+    const manager = await engine.worker.getManager(dir);
+    const w1 = await manager.create("task-1");
+    const w2 = await manager.create("task-2");
+    const w3 = await manager.create("task-3");
+
+    const originalRemove = manager.remove.bind(manager);
+    manager.remove = async (worktree, opts) => {
+      if (worktree.path === w2.path) {
+        throw new Error("simulated remove failure for task-2");
+      }
+      return originalRemove(worktree, opts);
+    };
+
+    const res = await call(engine, "engine.worker.gc", { projectDir: dir });
+    expect(res.error).toBeUndefined();
+
+    expect(res.result.removed).toEqual(expect.arrayContaining([w1.path, w3.path]));
+    expect(res.result.removed).toHaveLength(2);
+    expect(res.result.failed).toEqual([{ path: w2.path, error: "simulated remove failure for task-2" }]);
+
+    // The two healthy worktrees were actually removed from disk...
+    expect(existsSync(w1.path)).toBe(false);
+    expect(existsSync(w3.path)).toBe(false);
+    // ...but the one whose remove() failed is still there, untouched.
+    expect(existsSync(w2.path)).toBe(true);
+    expect(git(dir, "branch", "--list", w2.branch)).toContain(w2.branch);
+  });
+
+  it("matches a symlinked-spelling keep path via realpath comparison, not string equality", async () => {
+    dir = makeRepo();
+    engine = createEngine();
+
+    const manager = await engine.worker.getManager(dir);
+    const w1 = await manager.create("task-1");
+    const survivor = await manager.create("task-2");
+
+    // A symlink pointing AT the survivor's real worktree directory, under a
+    // completely different path -- a plain string/path.resolve comparison
+    // against `survivor.path` would never match this.
+    const symlinkPath = mkdtempSync(path.join(os.tmpdir(), "of-worker-gc-keep-"));
+    rmSync(symlinkPath, { recursive: true, force: true });
+    symlinkSync(survivor.path, symlinkPath, "dir");
+
+    try {
+      const res = await call(engine, "engine.worker.gc", { projectDir: dir, keep: [symlinkPath] });
+      expect(res.error).toBeUndefined();
+      expect(res.result.removed).toEqual([w1.path]);
+      expect(existsSync(survivor.path)).toBe(true);
+      expect(git(dir, "branch", "--list", survivor.branch)).toContain(survivor.branch);
+    } finally {
+      // unlinkSync, not rmSync: symlinkPath is a symlink POINTING AT a
+      // directory, and Node's rmSync (even non-recursive) stats through the
+      // symlink and refuses with EISDIR -- unlinkSync removes the symlink
+      // entry itself, leaving the real target (survivor.path) untouched.
+      unlinkSync(symlinkPath);
+    }
+  });
+
+  it("rejects a non-git projectDir with SERVER_ERROR", async () => {
+    dir = mkdtempSync(path.join(os.tmpdir(), "of-worker-gc-nongit-"));
+    engine = createEngine();
+
+    const res = await call(engine, "engine.worker.gc", { projectDir: dir });
+    expect(res.result).toBeUndefined();
+    expect(res.error.code).toBe(RpcErrorCodes.SERVER_ERROR);
   });
 });

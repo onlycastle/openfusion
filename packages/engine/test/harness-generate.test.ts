@@ -78,14 +78,20 @@ interface ScriptedAdapterOptions {
   capturedPrompts?: string[];
   capturedToolPolicy?: Array<{ writeScope?: string[] } | undefined>;
   createSessionSpy?: { count: number };
+  // Final review Fix 2: captures createSession's `resultLabel` argument so
+  // tests can assert generateHarness tags its session "frontier-generate"
+  // (not the pre-fix default of "frontier-review", which mislabeled an
+  // hour-long harness-generation run as per-task review overhead).
+  capturedResultLabel?: Array<string | undefined>;
 }
 
 function makeScriptedAdapter(opts: ScriptedAdapterOptions): FrontierAdapter {
   return {
     kind: "claude-code",
-    async createSession({ projectDir, toolPolicy }): Promise<FrontierSession> {
+    async createSession({ projectDir, toolPolicy, resultLabel }): Promise<FrontierSession> {
       if (opts.createSessionSpy !== undefined) opts.createSessionSpy.count += 1;
       opts.capturedToolPolicy?.push(toolPolicy);
+      opts.capturedResultLabel?.push(resultLabel);
       let callIndex = 0;
       return {
         id: "scripted-session",
@@ -264,6 +270,23 @@ describe("engine.harness.generate — happy path (scripted fake adapter)", () =>
     await call("engine.harness.generate", { projectDir: dir });
     expect(capturedPrompts[0]).toContain("wiki_map");
     expect(capturedPrompts[0]).toContain("wiki_query");
+  }, 30_000);
+
+  // Final review Fix 2 (Important): generateHarness's session used to open
+  // with no resultLabel at all, so engines/methods.ts's onResult hook
+  // defaulted every result to source "frontier-review" — mislabeling an
+  // hour-long, one-time harness-generation run as per-task review overhead,
+  // which breaks M6's amortization math. Confirmed RED against pre-fix code
+  // (capturedResultLabel was [undefined]).
+  it("opens the generation session with resultLabel \"frontier-generate\" so its cost is metered separately from per-task review", async () => {
+    dir = makeRepo();
+    engine = createEngine();
+    const capturedResultLabel: Array<string | undefined> = [];
+    engine.frontier.registerAdapter(makeScriptedAdapter({ scripts: happyScripts(), capturedResultLabel }));
+
+    const res = await call("engine.harness.generate", { projectDir: dir });
+    expect(res.error).toBeUndefined();
+    expect(capturedResultLabel).toEqual(["frontier-generate"]);
   }, 30_000);
 
   it("page prompts pass the overview JSON as context instead of re-exploration", async () => {

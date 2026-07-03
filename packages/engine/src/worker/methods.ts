@@ -3,8 +3,8 @@
 // write/edit), and runWorkerLoop (the AI SDK v7 multi-step tool loop) into
 // one metered, reviewable worker run. Mirrors the WikiService/HarnessService
 // sibling-service pattern on Engine: WorkerService itself holds only the
-// per-project WorktreeManager cache (keyed by the base repo's realpath, like
-// WikiService/HarnessService's own keyFor) — everything else (the models
+// per-project WorktreeManager cache (keyed by the base repo's realpath via
+// rpc/guards.js's shared resolveProjectKey) — everything else (the models
 // registry, the cost meter, the notify sink) is read directly off `engine`
 // by the RPC handlers below, the same way engine.frontier.* reads
 // engine.models.meter without owning it.
@@ -19,15 +19,14 @@
 // the CLIENT owns bounding fan-out (M5b's orchestrator is the intended
 // bounding layer).
 import { randomUUID } from "node:crypto";
-import { realpathSync } from "node:fs";
 import path from "node:path";
 import { z } from "zod";
 import { RpcErrorCodes } from "@openfusion/shared";
 import type { Engine } from "../engine.js";
 import { estimateCostUsd, lookupPricing } from "../models/pricing.js";
 import { RpcMethodError } from "../rpc/errors.js";
+import { providerKindOf, requireGitRepo, resolveProjectKey } from "../rpc/guards.js";
 import { registerMethod } from "../rpc/register.js";
-import { getHeadSha } from "../wiki/indexer.js";
 import { runWorkerLoop } from "./loop.js";
 import { createWorkerTools } from "./tools.js";
 import { WorktreeManager, type Worktree } from "./worktree.js";
@@ -40,7 +39,16 @@ const RunParamsSchema = z.object({
   wikiDigest: z.string().optional(),
   maxSteps: z.number().int().min(1).max(100).optional(),
   bashTimeoutMs: z.number().int().min(1000).max(600000).optional(),
+  // Whole-run deadline for the model loop (NOT a per-tool-call budget --
+  // that's bashTimeoutMs above). Ceiling is 30 minutes, well above
+  // engine.models.complete's own 10-minute timeoutMs ceiling: a worker run
+  // is a full multi-step tool loop (up to maxSteps model calls), not one
+  // completion, so it legitimately needs more room. Mirrors the M3 pattern
+  // (models/methods.ts's own timeoutMs -> AbortSignal.timeout()).
+  timeoutMs: z.number().int().min(1000).max(1_800_000).optional(),
 });
+
+const DEFAULT_RUN_TIMEOUT_MS = 600_000;
 
 const CleanupParamsSchema = z.object({
   projectDir: z.string().min(1),
@@ -48,48 +56,25 @@ const CleanupParamsSchema = z.object({
   deleteBranch: z.boolean().optional(),
 });
 
-// Mirrors wiki/methods.ts's own (unexported) keyFor: resolve to the
-// canonical, symlink-free path so distinct spellings of the same base repo
-// share one WorktreeManager (and thus one prune() / one worktreesDir()).
-function keyFor(projectDir: string): string {
-  const resolved = path.resolve(projectDir);
-  try {
-    return realpathSync(resolved);
-  } catch {
-    return resolved;
-  }
-}
+const ListParamsSchema = z.object({
+  projectDir: z.string().min(1),
+});
 
-// Mirrors wiki/methods.ts's and engines/methods.ts's own (unexported)
-// requireHeadSha guard, including its error shape — engine.worker.* rejects
-// a non-git projectDir the same way engine.wiki.* and engine.frontier.* do.
-function requireHeadSha(projectDir: string): void {
-  try {
-    getHeadSha(projectDir);
-  } catch {
-    throw new RpcMethodError(RpcErrorCodes.SERVER_ERROR, `not a git repository: ${projectDir}`);
-  }
-}
-
-// Looks up the provider kind recorded at engine.models.configure() time —
-// pricing.ts's table is keyed "<providerKind>/<modelId>", not by providerId,
-// so metering a worker run needs the SAME lookup engine.models.complete's
-// runComplete() does internally (models/methods.ts's own kindOf helper,
-// unexported — duplicated here rather than widening that module's surface
-// for one three-line helper, matching how frontier duplicates
-// requireHeadSha above). Falls back to the providerId itself for the
-// unsupported case of a resolve()-able-but-never-configured provider.
-function kindOf(engine: Engine, providerId: string): string {
-  const registered = engine.models.registry.list().find((p) => p.id === providerId);
-  return registered?.kind ?? providerId;
-}
+const GcParamsSchema = z.object({
+  projectDir: z.string().min(1),
+  keep: z.array(z.string()).optional(),
+});
 
 // Holds one WorktreeManager per base repo, cached by realpath so distinct
-// spellings of the same project share one manager (and its prune()).
-// Deliberately holds NOTHING else — see the module doc comment above.
+// spellings of the same project share one manager (and its prune()), PLUS
+// the set of in-flight worker-run AbortControllers (see beginRun/endRun/
+// close below) — the one piece of run-lifecycle state that has to live
+// somewhere Engine.close() can reach without engine.worker.run's handler
+// needing to expose anything beyond the RPC surface itself.
 export class WorkerService {
   #managers = new Map<string, WorktreeManager>();
   #pruned = new Set<string>();
+  #inFlight = new Set<AbortController>();
 
   // Lazily creates (and caches) the WorktreeManager for a project, running
   // WorktreeManager.prune() once per manager the first time it's needed —
@@ -97,7 +82,7 @@ export class WorkerService {
   // rather than at Engine construction time, since Engine has no project
   // path to prune against until the first worker.run/cleanup call arrives.
   async getManager(projectDir: string): Promise<WorktreeManager> {
-    const key = keyFor(projectDir);
+    const key = resolveProjectKey(projectDir);
     let manager = this.#managers.get(key);
     if (manager === undefined) {
       manager = new WorktreeManager(projectDir);
@@ -109,6 +94,32 @@ export class WorkerService {
     }
     return manager;
   }
+
+  // Registers a run's own AbortController as in-flight, right before
+  // engine.worker.run starts its runWorkerLoop() call, so close() below has
+  // something to abort if the engine shuts down mid-run. Paired with
+  // endRun() in that handler's `finally` — every beginRun() MUST have a
+  // matching endRun(), successful run or not, or this set would leak
+  // controllers for the life of the process.
+  beginRun(controller: AbortController): void {
+    this.#inFlight.add(controller);
+  }
+
+  endRun(controller: AbortController): void {
+    this.#inFlight.delete(controller);
+  }
+
+  // Aborts every in-flight worker run so Engine.close() can never hang
+  // behind a wedged one (a stuck model call has no other way to be
+  // interrupted). Deliberately does NOT wait for those runs to actually
+  // settle — each run's own try/finally in engine.worker.run reacts to the
+  // abort and does its own cleanup (including calling endRun above); this
+  // method's only job is to fire the signal.
+  async close(): Promise<void> {
+    for (const controller of this.#inFlight) {
+      controller.abort(new Error("worker run aborted"));
+    }
+  }
 }
 
 export function registerWorkerMethods(engine: Engine): void {
@@ -117,7 +128,7 @@ export function registerWorkerMethods(engine: Engine): void {
     // -> meter -> return.
     //
     // The git guard, model resolution, and worktree creation are wrapped in
-    // their own try/catch below: `requireHeadSha`/`registry.resolve`
+    // their own try/catch below: `requireGitRepo`/`registry.resolve`
     // already throw a properly-coded `RpcMethodError` (SERVER_ERROR /
     // INVALID_PARAMS) and pass through unchanged, but `getManager`/
     // `manager.create` can fail with a raw `Error` (e.g. a `git worktree
@@ -133,13 +144,13 @@ export function registerWorkerMethods(engine: Engine): void {
     let taskId: string;
     let worktree: Worktree;
     try {
-      requireHeadSha(params.projectDir);
+      requireGitRepo(params.projectDir);
 
       // Resolved BEFORE the worktree is created: an unconfigured provider
       // (or any other resolve()-time failure) must never leave an orphaned
       // worktree behind.
       languageModel = engine.models.registry.resolve(params.providerId, params.model);
-      kind = kindOf(engine, params.providerId);
+      kind = providerKindOf(engine.models.registry, params.providerId);
 
       manager = await engine.worker.getManager(params.projectDir);
       taskId = randomUUID();
@@ -161,6 +172,28 @@ export function registerWorkerMethods(engine: Engine): void {
       },
     });
 
+    // Two independent abort sources, combined into the ONE signal
+    // runWorkerLoop actually gets: `timeoutSignal` fires on its own after
+    // timeoutMs (a wedged model call that never errors on its own),
+    // `controller` is fired by WorkerService.close() (Engine.close() mid-run
+    // — see WorkerService.beginRun/endRun/close). AbortSignal.any is stable
+    // since Node 20.3 (this repo's floor is >=22) and confirmed to typecheck
+    // against this repo's tsconfig (no DOM lib override needed) — no manual
+    // fallback combinator is carried here.
+    //
+    // Kept as separate named signals (rather than only ever consulting the
+    // combined one) so the catch block below can ask "was it timeoutSignal
+    // or controller that actually fired?" by checking each source's OWN
+    // `.aborted` flag directly — deterministic regardless of how the AI SDK
+    // or a given provider adapter happens to wrap/rewrap the thrown error
+    // (mirrors models/methods.ts's isTimeoutError doc comment on why that
+    // module has to parse error shape instead: it only has ONE signal to
+    // reason about, we have two known sources here).
+    const timeoutMs = params.timeoutMs ?? DEFAULT_RUN_TIMEOUT_MS;
+    const timeoutSignal = AbortSignal.timeout(timeoutMs);
+    const controller = new AbortController();
+    engine.worker.beginRun(controller);
+
     try {
       const loopResult = await runWorkerLoop({
         model: languageModel,
@@ -168,6 +201,7 @@ export function registerWorkerMethods(engine: Engine): void {
         wikiDigest: params.wikiDigest,
         tools,
         maxSteps: params.maxSteps,
+        abortSignal: AbortSignal.any([timeoutSignal, controller.signal]),
         // Step progress is likewise structured + truncated (loop.ts's own
         // ON_STEP_TEXT_TRUNCATE_CHARS) — never the model's full raw output.
         onStep: (s) => {
@@ -191,12 +225,10 @@ export function registerWorkerMethods(engine: Engine): void {
       // synthetic "worker/..." kind — pricing.ts's table is keyed by provider
       // kind, and engine.models.usage's byModel breakdown needs to line up
       // with engine.models.complete's own records for the same provider/model
-      // so totals stay comparable across call sites. UsageRecord (meter.ts)
-      // has no spare field to tag "this record came from a worker run"
-      // without a schema change touching every existing record shape, so
-      // worker vs engine.models.complete vs engine.frontier.* records are NOT
-      // distinguishable in the ledger today — see the task report for the
-      // considered alternatives.
+      // so totals stay comparable across call sites. `source: "worker"`
+      // (M5b Task 1) is what makes worker vs engine.models.complete vs
+      // engine.frontier.* records distinguishable in the ledger — see
+      // engine.models.usage's bySource breakdown.
       engine.models.meter.record({
         providerId: params.providerId,
         kind,
@@ -204,6 +236,7 @@ export function registerWorkerMethods(engine: Engine): void {
         usage: loopResult.usage,
         costUsd,
         at: Date.now(),
+        source: "worker",
       });
 
       engine.log(
@@ -226,10 +259,29 @@ export function registerWorkerMethods(engine: Engine): void {
       // class-level doc comment ("never call remove() from a failure
       // path"). The path is carried in `data` so the caller can inspect, or
       // manually clean up the partial work via engine.worker.cleanup.
-      const message = err instanceof Error ? err.message : String(err);
+      const rawMessage = err instanceof Error ? err.message : String(err);
+      // Distinguishes WHY the run was cut short, checking each abort
+      // source's own `.aborted` flag (set the instant that signal fires,
+      // independent of whatever the AI SDK/provider adapter did to the
+      // thrown error) rather than parsing `err`'s shape — see the abort
+      // signal setup above for why that's safe to do here. `timeoutSignal`
+      // is checked first: if BOTH happened to be aborted (a close raced a
+      // timeout), "timed out" is the more informative half of that story.
+      const message = timeoutSignal.aborted
+        ? `worker run timed out after ${timeoutMs}ms: ${rawMessage}`
+        : controller.signal.aborted
+          ? `worker run aborted: ${rawMessage}`
+          : rawMessage;
       throw new RpcMethodError(RpcErrorCodes.SERVER_ERROR, `worker run failed: ${message}`, {
         worktree: { path: worktree.path, branch: worktree.branch },
       });
+    } finally {
+      // Matches beginRun() above — every registered controller must be
+      // unregistered once this run is done, success or failure, or
+      // WorkerService's in-flight set would leak controllers for the life
+      // of the process (and re-abort an already-finished run's controller
+      // on the next engine.close()).
+      engine.worker.endRun(controller);
     }
   });
 
@@ -239,7 +291,7 @@ export function registerWorkerMethods(engine: Engine): void {
     // failing `git worktree prune` call, whose raw `Error` falls through to
     // the dispatcher's generic INTERNAL_ERROR (-32603) instead of this
     // method's SERVER_ERROR (-32000) contract.
-    requireHeadSha(params.projectDir);
+    requireGitRepo(params.projectDir);
 
     const manager = await engine.worker.getManager(params.projectDir);
     const resolvedTarget = path.resolve(params.worktreePath);
@@ -251,5 +303,78 @@ export function registerWorkerMethods(engine: Engine): void {
     await manager.remove(found, { deleteBranch: params.deleteBranch });
     engine.log(`worker.cleanup ${found.id} removed`);
     return { removed: true };
+  });
+
+  // The worktree lifecycle policy's DISCOVERY half (M5b Task 5): a thin
+  // projection of WorktreeManager.list() down to {path, branch} — everything
+  // a caller needs to decide what to keep vs sweep, without leaking `base`/
+  // `baseSha` (internal to diff()/diffStat()'s anchoring, not part of this
+  // surface's contract). Reads are always live off `git worktree list
+  // --porcelain` (via the cached manager) rather than any locally-tracked
+  // set, so this reflects reality even after an out-of-band `git worktree
+  // remove` or a crash that skipped engine.worker.cleanup entirely.
+  registerMethod(engine.dispatcher, "engine.worker.list", ListParamsSchema, async (params) => {
+    requireGitRepo(params.projectDir);
+    const manager = await engine.worker.getManager(params.projectDir);
+    const worktrees = await manager.list();
+    return { worktrees: worktrees.map((w) => ({ path: w.path, branch: w.branch })) };
+  });
+
+  // The worktree lifecycle policy's SWEEP half (M5b Task 5). The three
+  // producers of worker worktrees each have their own disposition already:
+  // engine.worker.run leaves success AND failure worktrees on disk on
+  // purpose (see worktree.ts's class doc comment); engine.orchestrate cleans
+  // up its OWN rejected/empty-diff attempts as it goes (orchestrate.ts's
+  // cleanupWorktree) and deliberately leaves the surviving
+  // approved/escalated worktree for engine.orchestrate.apply to read the
+  // diff from. What neither of those covers is a worktree abandoned by a
+  // crash (engine process killed mid-run, before any of the above cleanup
+  // logic got to run) — gc is that backstop: call it with `keep` set to
+  // whatever worktree paths are still legitimately in flight (e.g. the one
+  // orchestrate just returned as its result), and everything else this
+  // manager knows about gets removed, branch and all. Safe to call
+  // unconditionally after a session ends, or periodically — a project with
+  // zero worker worktrees is a no-op (`removed: []`, `failed: []`).
+  //
+  // Final review Fix 1 (Important): each worktree's manager.remove() call is
+  // now isolated in its own try/catch — a mid-sweep failure (e.g. a locked
+  // file handle, a permissions error) used to escape uncaught, aborting the
+  // WHOLE gc call with a generic INTERNAL_ERROR and losing the `removed`
+  // list for every worktree already swept before the failing one. A failure
+  // is now recorded in `failed` (path + error message) and the sweep
+  // continues — the caller gets back exactly what happened instead of an
+  // all-or-nothing throw, so a partial gc can be retried or inspected rather
+  // than silently discarded.
+  registerMethod(engine.dispatcher, "engine.worker.gc", GcParamsSchema, async (params) => {
+    requireGitRepo(params.projectDir);
+    const manager = await engine.worker.getManager(params.projectDir);
+    const worktrees = await manager.list();
+    // Comparison is realpath-based (resolveProjectKey — the same helper
+    // WorkerService itself uses to key its manager cache), not raw string
+    // equality: a `keep` entry reached through a symlinked path spelling
+    // (or a relative one) must still match the manager's own, already
+    // realpath'd worktree.path (see WorktreeManager's constructor doc
+    // comment on why baseRepo — and therefore every path it returns — is
+    // realpath'd up front).
+    const keep = new Set((params.keep ?? []).map(resolveProjectKey));
+    const removed: string[] = [];
+    const failed: Array<{ path: string; error: string }> = [];
+    for (const worktree of worktrees) {
+      if (keep.has(resolveProjectKey(worktree.path))) continue;
+      try {
+        await manager.remove(worktree, { deleteBranch: true });
+        removed.push(worktree.path);
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        failed.push({ path: worktree.path, error: message });
+      }
+    }
+    if (removed.length > 0) {
+      engine.log(`worker.gc removed ${removed.length} worktree(s)`);
+    }
+    if (failed.length > 0) {
+      engine.log(`worker.gc failed to remove ${failed.length} worktree(s)`);
+    }
+    return { removed, failed };
   });
 }
