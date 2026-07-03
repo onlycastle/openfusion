@@ -1,5 +1,6 @@
 import { RpcDispatcher } from "./rpc/dispatcher.js";
 import { registerCoreMethods } from "./methods.js";
+import { WikiService, registerWikiMethods } from "./wiki/methods.js";
 
 export interface EngineOptions {
   log?: (message: string) => void;
@@ -8,14 +9,16 @@ export interface EngineOptions {
 export class Engine {
   readonly dispatcher = new RpcDispatcher();
   readonly log: (message: string) => void;
+  readonly wiki = new WikiService();
 
   constructor(options: EngineOptions = {}) {
     this.log = options.log ?? (() => {});
     registerCoreMethods(this.dispatcher);
+    registerWikiMethods(this);
   }
 
   async close(): Promise<void> {
-    // Services with resources (wiki store, etc.) hook in here in later tasks.
+    await this.wiki.close();
   }
 }
 
@@ -30,3 +33,7 @@ export type { DecodedLine } from "./rpc/ndjson.js";
 export { ENGINE_VERSION } from "./version.js";
 export { RpcMethodError } from "./rpc/errors.js";
 export { registerMethod } from "./rpc/register.js";
+export { WikiService } from "./wiki/methods.js";
+export { WikiStore, openWikiStore } from "./wiki/store.js";
+export { WikiParser } from "./wiki/parser.js";
+export { buildIndex, getHeadSha } from "./wiki/indexer.js";
