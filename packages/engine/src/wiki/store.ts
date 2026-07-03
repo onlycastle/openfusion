@@ -145,6 +145,22 @@ export class WikiStore {
       .all(name) as SymbolHit[];
   }
 
+  allSymbols(): SymbolHit[] {
+    return this.#db
+      .prepare(
+        "SELECT file, name, kind, row, col FROM symbols ORDER BY file, row",
+      )
+      .all() as SymbolHit[];
+  }
+
+  allRefs(): SymbolHit[] {
+    return this.#db
+      .prepare(
+        "SELECT file, name, kind, row, col FROM refs ORDER BY file, row",
+      )
+      .all() as SymbolHit[];
+  }
+
   counts(): { files: number; symbols: number; refs: number } {
     const one = (sql: string): number =>
       (this.#db.prepare(sql).get() as { n: number }).n;

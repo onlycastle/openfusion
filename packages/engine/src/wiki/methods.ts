@@ -7,11 +7,15 @@ import { RpcMethodError } from "../rpc/errors.js";
 import { registerMethod } from "../rpc/register.js";
 import { buildIndex, getHeadSha, type IndexStats } from "./indexer.js";
 import { WikiParser } from "./parser.js";
+import { rankFiles, renderRepoMap } from "./rank.js";
 import { openWikiStore, type WikiStore } from "./store.js";
 
 const ProjectParamsSchema = z.object({ projectDir: z.string().min(1) });
 const QueryParamsSchema = ProjectParamsSchema.extend({
   symbol: z.string().min(1),
+});
+const MapParamsSchema = ProjectParamsSchema.extend({
+  budgetTokens: z.number().int().min(64).max(32768).optional(),
 });
 
 // Resolve to the canonical, symlink-free path so distinct spellings of the
@@ -138,6 +142,27 @@ export function registerWikiMethods(engine: Engine): void {
         definitions: store.symbolsByName(symbol),
         references: store.refsByName(symbol),
       };
+    },
+  );
+
+  registerMethod(
+    engine.dispatcher,
+    "engine.wiki.map",
+    MapParamsSchema,
+    ({ projectDir, budgetTokens }) => {
+      requireHeadSha(projectDir);
+      const store = engine.wiki.getStore(projectDir);
+      if (store.getMeta("head_sha") === null) {
+        throw new RpcMethodError(
+          RpcErrorCodes.SERVER_ERROR,
+          "wiki not built — run engine.wiki.build first",
+        );
+      }
+      const ranked = rankFiles(store.allSymbols(), store.allRefs());
+      const map = renderRepoMap(ranked, budgetTokens ?? 1024);
+      // each rendered block is exactly two lines (file + symbols)
+      const rendered = map.length === 0 ? 0 : map.trimEnd().split("\n").length / 2;
+      return { map, files: ranked.length, truncated: rendered < ranked.length };
     },
   );
 }

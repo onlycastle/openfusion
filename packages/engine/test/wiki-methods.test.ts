@@ -87,4 +87,19 @@ describe("wiki RPC methods", () => {
     expect(b.error).toBeUndefined();
     expect(a.result.headSha).toBe(b.result.headSha);
   }, 30_000);
+
+  it("map returns a budgeted markdown map after build", async () => {
+    makeRepo();
+    await call("engine.wiki.build", { projectDir: dir });
+    const res = await call("engine.wiki.map", { projectDir: dir, budgetTokens: 256 });
+    expect(res.error).toBeUndefined();
+    expect(res.result.map).toContain("x.ts");
+    expect(res.result.truncated).toBe(false);
+  }, 30_000);
+
+  it("map on an unbuilt project returns SERVER_ERROR", async () => {
+    makeRepo();
+    const res = await call("engine.wiki.map", { projectDir: dir });
+    expect(res.error?.code).toBe(RpcErrorCodes.SERVER_ERROR);
+  }, 30_000);
 });
