@@ -13,7 +13,8 @@
     }
   },
   "files": [
-    "dist"
+    "dist",
+    "queries"
   ],
   "scripts": {
     "build": "tsc -p tsconfig.json",
@@ -21,9 +22,14 @@
     "test": "vitest run"
   },
   "dependencies": {
-    "@openfusion/shared": "workspace:*"
+    "@openfusion/shared": "workspace:*",
+    "@vscode/tree-sitter-wasm": "^0.3.1",
+    "better-sqlite3": "^12.11.1",
+    "web-tree-sitter": "^0.26.10",
+    "zod": "^4.4.3"
   },
   "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
     "@types/node": "^22.20.0",
     "typescript": "^6.0.3",
     "vitest": "^4.1.9"

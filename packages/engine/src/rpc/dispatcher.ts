@@ -4,6 +4,7 @@ import {
   RpcRequestSchema,
   type RpcResponse,
 } from "@openfusion/shared";
+import { RpcMethodError } from "./errors.js";
 
 export type RpcHandler = (params: unknown) => Promise<unknown> | unknown;
 
@@ -57,6 +58,17 @@ export class RpcDispatcher {
       return { jsonrpc: JSONRPC_VERSION, id, result: result ?? null };
     } catch (err) {
       if (id === undefined) return null;
+      if (err instanceof RpcMethodError) {
+        return {
+          jsonrpc: JSONRPC_VERSION,
+          id,
+          error: {
+            code: err.code,
+            message: err.message,
+            ...(err.data !== undefined ? { data: err.data } : {}),
+          },
+        };
+      }
       const message = err instanceof Error ? err.message : String(err);
       return {
         jsonrpc: JSONRPC_VERSION,

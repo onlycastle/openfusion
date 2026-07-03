@@ -4,7 +4,7 @@ import { ENGINE_VERSION } from "../src/version.js";
 
 describe("core methods", () => {
   it("engine.ping returns pong and the engine version", async () => {
-    const res = await createEngine().dispatch({
+    const res = await createEngine().dispatcher.dispatch({
       jsonrpc: "2.0",
       id: 1,
       method: "engine.ping",
@@ -13,7 +13,7 @@ describe("core methods", () => {
   });
 
   it("engine.info reports process facts", async () => {
-    const res = await createEngine().dispatch({
+    const res = await createEngine().dispatcher.dispatch({
       jsonrpc: "2.0",
       id: 2,
       method: "engine.info",

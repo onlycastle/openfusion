@@ -26,6 +26,18 @@ describe("RpcRequestSchema", () => {
       RpcRequestSchema.safeParse({ jsonrpc: "2.0", id: 1, method: "" }).success,
     ).toBe(false);
   });
+
+  it("rejects a fractional numeric id", () => {
+    expect(
+      RpcRequestSchema.safeParse({ jsonrpc: "2.0", id: 1.5, method: "x" }).success,
+    ).toBe(false);
+  });
+
+  it("accepts a string id", () => {
+    expect(
+      RpcRequestSchema.safeParse({ jsonrpc: "2.0", id: "req-1", method: "x" }).success,
+    ).toBe(true);
+  });
 });
 
 describe("RpcResponseSchema", () => {
