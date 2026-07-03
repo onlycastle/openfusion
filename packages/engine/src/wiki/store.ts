@@ -1,6 +1,7 @@
 import Database from "better-sqlite3";
-import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, rmSync } from "node:fs";
 import path from "node:path";
+import { ensureGitignoreGuard } from "../util/gitignore-guard.js";
 
 export interface SymbolEntry {
   name: string;
@@ -246,10 +247,7 @@ export function openWikiStore(projectDir: string): WikiStore {
   const openfusionDir = path.join(projectDir, ".openfusion");
   const cacheDir = path.join(openfusionDir, "cache");
   mkdirSync(cacheDir, { recursive: true });
-  const gitignorePath = path.join(openfusionDir, ".gitignore");
-  if (!existsSync(gitignorePath)) {
-    writeFileSync(gitignorePath, "cache/\n");
-  }
+  ensureGitignoreGuard(openfusionDir, ["cache/"]);
   const dbPath = wikiDbPath(projectDir);
   const db = new Database(dbPath);
   // busy_timeout must be set before attempting the WAL transition: it

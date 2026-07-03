@@ -1,8 +1,9 @@
 import { randomBytes } from "node:crypto";
-import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { mkdir, rename, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
+import { ensureGitignoreGuard } from "../util/gitignore-guard.js";
 import {
   AgentDefSchema,
   HarnessBundleSchema,
@@ -50,34 +51,6 @@ function agentsDir(projectDir: string): string {
 
 function routingPath(projectDir: string): string {
   return path.join(harnessDir(projectDir), "routing.yaml");
-}
-
-// An independent reimplementation of the same cache/ guard as
-// wiki/store.ts's `openWikiStore` — NOT shared/extracted code, despite
-// enforcing the identical invariant for the same `.openfusion/` directory:
-// harness artifacts (manifest.json, wiki/, agents/, routing.yaml) live
-// BESIDE cache/ and are meant to be committed by the user, while cache/
-// (the wiki symbol-index sqlite db) must stay gitignored. Because this is a
-// second, independent implementation rather than a shared helper, the two
-// call sites can drift (a fix applied to one won't automatically apply to
-// the other) — out of scope to unify in this task, but worth knowing before
-// either one is next touched. Idempotent and defensive about pre-existing
-// content — if a `.gitignore` already exists (most commonly because the
-// wiki cache was built first) but somehow doesn't list `cache/`, this
-// appends it rather than assuming the file is already correct.
-function ensureGitignoreGuard(dir: string): void {
-  mkdirSync(dir, { recursive: true });
-  const gitignorePath = path.join(dir, ".gitignore");
-  if (!existsSync(gitignorePath)) {
-    writeFileSync(gitignorePath, "cache/\n");
-    return;
-  }
-  const current = readFileSync(gitignorePath, "utf8");
-  const hasGuard = current.split("\n").some((line) => line.trim() === "cache/");
-  if (!hasGuard) {
-    const withTrailingNewline = current.length === 0 || current.endsWith("\n") ? current : `${current}\n`;
-    writeFileSync(gitignorePath, `${withTrailingNewline}cache/\n`);
-  }
 }
 
 // Atomic per-file write: the full content is built as a string BEFORE any
@@ -340,7 +313,7 @@ export async function writeHarness(
   const oldArtifacts = readOldManifestArtifacts(projectDir);
   const newArtifacts = computeArtifactPaths(parsed);
 
-  ensureGitignoreGuard(dir);
+  ensureGitignoreGuard(dir, ["cache/"]);
 
   const contentWrites: Array<[absPath: string, content: string]> = [
     [routingPath(projectDir), stringifyYaml(parsed.routing)],
