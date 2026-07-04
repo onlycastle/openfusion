@@ -63,38 +63,46 @@ function parseTasks(commitShasText: string, testCommandText: string): EvalsTaskD
   return shas.map((commitSha) => ({ commitSha, testCommand }));
 }
 
-// Mirrors evals/run.ts's own MIN_TASK_COUNT_FOR_VERDICT / own
-// MATERIAL_MEASUREMENT_FAILURE_FRACTION constants — used here ONLY to pick
-// a human-readable REASON string for an "inconclusive" verdict (the engine
-// itself already applied these thresholds; this screen never re-derives the
-// verdict, only explains it from the structured fields the report card
-// already carries).
-const MIN_TASK_COUNT_FOR_VERDICT = 5;
-const MATERIAL_MEASUREMENT_FAILURE_FRACTION = 0.2;
-
-/** Picks the most relevant honest reason for an "inconclusive" verdict,
- * checked in the SAME priority order evals/run.ts's own verdict computation
- * uses (material measurement-failure fraction, then a zero-clean-baseline
- * run, then unpriced calls, then too-few-tasks) — so the reason shown here
- * always names the actual gate that produced this run's "inconclusive"
- * result, never a guess. */
+/** Picks the reason text shown next to an "inconclusive" verdict. PREFERS
+ * evals/run.ts's own `report.note` — the structural, authoritative prose the
+ * engine itself built while computing this exact verdict (see that module's
+ * `buildNote`) — over re-deriving a reason from copied gate logic.
+ *
+ * An earlier version of this function hand-duplicated evals/run.ts's own
+ * `MIN_TASK_COUNT_FOR_VERDICT`/`MATERIAL_MEASUREMENT_FAILURE_FRACTION`
+ * constants to pick which sentence to show. That was a silent-drift hazard:
+ * the VERDICT itself always stays correct (it comes straight from
+ * `report.verdict`, computed by the engine), but the hand-copied constants
+ * used only to choose the REASON TEXT could quietly go stale if the engine's
+ * own thresholds ever changed, and silently name the wrong gate.
+ * `report.note` can't drift this way — it's the engine's own text, not a
+ * copy of its logic.
+ *
+ * `report.note` (`buildNote` in evals/run.ts) names three of the engine's
+ * four inconclusive gates explicitly: material measurement-failure
+ * fraction, a zero-clean-baseline run, and unpriced calls each get their own
+ * sentence appended via `buildNote`'s `extraNotes`. The too-few-tasks gate
+ * is also named, via `buildNote`'s own always-present sample-size sentence
+ * ("below the N-task minimum ... a demo, not a claim" when under that
+ * count). The one gate `buildNote` never calls out by name is "quality held
+ * on the clean subset, but no cost savings were measured" — for that gate
+ * `report.note` still reads as true, honest, structural context (sample
+ * size, cost-estimate caveat, pricing confidence), even though it doesn't
+ * spell out that specific gate by name. Showing it there anyway is still
+ * strictly safer than a hand-derived, drift-prone guess at the reason.
+ *
+ * The structural fallback below (no thresholds, just the STRUCTURAL counts
+ * the report card already carries) only fires if the engine ever ships an
+ * inconclusive report with a genuinely empty note — not expected today
+ * (`buildNote` always returns non-empty text) but kept as a floor rather
+ * than an empty reason. */
 function inconclusiveReason(report: EvalsReportCard): string {
-  if (report.taskCount > 0 && report.measurementFailureCount / report.taskCount >= MATERIAL_MEASUREMENT_FAILURE_FRACTION) {
-    return (
-      `inconclusive: ${report.measurementFailureCount} of ${report.taskCount} tasks had measurement failures — ` +
-      "this run is too corrupted to trust either a pass or fail verdict."
-    );
-  }
-  if (report.cleanBaselinePassed === 0) {
-    return "inconclusive: the baseline solved 0 of the clean (non-measurement-failed) tasks — there is nothing to measure quality against.";
-  }
-  if (report.pricingConfidence === "unpriced" || report.cleanSavingsPct === null) {
-    return "inconclusive: unpriced — no savings number can be computed for this run.";
-  }
-  if (report.taskCount < MIN_TASK_COUNT_FOR_VERDICT) {
-    return "inconclusive: too few tasks — a demo, not a claim.";
-  }
-  return "inconclusive: quality held, but no cost savings were measured on the clean subset.";
+  const note = report.note.trim();
+  if (note.length > 0) return `inconclusive: ${note}`;
+  return (
+    `inconclusive: verdict computed from ${report.cleanTaskCount} of ${report.taskCount} clean task(s) ` +
+    `(${report.measurementFailureCount} measurement failure(s)) — see the report details below for why.`
+  );
 }
 
 /** The verdict callout — the honesty gate this whole screen exists for (spec
@@ -129,11 +137,22 @@ function VerdictBanner({ report }: { report: EvalsReportCard }) {
  * (a `0` or `NaN` would silently misread as "no savings" or crash the
  * format call). A non-`"verified"` `pricingConfidence` always shows a
  * caveat badge alongside the figure — the savings claim is an ESTIMATE, and
- * this is the one place in the screen that says so out loud. */
+ * this is the one place in the screen that says so out loud.
+ *
+ * On a `"fail"` verdict (the ETH hazard — see `VerdictBanner`), a bare
+ * "Savings: X%" line reads, to a skim-reader, as a positive number without
+ * any acknowledgment that the fail banner above already supersedes it — a
+ * quality-degrading harness must never register as a savings win. So on
+ * `"fail"` ONLY, this line gets an inline qualifier saying so; `"pass"` and
+ * `"inconclusive"` rendering is unchanged. */
 function SavingsDisplay({ report }: { report: EvalsReportCard }) {
+  const isFail = report.verdict === "fail";
   return (
     <div className="savings-display">
-      <p className="savings-figure">Savings: {formatPct(report.savingsPct)}</p>
+      <p className={isFail ? "savings-figure savings-figure-disregarded" : "savings-figure"}>
+        Savings: {formatPct(report.savingsPct)}
+        {isFail && <span className="disregarded-note"> — disregarded; see verdict above</span>}
+      </p>
       {report.pricingConfidence !== "verified" && (
         <p className="caveat-badge">savings estimate — pricing confidence: {report.pricingConfidence}</p>
       )}

@@ -179,7 +179,7 @@ describe("EvalsScreen", () => {
     expect(screen.queryByText(/^PASS —/)).toBeNull();
   });
 
-  it("renders an INCONCLUSIVE verdict with the reason from structured fields — material measurement-failure fraction", async () => {
+  it("qualifies the savings line on a FAIL verdict so it can never skim-read as a win", async () => {
     await setUpRunnableForm();
     const controllable = makeControllableRun();
     runEvalsMock.mockReturnValueOnce(controllable);
@@ -189,23 +189,84 @@ describe("EvalsScreen", () => {
       () =>
         controllable.resolve(
           reportFixture({
-            verdict: "inconclusive",
-            taskCount: 8,
-            measurementFailureCount: 3,
+            verdict: "fail",
+            qualityHeld: false,
+            cleanHarnessPassed: 2,
+            cleanBaselinePassed: 6,
+            harness: { passed: 2, costUsd: 0.1, escalations: 0 },
           }),
         ),
     );
 
-    await waitFor(() => expect(screen.getByText(/inconclusive/i)).toBeTruthy());
-    expect(screen.getByText(/3 of 8 tasks had measurement failures/i)).toBeTruthy();
+    await waitFor(() => expect(screen.getByRole("alert")).toBeTruthy());
+    const savingsLine = screen.getByText(/^Savings:/);
+    expect(savingsLine.textContent).toMatch(/disregarded/i);
   });
 
-  it("renders an INCONCLUSIVE verdict with the reason from structured fields — too few tasks (a demo, not a claim)", async () => {
+  it("does NOT qualify the savings line on a PASS verdict", async () => {
     await setUpRunnableForm();
     const controllable = makeControllableRun();
     runEvalsMock.mockReturnValueOnce(controllable);
     fireEvent.click(screen.getByRole("button", { name: /run evals/i }));
 
+    act(() => controllable.resolve(reportFixture({ verdict: "pass" })));
+
+    await waitFor(() => expect(screen.getByText(/^PASS —/)).toBeTruthy());
+    const savingsLine = screen.getByText(/^Savings:/);
+    expect(savingsLine.textContent).not.toMatch(/disregarded/i);
+  });
+
+  it("renders an INCONCLUSIVE verdict using the engine's own report.note as the reason (material measurement-failure gate)", async () => {
+    await setUpRunnableForm();
+    const controllable = makeControllableRun();
+    runEvalsMock.mockReturnValueOnce(controllable);
+    fireEvent.click(screen.getByRole("button", { name: /run evals/i }));
+
+    // A note shaped like evals/run.ts's own buildNote() output for this gate
+    // (see that module's extraNotes push for the material-measurement-
+    // failure case) — driving the mocked report with a KNOWN note lets this
+    // test assert the note text is shown verbatim, never re-derived from a
+    // copied MATERIAL_MEASUREMENT_FAILURE_FRACTION threshold.
+    const engineNote =
+      "3 of 8 task(s) hit a measurement failure rather than a genuine, oracle-scoreable quality result " +
+      "(harness: 2 apply-failed, 1 error; baseline: 0 error) -- see the verdict note below for exactly how " +
+      "this run's pass/fail/inconclusive determination accounts for them. 3 of 8 task(s) (>= the 20% " +
+      'materiality threshold) hit a measurement failure -- this run is too corrupted to ground a "pass" or a ' +
+      '"fail" verdict in either direction; reported as inconclusive rather than trusting the raw pass counts.';
+    act(
+      () =>
+        controllable.resolve(
+          reportFixture({
+            verdict: "inconclusive",
+            taskCount: 8,
+            measurementFailureCount: 3,
+            note: engineNote,
+          }),
+        ),
+    );
+
+    // Scoped to the verdict banner (role="status") rather than a page-wide
+    // text query — report.note is ALSO rendered verbatim further down the
+    // report card (the existing muted-text paragraph), and this note's own
+    // prose contains the word "inconclusive" too, so an unscoped query would
+    // ambiguously match both.
+    const banner = await screen.findByRole("status");
+    expect(banner.textContent).toMatch(/inconclusive/i);
+    expect(banner.textContent).toMatch(/too corrupted to ground a "pass" or a "fail" verdict/i);
+  });
+
+  it("renders an INCONCLUSIVE verdict using the engine's own report.note as the reason (too-few-tasks gate, a demo not a claim)", async () => {
+    await setUpRunnableForm();
+    const controllable = makeControllableRun();
+    runEvalsMock.mockReturnValueOnce(controllable);
+    fireEvent.click(screen.getByRole("button", { name: /run evals/i }));
+
+    // Shaped like buildNote()'s own always-present sample-size sentence for
+    // taskCount below the engine's private minimum — again driven by a KNOWN
+    // note, not a re-derived MIN_TASK_COUNT_FOR_VERDICT comparison.
+    const engineNote =
+      "Sample size 3 task(s) is below the 5-task minimum for a credible savings claim (Anthropic eval guidance " +
+      "— see docs/research/2026-07-04-m6-pricing-eval-verification.md) -- this is a demo, not a claim.";
     act(
       () =>
         controllable.resolve(
@@ -216,12 +277,49 @@ describe("EvalsScreen", () => {
             cleanBaselinePassed: 2,
             cleanSavingsPct: 0.1,
             perTask: [],
+            note: engineNote,
           }),
         ),
     );
 
-    await waitFor(() => expect(screen.getByText(/too few tasks/i)).toBeTruthy());
-    expect(screen.getByText(/a demo, not a claim/i)).toBeTruthy();
+    const banner = await screen.findByRole("status");
+    expect(banner.textContent).toMatch(/inconclusive/i);
+    expect(banner.textContent).toMatch(/below the 5-task minimum/i);
+    expect(banner.textContent).toMatch(/demo, not a claim/i);
+  });
+
+  it("prefers report.note verbatim even for the gate the engine's note doesn't name explicitly (quality held, no savings measured)", async () => {
+    await setUpRunnableForm();
+    const controllable = makeControllableRun();
+    runEvalsMock.mockReturnValueOnce(controllable);
+    fireEvent.click(screen.getByRole("button", { name: /run evals/i }));
+
+    // evals/run.ts's buildNote() never adds an extraNotes entry for THIS
+    // gate (quality held on the clean subset, but cleanSavingsPct <= 0) —
+    // unlike the other three inconclusive gates. The reason shown must still
+    // come from report.note (never a hand-derived "quality held, no
+    // savings" sentence re-deriving the engine's own gate order).
+    const engineNote =
+      "Sample size: 8 task(s) (a credible claim wants 20-50 paired tasks; treat this as directional). " +
+      "Cost figures are estimate-class (see engine.orchestrate's own cost.note) -- directional, not exact. " +
+      "Pricing confidence: verified (the worst confidence across every cost record this run produced).";
+    act(
+      () =>
+        controllable.resolve(
+          reportFixture({
+            verdict: "inconclusive",
+            taskCount: 8,
+            measurementFailureCount: 0,
+            cleanBaselinePassed: 5,
+            cleanSavingsPct: -0.05,
+            note: engineNote,
+          }),
+        ),
+    );
+
+    const banner = await screen.findByRole("status");
+    expect(banner.textContent).toMatch(/inconclusive/i);
+    expect(banner.textContent).toMatch(/credible claim wants 20-50 paired tasks/i);
   });
 
   it("shows a pricingConfidence caveat badge whenever confidence is not 'verified'", async () => {
@@ -314,6 +412,32 @@ describe("EvalsScreen", () => {
     expect(cleanSection?.textContent).toMatch(/5/);
     expect(cleanSection?.textContent).toMatch(/42\.0%/);
     expect(cleanSection?.textContent).toMatch(/1/);
+  });
+
+  it("Report card heading shows the RUN's project directory, not the live picker value (wrong-project safety test)", async () => {
+    await setUpRunnableForm("/proj/A");
+    const controllable = makeControllableRun();
+    runEvalsMock.mockReturnValueOnce(controllable);
+    fireEvent.click(screen.getByRole("button", { name: /run evals/i }));
+
+    act(() => controllable.resolve(reportFixture()));
+    await waitFor(() => expect(screen.getByRole("heading", { name: /report card/i })).toBeTruthy());
+    expect(screen.getByRole("heading", { name: /report card/i }).textContent).toMatch(/\/proj\/A/);
+
+    // User re-picks a different directory AFTER the run resolves.
+    openMock.mockResolvedValueOnce("/proj/B");
+    fireEvent.click(screen.getByRole("button", { name: /choose project/i }));
+    await waitFor(() => {
+      const code = screen.getAllByText(/^\/proj\//)[0];
+      expect(code?.textContent).toBe("/proj/B");
+    });
+
+    // CORRECTNESS: the report card must still show the RUN's project
+    // (/proj/A), not the live picker value (/proj/B) — the same
+    // wrong-project safety property OrchestrateScreen's own "Apply uses the
+    // RUN's project directory" test guards.
+    expect(screen.getByRole("heading", { name: /report card/i }).textContent).toMatch(/\/proj\/A/);
+    expect(screen.getByRole("heading", { name: /report card/i }).textContent).not.toMatch(/\/proj\/B/);
   });
 
   it("Cancel calls the run's cancel(), disables the button while cancelling (no second cancel call), then shows Cancelled — not Failed — on RunCancelledError", async () => {
