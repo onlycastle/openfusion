@@ -243,6 +243,14 @@ interface FakeFrontierOptions {
   escalationPrompts?: string[];
   reviewSessionStarts?: { count: number };
   closedSessions?: { count: number };
+  // M6 Task 1 review round 1 (Fix 1 test): captures the `opts` each REVIEW
+  // session's prompt() call received, one entry per call — lets a test
+  // assert orchestrate.ts always threads a BOUNDED timeoutMs into the
+  // review turn, even when the RPC caller omitted reviewTimeoutMs entirely
+  // (the default must reach here, not `undefined`).
+  reviewPromptOpts?: Array<{ timeoutMs?: number }>;
+  // Same, for the ESCALATION session's prompt() call.
+  escalationPromptOpts?: Array<{ timeoutMs?: number }>;
   // M6 Task 1 (eval-batch safety gate): when true, a REVIEW session's
   // prompt() blocks forever (never yields, never completes) until THIS
   // session's own close() is called — standing in for a wedged real review
@@ -305,7 +313,7 @@ function makeFakeFrontierAdapter(opts: FakeFrontierOptions = {}): FrontierAdapte
       return {
         id: randomUUID(),
         projectDir,
-        prompt(text: string): FrontierPromptHandle {
+        prompt(text: string, promptOpts?: { timeoutMs?: number }): FrontierPromptHandle {
           if (!isEscalation && opts.blockReviewUntilClose === true) {
             async function* gen(): AsyncGenerator<FrontierEvent> {
               await closed;
@@ -317,6 +325,7 @@ function makeFakeFrontierAdapter(opts: FakeFrontierOptions = {}): FrontierAdapte
           }
           if (isEscalation) {
             opts.escalationPrompts?.push(text);
+            opts.escalationPromptOpts?.push(promptOpts ?? {});
             async function* gen(): AsyncGenerator<FrontierEvent> {
               if (opts.escalationWritesFile !== false) {
                 // Writes RELATIVE TO the `projectDir` this session was
@@ -345,6 +354,7 @@ function makeFakeFrontierAdapter(opts: FakeFrontierOptions = {}): FrontierAdapte
             return { events: gen(), abort: () => {} };
           }
 
+          opts.reviewPromptOpts?.push(promptOpts ?? {});
           const verdict = verdicts[Math.min(reviewIdx, verdicts.length - 1)] ?? {
             decision: "approve",
             reasons: [],
@@ -734,6 +744,126 @@ describe("engine.orchestrate — empty worker diff", () => {
     // escalation ran next and its own (surviving) worktree remains.
     const manager = await engine.worker.getManager(dir);
     expect(await manager.list()).toHaveLength(1);
+  });
+});
+
+// M6 Task 1 review round 1, Fix 1 (Important — the substantive one):
+// reviewTimeoutMs/workerTimeoutMs had NO default. An RPC caller omitting
+// reviewTimeoutMs left the review/escalation frontier call UNBOUNDED — and
+// under the stdin-close shutdown path (main.ts: abortAll -> pipeline.drain
+// -> engine.close), drain() waits on THIS in-flight orchestrate call before
+// close() can ever reap the direct frontier session it opened, so a wedged
+// REAL review/escalation could hang an entire eval batch. Since the real
+// Claude adapter now ENFORCES opts.timeoutMs (M6 Task 1 Change A), giving
+// orchestrate its own default deadline is what makes every sub-call here
+// self-bounding regardless of what a caller passes (or omits). These tests
+// assert the DEFAULT (not `undefined`) reaches the fake frontier session's
+// prompt() call whenever the RPC caller leaves the corresponding param out.
+//
+// Mirrors worker/methods.ts's own DEFAULT_RUN_TIMEOUT_MS convention: the
+// default constants live in orchestrate.ts as internal, unexported consts,
+// so the literal values below (300_000 / 600_000) are asserted directly
+// rather than imported.
+const DEFAULT_REVIEW_TIMEOUT_MS = 300_000;
+const DEFAULT_ESCALATE_TIMEOUT_MS = 600_000;
+
+describe("engine.orchestrate — default deadlines (Fix 1, review round 1)", () => {
+  it("omitted reviewTimeoutMs still passes a bounded timeoutMs to the review session's prompt", async () => {
+    dir = makeRepo();
+    await writeTestHarness(dir);
+    engine = createEngine();
+    engine.models.registry.configure({ id: "p1", kind: "deepseek", apiKey: TEST_API_KEY });
+    engine.models.registry.setTestModel("p1", makeWorkerMock("hello.txt", "HELLO FROM WORKER", "Created hello.txt"));
+    const reviewPromptOpts: Array<{ timeoutMs?: number }> = [];
+    engine.frontier.registerAdapter(
+      makeFakeFrontierAdapter({
+        reviewVerdicts: [{ decision: "approve", reasons: [], severity: "none" }],
+        reviewPromptOpts,
+      }),
+    );
+
+    const res = await call(engine, "engine.orchestrate", {
+      projectDir: dir,
+      task: "add hello.txt with a greeting",
+      // reviewTimeoutMs deliberately OMITTED.
+    });
+    expect(res.error).toBeUndefined();
+
+    expect(reviewPromptOpts).toHaveLength(1);
+    expect(reviewPromptOpts[0]!.timeoutMs).toBe(DEFAULT_REVIEW_TIMEOUT_MS);
+  });
+
+  it("omitted reviewTimeoutMs still passes a bounded timeoutMs to the escalation session's prompt", async () => {
+    dir = makeRepo();
+    const headSha = git(dir, "rev-parse", "HEAD");
+    const agent: AgentDef = {
+      name: "frontier-agent",
+      role: "worker",
+      description: "Frontier-only agent.",
+      prompt: "You handle everything directly.",
+      taskClasses: ["codegen"],
+      model: "frontier",
+      escalation: { maxAttempts: 2 },
+    };
+    const routing: Routing = {
+      version: 1,
+      taskClasses: { codegen: { agent: "frontier-agent" } },
+      escalation: { failuresBeforeFrontier: 2 },
+      defaults: { agent: "frontier-agent" },
+    };
+    const bundle: HarnessBundle = {
+      manifest: {
+        schemaVersion: 1,
+        generatorVersion: "0.0.1",
+        engine: "claude-code",
+        headSha,
+        generatedAt: new Date().toISOString(),
+        verification: { structural: "pass", evals: "pending" },
+        artifacts: [],
+      },
+      pages: [TRIVIAL_PAGE],
+      agents: [agent],
+      routing,
+    };
+    await writeHarness(dir, bundle);
+
+    engine = createEngine();
+    const escalationPromptOpts: Array<{ timeoutMs?: number }> = [];
+    engine.frontier.registerAdapter(makeFakeFrontierAdapter({ escalationPromptOpts }));
+
+    const res = await call(engine, "engine.orchestrate", {
+      projectDir: dir,
+      task: "do everything",
+      // reviewTimeoutMs deliberately OMITTED.
+    });
+    expect(res.error).toBeUndefined();
+
+    expect(escalationPromptOpts).toHaveLength(1);
+    expect(escalationPromptOpts[0]!.timeoutMs).toBe(DEFAULT_ESCALATE_TIMEOUT_MS);
+  });
+
+  it("an explicit reviewTimeoutMs is still honored verbatim for both review and escalation", async () => {
+    dir = makeRepo();
+    await writeTestHarness(dir, { failuresBeforeFrontier: 1 });
+    engine = createEngine();
+    engine.models.registry.configure({ id: "p1", kind: "deepseek", apiKey: TEST_API_KEY });
+    engine.models.registry.setTestModel("p1", makeEmptyWorkerMock("nothing to change"));
+    const reviewPromptOpts: Array<{ timeoutMs?: number }> = [];
+    const escalationPromptOpts: Array<{ timeoutMs?: number }> = [];
+    engine.frontier.registerAdapter(
+      makeFakeFrontierAdapter({ reviewPromptOpts, escalationPromptOpts, escalationWritesFile: false }),
+    );
+
+    const res = await call(engine, "engine.orchestrate", {
+      projectDir: dir,
+      task: "improve the widget",
+      reviewTimeoutMs: 12_345,
+    });
+    expect(res.error).toBeUndefined();
+
+    // Empty worker diff never reaches review — only escalation's prompt runs.
+    expect(escalationPromptOpts).toHaveLength(1);
+    expect(escalationPromptOpts[0]!.timeoutMs).toBe(12_345);
   });
 });
 

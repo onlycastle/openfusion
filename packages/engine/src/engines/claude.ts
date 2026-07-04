@@ -338,27 +338,42 @@ export function createClaudeAdapter(options: CreateClaudeAdapterOptions = {}): F
           // actually bounds how long a caller can be kept waiting,
           // independent of the adapter's own cooperation.
           let timeoutRejection: Promise<never> | undefined;
+          // Fix 2 (M6 Task 1 review round 1 — hygiene): set alongside
+          // timeoutRejection when a deadline is armed; calling it tears the
+          // combinedSignal "abort" listener down. Without this, a prompt
+          // that finishes (or is manually aborted) BEFORE opts.timeoutMs
+          // elapses left that listener registered — and the underlying
+          // AbortSignal.timeout timer running — until the ORIGINAL deadline
+          // eventually fired on a stale abortController/query this call no
+          // longer owns. Harmless in practice today (the timer is unref'd;
+          // q.close() is idempotent; the listener already has `{ once: true
+          // }` so it can only ever fire once), but inconsistent with this
+          // codebase's own pattern elsewhere of tearing a timeout down in a
+          // `finally` (worker/methods.ts, models/methods.ts's
+          // `clearTimeout(timer)`) — this closes the same gap here. Calling
+          // it AFTER the listener already fired (the genuinely-wedged path)
+          // is just a no-op removeEventListener, so this can never weaken
+          // the wedged-query timeout guarantee itself.
+          let removeTimeoutListener: (() => void) | undefined;
           if (opts?.timeoutMs !== undefined) {
             const timeoutSignal = AbortSignal.timeout(opts.timeoutMs);
             const combinedSignal = AbortSignal.any([timeoutSignal, abortController.signal]);
             timeoutRejection = new Promise<never>((_resolve, reject) => {
-              combinedSignal.addEventListener(
-                "abort",
-                () => {
-                  timedOut = timeoutSignal.aborted;
-                  abortController.abort();
-                  q.close();
-                  if (timedOut) {
-                    reject(new Error("prompt timed out"));
-                  }
-                  // A manual (non-timeout) abort while timeoutMs is set:
-                  // leave this promise permanently pending — the iteration
-                  // loop below ends on its own once the (now-aborted)
-                  // query's iterator stops, exactly as it did before this
-                  // task, and nothing re-checks this promise afterward.
-                },
-                { once: true },
-              );
+              const onTimeoutSignal = (): void => {
+                timedOut = timeoutSignal.aborted;
+                abortController.abort();
+                q.close();
+                if (timedOut) {
+                  reject(new Error("prompt timed out"));
+                }
+                // A manual (non-timeout) abort while timeoutMs is set:
+                // leave this promise permanently pending — the iteration
+                // loop below ends on its own once the (now-aborted)
+                // query's iterator stops, exactly as it did before this
+                // task, and nothing re-checks this promise afterward.
+              };
+              combinedSignal.addEventListener("abort", onTimeoutSignal, { once: true });
+              removeTimeoutListener = () => combinedSignal.removeEventListener("abort", onTimeoutSignal);
             });
           }
 
@@ -366,65 +381,93 @@ export function createClaudeAdapter(options: CreateClaudeAdapterOptions = {}): F
             // Prompt text and every streamed message body are user/model
             // content — never pass them to `log`. Only lifecycle facts
             // (nothing here) would be safe; this loop logs nothing.
-            while (true) {
-              const nextPromise = q.next();
-              // Swallow a rejection this promise may settle with LATER, if
-              // it loses the race below (the timeout won instead) — without
-              // this, an eventual reject from an abandoned promise with no
-              // attached handler would surface as an unhandled rejection.
-              // Attaching .catch() here (even though its own returned
-              // promise is discarded) is enough for Node to consider the
-              // ORIGINAL promise handled; the race below still
-              // resolves/rejects off that same original promise when it
-              // settles first.
-              nextPromise.catch(() => {});
-              const result =
-                timeoutRejection !== undefined
-                  ? await Promise.race([nextPromise, timeoutRejection])
-                  : await nextPromise;
-              if (result.done === true) return;
-              const message = result.value;
-              if (message.type === "assistant") {
-                // Rate-limit visibility (M3 inherit #2): an API-error tag on
-                // an assistant message is not terminal — it's a mid-turn
-                // notice, so mapping it here and letting the loop fall
-                // through to the message's (likely empty, but not assumed
-                // so) content blocks below is deliberate; the RPC layer
-                // streams `notice` like any other event, with no special
-                // handling (methods.ts's prompt loop is event-type-agnostic).
-                if (message.error !== undefined) {
-                  yield mapAssistantError(message.error);
-                }
-                for (const block of message.message.content) {
-                  if (block.type === "text") {
-                    yield { type: "text", text: block.text };
-                  } else if (block.type === "tool_use") {
-                    yield {
-                      type: "tool_use",
-                      name: block.name,
-                      summary: JSON.stringify(block.input).slice(0, 200),
-                    };
+            //
+            // Fix 3 (M6 Task 1 review round 1 — comment): this manual
+            // `while`/`q.next()` loop does NOT auto-propagate an early
+            // consumer exit down to `q` the way a nested `for await...of q`
+            // would have (that propagation is a language-level behavior of
+            // `for await...of` calling the ITERATED object's own
+            // `.return()` — a manually-driven `q.next()` loop has no such
+            // hook). Every current consumer of `handle.events`
+            // (harness/driver.ts, engines/methods.ts, orchestrate.ts) always
+            // calls `handle.abort()` explicitly on early exit/catch, which is
+            // what actually aborts `abortController` and closes `q` — so
+            // this is inert today. A FUTURE consumer that merely `break`s
+            // out of (or throws out of) its `for await (const event of
+            // handle.events)` loop WITHOUT calling `handle.abort()` would
+            // silently leak the underlying query/subprocess. Don't
+            // reintroduce that leak — call `handle.abort()` on early exit.
+            try {
+              while (true) {
+                const nextPromise = q.next();
+                // Swallow a rejection this promise may settle with LATER, if
+                // it loses the race below (the timeout won instead) —
+                // without this, an eventual reject from an abandoned promise
+                // with no attached handler would surface as an unhandled
+                // rejection. Attaching .catch() here (even though its own
+                // returned promise is discarded) is enough for Node to
+                // consider the ORIGINAL promise handled; the race below
+                // still resolves/rejects off that same original promise when
+                // it settles first.
+                nextPromise.catch(() => {});
+                const result =
+                  timeoutRejection !== undefined
+                    ? await Promise.race([nextPromise, timeoutRejection])
+                    : await nextPromise;
+                if (result.done === true) return;
+                const message = result.value;
+                if (message.type === "assistant") {
+                  // Rate-limit visibility (M3 inherit #2): an API-error tag
+                  // on an assistant message is not terminal — it's a
+                  // mid-turn notice, so mapping it here and letting the loop
+                  // fall through to the message's (likely empty, but not
+                  // assumed so) content blocks below is deliberate; the RPC
+                  // layer streams `notice` like any other event, with no
+                  // special handling (methods.ts's prompt loop is
+                  // event-type-agnostic).
+                  if (message.error !== undefined) {
+                    yield mapAssistantError(message.error);
                   }
+                  for (const block of message.message.content) {
+                    if (block.type === "text") {
+                      yield { type: "text", text: block.text };
+                    } else if (block.type === "tool_use") {
+                      yield {
+                        type: "tool_use",
+                        name: block.name,
+                        summary: JSON.stringify(block.input).slice(0, 200),
+                      };
+                    }
+                  }
+                } else if (message.type === "result") {
+                  resumeSessionId = message.session_id;
+                  const usage = {
+                    inputTokens: message.usage.input_tokens,
+                    outputTokens: message.usage.output_tokens,
+                    cacheReadTokens: message.usage.cache_read_input_tokens,
+                  };
+                  const resultEvent: FrontierResultEvent = {
+                    type: "result",
+                    resultText: message.subtype === "success" ? message.result : message.errors.join("; "),
+                    costUsd: message.total_cost_usd,
+                    usage,
+                    numTurns: message.num_turns,
+                    durationMs: message.duration_ms,
+                    engineSessionId: message.session_id,
+                  };
+                  onResult?.(resultEvent, dominantModel(message.modelUsage), resultLabel);
+                  yield resultEvent;
                 }
-              } else if (message.type === "result") {
-                resumeSessionId = message.session_id;
-                const usage = {
-                  inputTokens: message.usage.input_tokens,
-                  outputTokens: message.usage.output_tokens,
-                  cacheReadTokens: message.usage.cache_read_input_tokens,
-                };
-                const resultEvent: FrontierResultEvent = {
-                  type: "result",
-                  resultText: message.subtype === "success" ? message.result : message.errors.join("; "),
-                  costUsd: message.total_cost_usd,
-                  usage,
-                  numTurns: message.num_turns,
-                  durationMs: message.duration_ms,
-                  engineSessionId: message.session_id,
-                };
-                onResult?.(resultEvent, dominantModel(message.modelUsage), resultLabel);
-                yield resultEvent;
               }
+            } finally {
+              // Fix 2: torn down on EVERY exit from this loop — normal
+              // completion (the `return` above), an early consumer exit
+              // (Fix 3's own doc comment — a `.return()`/`.throw()` on this
+              // generator resumes here), or the timed-out rejection
+              // propagating out of the `await` above. See
+              // removeTimeoutListener's own doc comment for why this can
+              // never weaken the wedged-query guarantee.
+              removeTimeoutListener?.();
             }
           }
 

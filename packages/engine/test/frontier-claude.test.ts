@@ -1,7 +1,7 @@
 import { mkdirSync, mkdtempSync, rmSync, symlinkSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Options, Query, SDKMessage } from "@anthropic-ai/claude-agent-sdk";
 import { createClaudeAdapter } from "../src/engines/claude.js";
 import type { FrontierPromptHandle } from "../src/engines/types.js";
@@ -471,6 +471,30 @@ describe("createClaudeAdapter", () => {
     // CLI subprocess) so a real wedged process can't survive the deadline.
     expect(closeSpy.count).toBe(1);
   }, 5_000);
+
+  // M6 Task 1 review round 1 (Fix 2 — hygiene): the combinedSignal "abort"
+  // listener armed whenever opts.timeoutMs is set must be torn down once
+  // the prompt completes normally, BEFORE the deadline ever elapses —
+  // otherwise it (and the underlying AbortSignal.timeout timer) linger
+  // until the original deadline fires on a stale controller/query this call
+  // no longer owns. Proven by spying on the global
+  // AbortSignal.prototype.removeEventListener: a fast-completing prompt with
+  // a (comparatively distant) timeoutMs set must still call it at least
+  // once by the time the events fully drain.
+  it("tears down the timeout listener once a prompt with timeoutMs set completes normally (Fix 2)", async () => {
+    const { queryFn } = makeQueryFn([[RESULT_MSG]]);
+    const adapter = createClaudeAdapter({ queryFn });
+    const session = await adapter.createSession({ projectDir: "/repo", wikiMcpUrl: null, log: noopLog });
+
+    const removeEventListenerSpy = vi.spyOn(AbortSignal.prototype, "removeEventListener");
+    try {
+      const events = await drain(session.prompt("hi", { timeoutMs: 60_000 }));
+      expect(events.map((e) => e.type)).toEqual(["result"]);
+      expect(removeEventListenerSpy).toHaveBeenCalledWith("abort", expect.anything());
+    } finally {
+      removeEventListenerSpy.mockRestore();
+    }
+  });
 
   // Preserves the M3 single-timeout-authority default: omitting timeoutMs
   // (or passing an opts object without it — every M4-era caller's shape)

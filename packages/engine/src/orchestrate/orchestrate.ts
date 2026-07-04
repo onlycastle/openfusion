@@ -46,6 +46,36 @@ import { routeTask } from "./routing.js";
 const FRONTIER_KIND = "claude-code";
 const DEFAULT_MAX_WORKER_ATTEMPTS = 2;
 
+// M6 Task 1 review round 1 (Important — Fix 1): reviewTimeoutMs (and, by
+// extension, the escalation turn's own deadline) had NO default anywhere in
+// this pipeline — an RPC caller simply omitting it left the review/
+// escalation frontier call fully UNBOUNDED. That matters specifically
+// because of the stdin-close shutdown path (main.ts: abortAll ->
+// pipeline.drain -> engine.close): drain() waits on THIS in-flight
+// orchestrate call to settle BEFORE close() ever runs and can reach (and
+// force-close) the direct frontier session engine.frontier.track registered
+// (see runEscalation/the worker loop's review session below) — so a wedged
+// REAL review or escalation turn would hang the entire process, not just
+// this one call, taking down an eval batch of N orchestrate loops with it.
+// M6 Task 1 Change A made the real Claude adapter actually ENFORCE
+// opts.timeoutMs (claude.ts) — before that, a default here would have been
+// a no-op against the real adapter. With enforcement now real, defaulting
+// here is what makes every sub-call self-bounding regardless of what an RPC
+// caller passes (or omits). Kept as internal, unexported constants — same
+// convention as worker/methods.ts's own DEFAULT_RUN_TIMEOUT_MS (the wire
+// schema, methods.ts's OrchestrateParamsSchema, keeps both params OPTIONAL;
+// applying the default HERE, not there, is what guarantees an omitted param
+// still yields a bounded call).
+const DEFAULT_REVIEW_TIMEOUT_MS = 300_000; // 5 min — a read-only judgment call; should be fast.
+// 10 min — a full editing turn, comparable in scope to a worker attempt, so
+// this mirrors worker/methods.ts's own DEFAULT_RUN_TIMEOUT_MS rather than
+// reusing the (shorter) review default. An EXPLICIT reviewTimeoutMs from the
+// caller is still reused verbatim for escalation too (unchanged from before
+// this fix — see OrchestrateParamsSchema's own doc comment) since a caller
+// providing one is clearly stating a per-sub-call deadline for this whole
+// run; only the OMITTED case gets escalation's own, longer default.
+const DEFAULT_ESCALATE_TIMEOUT_MS = 600_000;
+
 export interface OrchestrateParams {
   projectDir: string;
   task: string;
@@ -270,8 +300,17 @@ interface EscalationResult {
 // access scoped to that worktree's root (toolPolicy.writeScope) — the first
 // use of the M4 write-policy path in anger. Reached either because routing
 // resolved straight to "frontier", or because every worker attempt above
-// was rejected/empty.
-async function runEscalation(engine: Engine, params: OrchestrateParams, agent: AgentDef): Promise<EscalationResult> {
+// was rejected/empty. `timeoutMs` is the CALLER'S already-resolved deadline
+// (params.reviewTimeoutMs if the caller passed one, else
+// DEFAULT_ESCALATE_TIMEOUT_MS — see orchestrate()'s own resolution below) —
+// this function never reads params.reviewTimeoutMs itself, so it can never
+// silently forward an unbounded `undefined` to the escalation turn.
+async function runEscalation(
+  engine: Engine,
+  params: OrchestrateParams,
+  agent: AgentDef,
+  timeoutMs: number,
+): Promise<EscalationResult> {
   const manager = await engine.worker.getManager(params.projectDir);
   const worktree = await manager.create(randomUUID());
 
@@ -321,7 +360,7 @@ async function runEscalation(engine: Engine, params: OrchestrateParams, agent: A
         // working directory" is now literally correct: the session's cwd IS
         // the worktree (see the createSession call above).
         `${agent.prompt}\n\nComplete this task by editing files in the current working directory: ${params.task}`,
-        params.reviewTimeoutMs,
+        timeoutMs,
       );
       const diff = await manager.diff(worktree);
       const diffStat = await manager.diffStat(worktree);
@@ -428,6 +467,13 @@ export async function orchestrate(engine: Engine, params: OrchestrateParams): Pr
 
     const maxWorkerAttempts =
       params.maxWorkerAttempts ?? harness.routing.escalation.failuresBeforeFrontier ?? DEFAULT_MAX_WORKER_ATTEMPTS;
+    // Fix 1 (M6 Task 1 review round 1): resolved ONCE, here — every
+    // review/escalation call below reads these locals, never
+    // params.reviewTimeoutMs directly, so an omitted param can't leak an
+    // unbounded `undefined` past this point. See the DEFAULT_* constants'
+    // own doc comment (top of file) for the drain()-hang rationale.
+    const reviewTimeoutMs = params.reviewTimeoutMs ?? DEFAULT_REVIEW_TIMEOUT_MS;
+    const escalateTimeoutMs = params.reviewTimeoutMs ?? DEFAULT_ESCALATE_TIMEOUT_MS;
 
     if (routed.resolution !== "frontier") {
       const { providerId, model } = routed.resolution;
@@ -449,6 +495,14 @@ export async function orchestrate(engine: Engine, params: OrchestrateParams): Pr
             task: buildWorkerTask(routed.agent, params.task, priorAttempt),
             providerId,
             model,
+            // Fix 1: unlike reviewTimeoutMs/escalateTimeoutMs above, this is
+            // deliberately left as `params.workerTimeoutMs` verbatim
+            // (possibly undefined) rather than defaulted here —
+            // engine.worker.run's OWN handler (worker/methods.ts) already
+            // applies its own bounded default (`params.timeoutMs ??
+            // DEFAULT_RUN_TIMEOUT_MS`, 600000) whenever this arrives as
+            // undefined, so this sub-call is ALREADY self-bounding without
+            // orchestrate needing to duplicate that default.
             timeoutMs: params.workerTimeoutMs,
           });
         } catch (err) {
@@ -503,7 +557,7 @@ export async function orchestrate(engine: Engine, params: OrchestrateParams): Pr
           const reviewResult = await reviewDiff(
             reviewSession,
             { task: params.task, diff: workerResult.diff, summary: workerResult.summary },
-            { timeoutMs: params.reviewTimeoutMs },
+            { timeoutMs: reviewTimeoutMs },
           );
           verdict = reviewResult.verdict;
           frontierUsd = addCost(frontierUsd, reviewResult.costUsd);
@@ -538,7 +592,7 @@ export async function orchestrate(engine: Engine, params: OrchestrateParams): Pr
     progress(engine, "escalate", "escalating to the frontier with write access");
     let escalation: EscalationResult;
     try {
-      escalation = await runEscalation(engine, params, routed.agent);
+      escalation = await runEscalation(engine, params, routed.agent, escalateTimeoutMs);
     } catch (err) {
       // Mirrors the worker-attempt catch's identical lift, above.
       const worktree = liftWorktreeFromError(err);
