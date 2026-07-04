@@ -359,8 +359,20 @@ function addCost(total: number | null, next: number | null): number | null {
   return (total ?? 0) + next;
 }
 
-function progress(engine: Engine, stage: string, taskId?: string): void {
-  engine.notify("evals.progress", taskId !== undefined ? { stage, taskId } : { stage });
+// M7c Task 5: `runId`, when supplied (the same batch-level runId this run's
+// own cancelSignal lookup above uses), is included on every notification so a
+// client with more than one concurrent evals run in flight can filter
+// progress to just its own. Mirrors orchestrate.ts's identical `progress()`
+// fix -- each field is present only when the caller actually supplied it
+// (`taskId` for run-level "start"/"done" stages stays absent exactly as
+// before; `runId` is absent entirely, not `runId: undefined`, when no runId
+// was given), so an older/runId-less caller sees the exact same shape as
+// before this task.
+function progress(engine: Engine, stage: string, taskId?: string, runId?: string): void {
+  const params: { stage: string; taskId?: string; runId?: string } = { stage };
+  if (taskId !== undefined) params.taskId = taskId;
+  if (runId !== undefined) params.runId = runId;
+  engine.notify("evals.progress", params);
 }
 
 // Invokes an already-registered engine.* RPC method through the engine's own
@@ -680,7 +692,7 @@ export async function runEvals(engine: Engine, params: EvalsRunParams): Promise<
     throw new RpcMethodError(RpcErrorCodes.SERVER_ERROR, "engine.evals.run requires at least one task");
   }
 
-  progress(engine, "start");
+  progress(engine, "start", undefined, params.runId);
 
   // C1 / I2 (final review): snapshot the meter's own record count BEFORE any
   // task in this run makes a single model call. Every aggregate this
@@ -718,11 +730,11 @@ export async function runEvals(engine: Engine, params: EvalsRunParams): Promise<
       const baselineDir = await mkdtemp(path.join(os.tmpdir(), "of-eval-baseline-"));
       const harnessDir = await mkdtemp(path.join(os.tmpdir(), "of-eval-harness-"));
       try {
-        progress(engine, "baseline", task.id);
+        progress(engine, "baseline", task.id, params.runId);
         await task.setup(baselineDir);
         const baseline = await runBaselineTask(engine, baselineDir, task, cancelSignal);
 
-        progress(engine, "harness", task.id);
+        progress(engine, "harness", task.id, params.runId);
         // Fix 1 (base identity — see this module's header comment): harnessDir
         // gets the SAME task.setup() base state the baseline used, THEN a
         // committed git repo, THEN the real project's harness bundle copied
@@ -736,7 +748,7 @@ export async function runEvals(engine: Engine, params: EvalsRunParams): Promise<
           abortSignal: cancelSignal,
         });
 
-        progress(engine, "scored", task.id);
+        progress(engine, "scored", task.id, params.runId);
 
         if (baseline.passed) baselinePassed += 1;
         if (harnessResult.passed) harnessPassed += 1;
@@ -776,7 +788,7 @@ export async function runEvals(engine: Engine, params: EvalsRunParams): Promise<
     throw err; // a genuine bug/crash, not cancellation — unchanged behavior
   }
 
-  progress(engine, "done");
+  progress(engine, "done", undefined, params.runId);
 
   const taskCount = params.tasks.length;
   // Run-scoped (C1 / I2): everything this run's own task loop added to the

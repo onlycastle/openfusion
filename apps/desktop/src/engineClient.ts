@@ -533,21 +533,22 @@ export class EngineClient {
    *    abandons the RESPONSE while the engine run keeps executing in the
    *    background; `engine.cancel({runId})` is the only real stop.
    * 3. Subscribes to `onEngineEvent`, forwarding every notification whose
-   *    `method` equals `progressMethod` to `onProgress`, and unsubscribes
-   *    the instant the run's promise settles (success, failure, OR
-   *    cancellation) — no leaked subscription.
+   *    `method` equals `progressMethod` (and, when present, whose `runId`
+   *    matches THIS run's) to `onProgress`, and unsubscribes the instant the
+   *    run's promise settles (success, failure, OR cancellation) — no leaked
+   *    subscription.
    *
-   *    ASSUMPTION (v1, single-run-at-a-time per kind): neither
-   *    `orchestrate.progress` nor `evals.progress` carries a `runId` in its
-   *    params today (checked against the engine's actual `notify()` call
-   *    sites: `orchestrate.ts`'s and `evals/run.ts`'s own `progress()`
-   *    helpers) — so this filters by `method` ALONE, not by runId. Two
-   *    concurrently in-flight runs of the SAME kind would have their
-   *    progress notifications interleave onto both callers' `onProgress`.
-   *    M7c Task 5 is tracked to add `runId` to these notifications; once it
-   *    does, this filter should ALSO match `notification.params.runId ===
-   *    runId`. Until then, the Orchestrate/Evals cockpit screens must not
-   *    start a second run of the same kind while one is already in flight.
+   *    RUNID FILTERING (M7c Task 5): `orchestrate.progress`/`evals.progress`
+   *    now carry a `runId` (the engine-side fix — `orchestrate.ts`'s and
+   *    `evals/run.ts`'s own `progress()` helpers). This filters on it when
+   *    present: a notification whose `params.runId` is defined and does NOT
+   *    equal this run's own `runId` is dropped, so two concurrently in-flight
+   *    runs of the SAME kind no longer interleave onto each other's
+   *    `onProgress`. Kept BACKWARD TOLERANT for a notification with no
+   *    `runId` at all (`params.runId === undefined`) — treated as "not
+   *    filterable, forward it anyway" rather than dropped, so an older
+   *    engine build (or any future notification this client doesn't fully
+   *    type) can't silently go missing.
    * 4. Returns a `cancel()` that calls `engine.cancel({runId})`. A
    *    `{cancelled:true}` response means the run's own pipeline will reject
    *    with the cancellation marker shortly (handled by the `.catch` below).
@@ -577,6 +578,11 @@ export class EngineClient {
 
     const unsubscribe = this.onEngineEvent((notification) => {
       if (notification.method !== progressMethod) return;
+      // See this method's own doc comment ("RUNID FILTERING"): filter on
+      // runId only when the notification actually carries one; an absent
+      // runId is forwarded rather than dropped (backward tolerant).
+      const notificationRunId = (notification.params as { runId?: string } | undefined)?.runId;
+      if (notificationRunId !== undefined && notificationRunId !== runId) return;
       onProgress?.(notification.params as P);
     });
 

@@ -1101,6 +1101,56 @@ describe("runEvals — evals.progress notifications", () => {
     expect(events[4]!.taskId).toBe("t2");
     expect(events[7]!.taskId).toBeUndefined();
   });
+
+  // M7c Task 5: orchestrate.progress/evals.progress notifications previously
+  // carried no runId at all -- a client with more than one run in flight (of
+  // the same kind) had no reliable way to filter progress to just ITS run
+  // (the desktop engineClient helper had to fall back to a "filter by method
+  // name only, assume single-run-at-a-time" posture -- see that module's own
+  // doc comment). Every stage's notification must now carry the SAME runId
+  // the caller supplied, end to end.
+  it("carries the run's runId on every notification when one was supplied to runEvals", async () => {
+    dir = await makeHarnessFixture();
+    const notifications: Array<{ method: string; params: unknown }> = [];
+    engine = createEngine({ notify: (method, params) => notifications.push({ method, params }) });
+    engine.frontier.registerAdapter(
+      makeFakeEvalsFrontierAdapter({ baselineCorrect: true, harnessCorrect: true, meter: engine.models.meter }),
+    );
+
+    await runEvals(engine, {
+      projectDir: dir,
+      tasks: [synthEvalTask({ id: "t1" })],
+      runId: "eval-progress-1",
+    });
+
+    const events = notifications
+      .filter((n) => n.method === "evals.progress")
+      .map((n) => n.params as { stage: string; taskId?: string; runId?: string });
+
+    expect(events.length).toBeGreaterThan(0);
+    for (const e of events) {
+      expect(e.runId).toBe("eval-progress-1");
+    }
+  });
+
+  it("omits runId entirely when none was supplied (backward compatible shape)", async () => {
+    dir = await makeHarnessFixture();
+    const notifications: Array<{ method: string; params: unknown }> = [];
+    engine = createEngine({ notify: (method, params) => notifications.push({ method, params }) });
+    engine.frontier.registerAdapter(
+      makeFakeEvalsFrontierAdapter({ baselineCorrect: true, harnessCorrect: true, meter: engine.models.meter }),
+    );
+
+    await runEvals(engine, { projectDir: dir, tasks: [synthEvalTask({ id: "t1" })] });
+
+    const events = notifications
+      .filter((n) => n.method === "evals.progress")
+      .map((n) => n.params as Record<string, unknown>);
+    expect(events.length).toBeGreaterThan(0);
+    for (const e of events) {
+      expect("runId" in e).toBe(false);
+    }
+  });
 });
 
 describe("runEvals — guard failures", () => {
@@ -1208,4 +1258,91 @@ describe("engine.evals.run (RPC wire layer) — golden task descriptors", () => 
     expect(res.result).toBeUndefined();
     expect(res.error.code).toBe(RpcErrorCodes.INVALID_PARAMS);
   });
+});
+
+// M7c Task 5 (FIX BATCH T2.1 -- the coverage gap the M7b/M7c reviews named):
+// every OTHER cancellation test in this file (the "mid-batch cancel" describe
+// block above) drives runEvals() directly and hand-simulates the
+// register()/deregister() wrapping that is actually evals/methods.ts's OWN
+// RPC handler's job -- see that describe block's own comment, which documents
+// this exact gap ("this test... must therefore stand in for that handler's
+// own register/finally-deregister wrapping itself"). This describe block
+// instead drives the ACTUAL `engine.evals.run` RPC method end-to-end through
+// the real dispatcher (dispatcher.dispatch -> evals/methods.ts's registered
+// handler -> its own register() -> runEvals() -> its own deregister() in
+// `finally`), mirroring orchestrate.test.ts's "cancellation via engine.cancel"
+// describe block for engine.orchestrate. A single golden-commit task
+// (commitSha + testCommand -- the only JSON-safe task shape this RPC method
+// accepts; see methods.ts's own WIRE-SAFETY header comment) is enough: its
+// harness-side escalation call is where makeCancelEvalsFrontierAdapter blocks
+// until engine.cancel aborts it.
+describe("engine.evals.run (RPC wire layer) — cancellation via engine.cancel (M7c Task 5)", () => {
+  it("cancels an in-flight run driven through evals/methods.ts's own handler: registers via the real handler, aborts promptly, reports the cancelled marker, and leaves the registry empty", async () => {
+    dir = makeRepo();
+    writeFileSync(
+      path.join(dir, "source.js"),
+      ["function add(a, b) {", "  return a - b; // bug: should be a + b", "}", "", "module.exports = { add };", ""].join(
+        "\n",
+      ),
+    );
+    writeFileSync(
+      path.join(dir, "test.js"),
+      [
+        "const assert = require('node:assert');",
+        "const { add } = require('./source');",
+        "assert.strictEqual(add(2, 3), 5);",
+        "console.log('ok');",
+        "",
+      ].join("\n"),
+    );
+    git(dir, "add", "-A");
+    git(dir, "commit", "-qm", "A: add buggy add() with its test");
+
+    writeFileSync(
+      path.join(dir, "source.js"),
+      ["function add(a, b) {", "  return a + b;", "}", "", "module.exports = { add };", ""].join("\n"),
+    );
+    git(dir, "add", "-A");
+    git(dir, "commit", "-qm", "B: fix add() to return the correct sum");
+    const commitB = git(dir, "rev-parse", "HEAD");
+
+    await writeFrontierOnlyHarness(dir);
+
+    engine = createEngine();
+    const blockReached = { count: 0 };
+    // Only one task -> its own (only) harness escalation call is call #1.
+    engine.frontier.registerAdapter(makeCancelEvalsFrontierAdapter({ blockOnEscalateCallIndex: 1, blockReached }));
+
+    const runId = "evals-rpc-cancel-1";
+    const runPromise = call(engine, "engine.evals.run", {
+      projectDir: dir,
+      tasks: [{ commitSha: commitB, testCommand: ["node", "test.js"] }],
+      runId,
+    });
+
+    const deadline = Date.now() + 10_000;
+    while (blockReached.count < 1) {
+      if (Date.now() > deadline) throw new Error("harness escalation call never started blocking");
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+
+    // Registered by engine.evals.run's OWN handler (methods.ts) -- not by
+    // this test -- which is exactly the wiring the gap this test closes
+    // cares about.
+    expect(engine.cancelRegistry.get(runId)).toBeDefined();
+
+    const cancelRes = await call(engine, "engine.cancel", { runId });
+    expect(cancelRes.error).toBeUndefined();
+    expect(cancelRes.result.cancelled).toBe(true);
+
+    const res = await runPromise;
+    expect(res.result).toBeUndefined();
+    expect(res.error).toBeDefined();
+    expect(res.error.code).toBe(RpcErrorCodes.SERVER_ERROR);
+    expect(res.error.data.cancelled).toBe(true);
+
+    // No leak: evals/methods.ts's own `finally` deregistered this runId once
+    // the RPC call settled.
+    expect(engine.cancelRegistry.size()).toBe(0);
+  }, 15_000);
 });

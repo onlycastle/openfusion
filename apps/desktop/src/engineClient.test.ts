@@ -302,6 +302,37 @@ describe("runOrchestrate/runEvals — cancellable-run helper", () => {
     expect(received).toEqual([{ stage: "baseline", taskId: "task-1" }]);
   });
 
+  // M7c Task 5: the engine now tags orchestrate.progress/evals.progress with
+  // the run's own runId — this closes the single-run-at-a-time assumption
+  // #startCancellableRun's own doc comment used to document. Two concurrent
+  // runOrchestrate calls (sharing the one Channel) must each only see their
+  // OWN run's progress; a notification with no runId at all (hypothetically,
+  // an older engine build) is still forwarded to both rather than dropped.
+  it("filters orchestrate.progress by runId across two concurrent runs, forwarding a runId-less notification to both", () => {
+    invokeMock.mockResolvedValueOnce(undefined); // engine_events subscribe (shared)
+    invokeMock.mockImplementation(() => new Promise(() => {})); // both main calls stay pending
+    const client = new EngineClient();
+    const receivedA: unknown[] = [];
+    const receivedB: unknown[] = [];
+
+    const runA = client.runOrchestrate({ projectDir: "/proj", task: "a" }, (event) => receivedA.push(event));
+    const runB = client.runOrchestrate({ projectDir: "/proj", task: "b" }, (event) => receivedB.push(event));
+
+    const channel = channelInstances[0]!;
+    channel.onmessage?.({ method: "orchestrate.progress", params: { stage: "route", runId: runA.runId } });
+    channel.onmessage?.({ method: "orchestrate.progress", params: { stage: "worker:1", runId: runB.runId } });
+    channel.onmessage?.({ method: "orchestrate.progress", params: { stage: "no-runid-stage" } });
+
+    expect(receivedA).toEqual([
+      { stage: "route", runId: runA.runId },
+      { stage: "no-runid-stage" },
+    ]);
+    expect(receivedB).toEqual([
+      { stage: "worker:1", runId: runB.runId },
+      { stage: "no-runid-stage" },
+    ]);
+  });
+
   it("unsubscribes from onEngineEvent once the run settles successfully — no further progress delivered", async () => {
     invokeMock.mockResolvedValueOnce(undefined); // engine_events subscribe
     invokeMock.mockResolvedValueOnce(orchestrateResultFixture());
