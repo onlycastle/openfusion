@@ -257,3 +257,70 @@ textarea {
 .cost-split dd {
   margin: 0;
 }
+
+.verdict-banner {
+  padding: 0.75rem 1rem;
+  border-radius: 8px;
+  font-weight: 600;
+  margin: 0.75rem 0;
+}
+
+.verdict-banner-pass {
+  background: #1e7a34;
+  color: #fff;
+}
+
+.verdict-banner-fail {
+  background: var(--error);
+  color: #fff;
+  border: 2px solid #7a1410;
+}
+
+.verdict-banner-inconclusive {
+  background: #b8860b;
+  color: #fff;
+}
+
+.savings-figure {
+  font-weight: 600;
+  font-size: 1.05rem;
+}
+
+.caveat-badge {
+  display: inline-block;
+  padding: 0.15rem 0.6rem;
+  border-radius: 999px;
+  background: var(--border);
+  color: var(--fg);
+  font-size: 0.8rem;
+  font-weight: 600;
+}
+
+.eval-per-task-table {
+  border-collapse: collapse;
+  width: 100%;
+  font-size: 0.85rem;
+  margin: 0.5rem 0;
+}
+
+.eval-per-task-table th,
+.eval-per-task-table td {
+  border: 1px solid var(--border);
+  padding: 0.35rem 0.5rem;
+  text-align: left;
+}
+
+.clean-subset {
+  display: grid;
+  grid-template-columns: max-content max-content;
+  column-gap: 1rem;
+  row-gap: 0.25rem;
+}
+
+.clean-subset dt {
+  font-weight: 600;
+}
+
+.clean-subset dd {
+  margin: 0;
+}

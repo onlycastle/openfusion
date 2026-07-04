@@ -3,10 +3,10 @@ import { ErrorBoundary } from "./components/ErrorBoundary";
 import { Nav } from "./components/Nav";
 import { engineClient, type EngineNotification } from "./engineClient";
 import { useHashRoute } from "./router";
+import { EvalsScreen } from "./screens/EvalsScreen";
 import { KeysScreen } from "./screens/KeysScreen";
 import { OrchestrateScreen } from "./screens/OrchestrateScreen";
 import { ProjectScreen } from "./screens/ProjectScreen";
-import { StubScreen } from "./screens/StubScreen";
 
 /** The app shell: this is the ONE place the app subscribes to engine
  * notifications (`engineClient.onEngineEvent`), so it's also the proof, at
@@ -35,7 +35,7 @@ export function App() {
           {route === "project" && <ProjectScreen />}
           {route === "keys" && <KeysScreen />}
           {route === "orchestrate" && <OrchestrateScreen />}
-          {route === "evals" && <StubScreen title="Evals" />}
+          {route === "evals" && <EvalsScreen />}
         </main>
       </div>
       <footer className="status-bar">
