@@ -3,6 +3,7 @@ import { execFileSync } from "node:child_process";
 import { existsSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { MockLanguageModelV4 } from "ai/test";
 import { afterEach, describe, expect, it } from "vitest";
 import { RpcErrorCodes } from "@openfusion/shared";
 import { createEngine, type Engine } from "../src/engine.js";
@@ -12,6 +13,10 @@ import { harnessStatus, writeHarness } from "../src/harness/store.js";
 import type { CostMeter } from "../src/models/meter.js";
 import { goldenTaskFromCommit, synthEvalTask, type EvalTask } from "../src/evals/tasks.js";
 import { runEvals } from "../src/evals/run.js";
+
+// Fixture literal only — must never appear outside test files (mirrors
+// orchestrate.test.ts's identical TEST_API_KEY constant/rationale).
+const TEST_API_KEY = "sk-test-fixture-never-real-1234567890";
 
 let dir: string;
 let engine: Engine;
@@ -172,6 +177,245 @@ function makeFakeEvalsFrontierAdapter(opts: FakeEvalsFrontierOptions): FrontierA
     },
   };
 }
+
+// --- C1 fixtures: mixed pricing (frontier priced, WORKER model unpriced) --
+//
+// Unlike writeFrontierOnlyHarness above (which routes straight to the
+// frontier-escalation path with no worker attempt at all), this fixture
+// routes to a real worker model resolution -- required to reproduce C1: the
+// bug only shows up when orchestrate.ts's own `cost.totalUsd` sums a null
+// (unpriced) `workerUsd` alongside a non-null (always-priced) frontier
+// review cost. A harness that skips the worker (frontier-only) can never
+// exercise addCost's null-skip semantics the way a real "cheap worker,
+// frontier review" split does.
+const UNPRICED_WORKER_MODEL = "deepseek-v4-mixed-pricing-fixture";
+
+async function writeUnpricedWorkerHarness(projectDir: string): Promise<void> {
+  const headSha = git(projectDir, "rev-parse", "HEAD");
+  const agent: AgentDef = {
+    name: "codegen-worker",
+    role: "worker",
+    description: "Writes code for codegen tasks (C1 fixture -- deliberately NOT in the PRICING table).",
+    prompt: "You are a codegen specialist. Follow instructions exactly.",
+    taskClasses: ["codegen"],
+    model: { kind: "deepseek", model: UNPRICED_WORKER_MODEL, providerId: "p1" },
+    escalation: { maxAttempts: 2 },
+  };
+  const routing: Routing = {
+    version: 1,
+    taskClasses: { codegen: { agent: "codegen-worker" } },
+    escalation: { failuresBeforeFrontier: 2 },
+    defaults: { agent: "codegen-worker" },
+  };
+  const bundle: HarnessBundle = {
+    manifest: {
+      schemaVersion: 1,
+      generatorVersion: "0.0.1",
+      engine: "claude-code",
+      headSha,
+      generatedAt: new Date().toISOString(),
+      verification: { structural: "pass", evals: "pending" },
+      artifacts: [],
+    },
+    pages: [TRIVIAL_PAGE],
+    agents: [agent],
+    routing,
+  };
+  await writeHarness(projectDir, bundle);
+}
+
+async function makeUnpricedWorkerHarnessFixture(): Promise<string> {
+  const base = makeRepo();
+  await writeUnpricedWorkerHarness(base);
+  return base;
+}
+
+// --- Scripted worker model (ai/test's MockLanguageModelV4) — mirrors
+// orchestrate.test.ts's own toolCallStep/textStep/makeWorkerMock (duplicated
+// locally per this codebase's established test-fixture convention; see
+// run.ts's own doc comments on addCost/callEngineMethod for the same
+// rationale). `makeRepeatableWorkerMock` differs from orchestrate.test.ts's
+// `makeWorkerMock` only in ALTERNATING (step % 2) rather than "step 1 vs.
+// everything else": this suite drives FIVE separate engine.worker.run loops
+// (one per eval task, each a single write-then-summarize attempt approved by
+// review on the first try, so a single worker model instance registered ONCE
+// outside runEvals's own per-task loop still produces the right
+// tool-call/text pair for every task in sequence.
+function toolCallStep(filePath: string, content: string): {
+  content: Array<{ type: "tool-call"; toolCallId: string; toolName: string; input: string }>;
+  finishReason: { unified: "tool-calls"; raw: string };
+  usage: {
+    inputTokens: { total: number; noCache: number; cacheRead: undefined; cacheWrite: undefined };
+    outputTokens: { total: number; text: number; reasoning: undefined };
+  };
+  warnings: never[];
+} {
+  return {
+    content: [
+      {
+        type: "tool-call",
+        toolCallId: `call-${randomUUID()}`,
+        toolName: "write_file",
+        input: JSON.stringify({ path: filePath, content }),
+      },
+    ],
+    finishReason: { unified: "tool-calls", raw: "tool_calls" },
+    usage: {
+      inputTokens: { total: 100, noCache: 100, cacheRead: undefined, cacheWrite: undefined },
+      outputTokens: { total: 50, text: 0, reasoning: undefined },
+    },
+    warnings: [],
+  };
+}
+
+function textStep(text: string): {
+  content: Array<{ type: "text"; text: string }>;
+  finishReason: { unified: "stop"; raw: string };
+  usage: {
+    inputTokens: { total: number; noCache: number; cacheRead: undefined; cacheWrite: undefined };
+    outputTokens: { total: number; text: number; reasoning: undefined };
+  };
+  warnings: never[];
+} {
+  return {
+    content: [{ type: "text", text }],
+    finishReason: { unified: "stop", raw: "stop" },
+    usage: {
+      inputTokens: { total: 200, noCache: 200, cacheRead: undefined, cacheWrite: undefined },
+      outputTokens: { total: 30, text: 30, reasoning: undefined },
+    },
+    warnings: [],
+  };
+}
+
+function makeRepeatableWorkerMock(filePath: string, content: string, summary: string): MockLanguageModelV4 {
+  let step = 0;
+  return new MockLanguageModelV4({
+    doGenerate: async () => {
+      step++;
+      return step % 2 === 1 ? toolCallStep(filePath, content) : textStep(summary);
+    },
+  });
+}
+
+// Serves BOTH the baseline primitive (resultLabel "eval-baseline") and the
+// harness side's READ-ONLY review session (resultLabel "frontier-review") —
+// always approves, so the worker's first (and only) attempt is never
+// retried or escalated. Both cost figures are priced/verified: the whole
+// point of C1's fixture is that ONLY the worker call (a real
+// engine.models.complete call against a model absent from PRICING, recorded
+// automatically by models/methods.ts's own runComplete -- see pricing.ts's
+// lookupPricing) is unpriced; the frontier side is never the unpriced
+// component in this scenario.
+function makeMixedPricingFrontierAdapter(meter: CostMeter): FrontierAdapter {
+  return {
+    kind: "claude-code",
+    async createSession({ projectDir, resultLabel }): Promise<FrontierSession> {
+      const isBaseline = resultLabel === "eval-baseline";
+      return {
+        id: randomUUID(),
+        projectDir,
+        prompt(_text: string, _promptOpts?: { timeoutMs?: number }): FrontierPromptHandle {
+          async function* gen(): AsyncGenerator<FrontierEvent> {
+            if (isBaseline) {
+              writeFileSync(path.join(projectDir, "source.js"), CORRECT_SOURCE);
+              yield { type: "tool_use", name: "Write", summary: "wrote source.js" };
+              yield { type: "text", text: "done" };
+              const event: FrontierEvent = {
+                type: "result",
+                resultText: "done",
+                costUsd: 0.5,
+                usage: { inputTokens: 10, outputTokens: 5, cacheReadTokens: 0 },
+                numTurns: 1,
+                durationMs: 1,
+                engineSessionId: null,
+              };
+              meter.record({
+                providerId: "claude-code",
+                kind: "frontier-claude",
+                model: "fake-frontier-model",
+                usage: event.usage,
+                costUsd: event.costUsd,
+                at: Date.now(),
+                source: "frontier-review",
+                pricingConfidence: "verified",
+              });
+              yield event;
+              return;
+            }
+            // Harness-side review: approve immediately -- no retry, no
+            // escalation, so the worker's own (unpriced) cost is the ONLY
+            // component orchestrate.ts's addCost null-skip can hide.
+            yield {
+              type: "text",
+              text: "```json\n" + JSON.stringify({ decision: "approve", reasons: [], severity: "none" }) + "\n```",
+            };
+            const event: FrontierEvent = {
+              type: "result",
+              resultText: "approve",
+              costUsd: 0.05,
+              usage: { inputTokens: 10, outputTokens: 5, cacheReadTokens: 0 },
+              numTurns: 1,
+              durationMs: 1,
+              engineSessionId: null,
+            };
+            meter.record({
+              providerId: "claude-code",
+              kind: "frontier-claude",
+              model: "fake-frontier-model",
+              usage: event.usage,
+              costUsd: event.costUsd,
+              at: Date.now(),
+              source: "frontier-review",
+              pricingConfidence: "verified",
+            });
+            yield event;
+          }
+          return { events: gen(), abort: () => {} };
+        },
+        async close(): Promise<void> {},
+      };
+    },
+  };
+}
+
+describe("runEvals — C1: mixed pricing (unpriced worker cost must not overstate savings)", () => {
+  it("frontier priced, WORKER model unpriced -> verdict 'inconclusive' (never 'pass'); manifest not flipped; note names the unpriced count", async () => {
+    dir = await makeUnpricedWorkerHarnessFixture();
+    engine = createEngine();
+    engine.models.registry.configure({ id: "p1", kind: "deepseek", apiKey: TEST_API_KEY });
+    engine.models.registry.setTestModel("p1", makeRepeatableWorkerMock("source.js", CORRECT_SOURCE, "wrote source.js"));
+    engine.frontier.registerAdapter(makeMixedPricingFrontierAdapter(engine.models.meter));
+
+    const tasks: EvalTask[] = Array.from({ length: 5 }, (_, i) => synthEvalTask({ id: `t${i + 1}` }));
+    const report = await runEvals(engine, { projectDir: dir, tasks });
+
+    expect(report.taskCount).toBe(5);
+    // Quality genuinely held on every task -- this is NOT an ETH-hazard
+    // scenario. The bug this test targets is purely about the SAVINGS claim.
+    expect(report.baseline.passed).toBe(5);
+    expect(report.harness.passed).toBe(5);
+    expect(report.qualityHeld).toBe(true);
+    expect(report.perTask.every((t) => t.harnessOutcome === "worker-approved")).toBe(true);
+
+    // THE BUG (pre-fix): orchestrate.ts's own `cost.totalUsd` silently drops
+    // the unpriced worker cost (addCost's null-skip semantics), so
+    // harness.costUsd looks like a real, priced (review-only) number and
+    // savingsPct comes out positive -- looking exactly like a legitimate
+    // "pass".
+    expect(report.harness.costUsd).not.toBeNull();
+    expect(report.savingsPct).not.toBeNull();
+    expect(report.savingsPct!).toBeGreaterThan(0);
+
+    // THE FIX (C1): a run where ANY model call went unpriced must never be
+    // reported as "pass" -- the savings figure above rests on an
+    // undercounted cost, not a real measurement.
+    expect(report.verdict).toBe("inconclusive");
+    expect(report.note).toContain("unpriced");
+    expect(report.note).toMatch(/\d+ model call\(s\) were unpriced/);
+    expect(harnessStatus(dir).evals).toBe("pending");
+  }, 30_000);
+});
 
 describe("runEvals — sample-size gate", () => {
   it("harness matches baseline (both pass), priced -- but too few tasks -> inconclusive even on a good run", async () => {

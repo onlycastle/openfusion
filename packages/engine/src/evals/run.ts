@@ -210,6 +210,7 @@
 // would measure — not an inflated one.
 import { randomUUID } from "node:crypto";
 import { execFile } from "node:child_process";
+import { existsSync } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -313,9 +314,15 @@ export interface EvalsReportCard {
   // raw number from being over-read as "fail"/"pass" on its own.
   qualityHeld: boolean;
   verdict: "pass" | "fail" | "inconclusive";
-  // Worst PricingConfidence across every cost record this run produced
-  // (engine.models.meter.totals().pricingConfidence) — taints the savings
-  // claim even when the arithmetic itself looks fine.
+  // Worst PricingConfidence across every cost record THIS RUN produced —
+  // genuinely run-scoped (M6 final review I2): a snapshot of
+  // engine.models.meter.recordCount() taken before the task loop below lets
+  // this be computed as engine.models.meter.totals(snapshotIndex), over only
+  // the records this call to runEvals itself added, never records left over
+  // from a prior run against the same long-lived engine (relevant from M7
+  // onward). Taints the savings claim even when the arithmetic itself looks
+  // fine. See also the `unpricedCalls`-driven verdict gate (C1) below, which
+  // reads the same run-scoped slice.
   pricingConfidence: PricingConfidence;
   perTask: PerTaskResult[];
   note: string;
@@ -478,14 +485,26 @@ async function runBaselineTask(
 // harness bundle is written into `dir` (see writeHarness call in the main
 // loop below) so that bundle stays untracked in this commit either way —
 // nothing downstream needs it committed (see this module's header comment).
+//
+// M2 (final review — cheap footgun): the "already a repo" probe checks for
+// `dir`'s OWN `.git` entry (a directory for a plain repo, or the "gitdir:
+// <path>" file `git worktree add`/task.setup()'s own history-strip mechanism
+// can leave behind) rather than shelling out to `git -C dir rev-parse
+// --is-inside-work-tree`. That command answers "is ANY ancestor of dir a git
+// repo", not "is dir ITSELF a repo root" — a false positive if the eval
+// scratch tmp root (`os.tmpdir()`, mkdtemp'd by the caller) ever happened to
+// be nested inside a git repo (e.g. a CI runner whose $TMPDIR lives under a
+// checkout) would wrongly conclude `dir` is already a repo and skip `git
+// init` here, silently anchoring every subsequent git operation this
+// pipeline runs against `dir` (requireGitRepo, WorktreeManager's `git
+// worktree add ... HEAD`, `git apply --3way`) to that OUTER repo instead of
+// a fresh one rooted at `dir`. Checking for `dir`'s own `.git` path has no
+// such ambiguity: it is only ever true when `dir` itself is a repo root.
 async function initEvalGitRepo(dir: string): Promise<void> {
-  try {
-    await execFileAsync("git", ["-C", dir, "rev-parse", "--is-inside-work-tree"]);
+  if (existsSync(path.join(dir, ".git"))) {
     // Already a git repo (task.setup() itself initialized one) — nothing
     // more to do.
     return;
-  } catch {
-    // Not a git repo yet — fall through and create one below.
   }
   await execFileAsync("git", ["-C", dir, "init", "-q"]);
   await execFileAsync("git", ["-C", dir, "config", "user.email", "eval@openfusion.local"]);
@@ -614,6 +633,16 @@ export async function runEvals(engine: Engine, params: EvalsRunParams): Promise<
 
   progress(engine, "start");
 
+  // C1 / I2 (final review): snapshot the meter's own record count BEFORE any
+  // task in this run makes a single model call. Every aggregate this
+  // function reads off the meter after the loop (pricingConfidence,
+  // unpricedCalls) is scoped to `meter.totals(runMeterStartIndex)` — records
+  // at or after this index — never the engine's whole-lifetime ledger. Under
+  // M7's long-lived engine, a prior unrelated run's records must not taint
+  // (or, for pricingConfidence, ever hide behind) this run's own report
+  // card. See CostMeter.recordCount()'s own doc comment.
+  const runMeterStartIndex = engine.models.meter.recordCount();
+
   let baselinePassed = 0;
   let harnessPassed = 0;
   let baselineCostTotal: number | null = null;
@@ -672,7 +701,12 @@ export async function runEvals(engine: Engine, params: EvalsRunParams): Promise<
   progress(engine, "done");
 
   const taskCount = params.tasks.length;
-  const pricingConfidence = engine.models.meter.totals().pricingConfidence;
+  // Run-scoped (C1 / I2): everything this run's own task loop added to the
+  // meter, and nothing else — see runMeterStartIndex's own doc comment
+  // above.
+  const runMeterTotals = engine.models.meter.totals(runMeterStartIndex);
+  const pricingConfidence = runMeterTotals.pricingConfidence;
+  const runUnpricedCalls = runMeterTotals.unpricedCalls;
   const savingsPct =
     baselineCostTotal !== null && harnessCostTotal !== null && baselineCostTotal > 0
       ? (baselineCostTotal - harnessCostTotal) / baselineCostTotal
@@ -781,6 +815,29 @@ export async function runEvals(engine: Engine, params: EvalsRunParams): Promise<
         ? "The baseline solved 0 of the clean (non-measurement-failed) tasks in this run -- there is nothing to " +
             "measure quality against."
         : "The baseline solved 0 of the tasks in this run -- there is nothing to measure quality against.",
+    );
+  } else if (runUnpricedCalls > 0) {
+    // C1 (final review, CRITICAL — the false-pass path): addCost's own
+    // null-skip semantics (this module's own addCost doc comment, and
+    // orchestrate.ts's identical copy) mean an unpriced COMPONENT of a cost
+    // total is silently dropped rather than making the whole total null —
+    // e.g. a harness task with a priced review but an UNPRICED worker call
+    // still gets a non-null `harnessUsd` (review cost only), so
+    // `cleanSavingsPct` below can come out positive and pass-shaped even
+    // though it rests on an undercounted harness cost. The
+    // `cleanSavingsPct === null` branch below only ever catches the
+    // ALL-unpriced case (every component null, so addCost never had a priced
+    // sibling to hide behind) — it can never catch this MIXED case, which is
+    // exactly the false "pass" this gate exists to close. Checked AFTER the
+    // ETH-fail and zero-baseline checks above (a genuine quality failure, or
+    // nothing to hold quality against, is real regardless of pricing — this
+    // gate only ever downgrades what would otherwise become a "pass") and
+    // BEFORE the sample-size/null-savings and "pass" branches below (the
+    // savings claim itself is untrustworthy, so it must never reach "pass").
+    verdict = "inconclusive";
+    extraNotes.push(
+      `${runUnpricedCalls} model call(s) were unpriced -- savings cannot be computed; run with priced models for ` +
+        "a savings claim.",
     );
   } else if (taskCount < MIN_TASK_COUNT_FOR_VERDICT || cleanSavingsPct === null) {
     // Too few tasks (a demo, not a claim) or an unpriced cost figure on the

@@ -162,7 +162,9 @@ The loop (realized in M6) works as follows:
    - **pass** if quality held, savings > 0, and sample size ≥ 5 tasks (credible: 20–50);
      manifest flips to verified.
    - **fail** if harness *degraded* quality on the clean subset (no measurement failures);
-     ETH hazard, never shipped.
+     ETH hazard, never shipped. This check deliberately ignores the ≥5-task sample-size
+     floor below: a quality regression is worth flagging even on a small run, since it
+     only ever blocks a claim, never inflates one.
    - **inconclusive** if too few tasks, unpriced, baseline solved zero, or ≥20% measurement
      failures (infra hiccups, apply mismatches — run too corrupted for "pass" or "fail").
 5. Cost figures are estimate-class (directional) and carry `pricingConfidence` (worst

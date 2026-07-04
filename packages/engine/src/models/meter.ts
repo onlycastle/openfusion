@@ -109,7 +109,23 @@ export class CostMeter {
     this.#records.push(r);
   }
 
-  totals(): MeterTotals {
+  // Number of records in the ledger right now. Lets a caller snapshot a
+  // starting index BEFORE some window of work (e.g. engine.evals.run's own
+  // task loop — see evals/run.ts) and later call `totals(sinceIndex)` to
+  // scope every aggregate (including `unpricedCalls` and
+  // `pricingConfidence`) to just the records produced during that window,
+  // rather than the engine's whole lifetime ledger. Exists specifically for
+  // M6 final review I2 (run-scoped pricingConfidence) and C1 (the
+  // unpriced-calls gate) — under M7's long-lived engine, unrelated prior
+  // records must not taint a single run's own report card.
+  recordCount(): number {
+    return this.#records.length;
+  }
+
+  // `sinceIndex` (default 0 — the whole ledger, this class's original
+  // behavior) scopes every aggregate to records at that index or later, per
+  // `recordCount()`'s own doc comment above.
+  totals(sinceIndex = 0): MeterTotals {
     const totals: MeterTotals = {
       calls: 0,
       inputTokens: 0,
@@ -119,15 +135,17 @@ export class CostMeter {
       unpricedCalls: 0,
       byModel: {},
       bySource: {},
-      // Vacuous best case for an empty ledger — see CONFIDENCE_RANK's doc
-      // comment. Downgraded below as records are folded in.
+      // Vacuous best case for an empty ledger (or an empty since-index
+      // slice) — see CONFIDENCE_RANK's doc comment. Downgraded below as
+      // records are folded in.
       pricingConfidence: "verified",
     };
     let worstRank = CONFIDENCE_RANK.verified;
     let hasVerified = false;
     let hasProviderReported = false;
 
-    for (const r of this.#records) {
+    const records = sinceIndex > 0 ? this.#records.slice(sinceIndex) : this.#records;
+    for (const r of records) {
       totals.calls += 1;
       totals.inputTokens += r.usage.inputTokens;
       totals.outputTokens += r.usage.outputTokens;

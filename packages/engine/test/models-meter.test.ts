@@ -183,3 +183,58 @@ describe("CostMeter — totals().pricingConfidence (worst across all records)", 
     expect(meter.totals().pricingConfidence).toBe("unpriced");
   });
 });
+
+// M6 final review (C1 / I2): recordCount() + totals(sinceIndex) let a caller
+// (engine.evals.run) scope every aggregate to a window of records added
+// during ITS OWN run, not the engine's whole-lifetime ledger — see run.ts's
+// own runMeterStartIndex.
+describe("CostMeter — recordCount() + totals(sinceIndex) run-scoping", () => {
+  it("recordCount() reflects the number of records seen so far", () => {
+    const meter = new CostMeter();
+    expect(meter.recordCount()).toBe(0);
+    meter.record(record());
+    expect(meter.recordCount()).toBe(1);
+    meter.record(record());
+    expect(meter.recordCount()).toBe(2);
+  });
+
+  it("totals(sinceIndex) excludes records recorded before sinceIndex from every aggregate", () => {
+    const meter = new CostMeter();
+    // Prior "unrelated" records — verified, priced — as if left over from an
+    // earlier run against the same long-lived engine.
+    meter.record(record({ pricingConfidence: "verified", costUsd: 1 }));
+    meter.record(record({ pricingConfidence: "verified", costUsd: 1 }));
+    const sinceIndex = meter.recordCount();
+
+    // "This run"'s own records: one unpriced call alongside a priced one.
+    meter.record(record({ pricingConfidence: "unpriced", costUsd: null }));
+    meter.record(record({ pricingConfidence: "verified", costUsd: 2 }));
+
+    const wholeLedger = meter.totals();
+    expect(wholeLedger.calls).toBe(4);
+    expect(wholeLedger.unpricedCalls).toBe(1);
+
+    const thisRunOnly = meter.totals(sinceIndex);
+    expect(thisRunOnly.calls).toBe(2);
+    expect(thisRunOnly.unpricedCalls).toBe(1);
+    expect(thisRunOnly.pricingConfidence).toBe("unpriced");
+    expect(thisRunOnly.costUsd).toBe(2);
+  });
+
+  it("totals(sinceIndex) at the CURRENT recordCount() (nothing added yet) reports the vacuous empty case", () => {
+    const meter = new CostMeter();
+    meter.record(record({ pricingConfidence: "unpriced", costUsd: null }));
+    const sinceIndex = meter.recordCount();
+
+    const emptySlice = meter.totals(sinceIndex);
+    expect(emptySlice.calls).toBe(0);
+    expect(emptySlice.unpricedCalls).toBe(0);
+    expect(emptySlice.pricingConfidence).toBe("verified");
+  });
+
+  it("totals() with no argument is unchanged: the whole ledger, default sinceIndex 0", () => {
+    const meter = new CostMeter();
+    meter.record(record({ pricingConfidence: "secondary" }));
+    expect(meter.totals()).toEqual(meter.totals(0));
+  });
+});

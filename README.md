@@ -68,10 +68,12 @@ routing as unproven against your project until then.
 by the same oracle (the repo's own test suite). The report card carries three verdicts:
 
 - **pass**: the harness held quality on all clean tasks (no measurement failures), saved
-  cost, and the sample size (20–50 tasks) supports a credible claim. Manifest flips to
+  cost, and the sample size is ≥5 tasks (a credible claim wants 20–50). Manifest flips to
   verified. This is the only report that ships as a savings win.
 - **fail**: the harness *degraded* quality below baseline on the clean subset — a genuine
   ETH hazard (generated context can hurt). Flagged and never shipped, regardless of cost.
+  This check deliberately ignores the sample-size minimum below: a quality regression is
+  worth flagging even on a small run, since it only ever blocks a claim, never inflates one.
 - **inconclusive**: one of: (1) too few tasks (<5 is a demo, not a claim); (2) unpriced
   cost figures (an unknown model or no cost data → no savings number → no claim);
   (3) baseline solved zero tasks (nothing to hold quality against);
