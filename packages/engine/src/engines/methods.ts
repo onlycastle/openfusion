@@ -257,13 +257,16 @@ export function registerFrontierMethods(engine: Engine): void {
           // dollar figure the Claude Code CLI itself reports for the turn
           // (message.total_cost_usd, threaded through as result.costUsd by
           // claude.ts). That is the provider's own ground truth, so
-          // "verified" here means something stronger than a verified row in
-          // our own pricing table. The null case (an adapter that can't
-          // report a cost at all — no such path exists for claude-code
-          // today, but the FrontierEvent type allows it for a future
-          // engine) is "unpriced", matching the models.complete/worker rule
-          // of "no cost figure at all" -> "unpriced".
-          pricingConfidence: result.costUsd !== null ? "verified" : "unpriced",
+          // "provider-reported" reflects its distinct provenance (the literal
+          // amount billed) vs our sourced pricing table. It ranks equal to
+          // "verified" (both rank 3) so a meter mixing frontier provider-reported
+          // + verified-table costs stays at top confidence, while the label
+          // remains distinct for the report card to display provenance.
+          // The null case (an adapter that can't report a cost at all — no such
+          // path exists for claude-code today, but the FrontierEvent type allows
+          // it for a future engine) is "unpriced", matching the models.complete/worker
+          // rule of "no cost figure at all" -> "unpriced".
+          pricingConfidence: result.costUsd !== null ? "provider-reported" : "unpriced",
         });
       },
     }),

@@ -143,4 +143,43 @@ describe("CostMeter — totals().pricingConfidence (worst across all records)", 
     meter.record(record({ pricingConfidence: "secondary" }));
     expect(meter.totals().pricingConfidence).toBe("unpriced");
   });
+
+  // Finding 1: provider-reported confidence (from frontier CLI cost) ranks
+  // EQUAL to verified (both rank 3) so a meter mixing frontier provider-reported
+  // + verified-table costs stays at the top confidence. Label is still distinct
+  // for the report card to display provenance. When worst rank is shared,
+  // prefer "verified" if any verified record exists.
+  it("provider-reported ranks equal to verified (both rank 3)", () => {
+    const meter = new CostMeter();
+    meter.record(record({ pricingConfidence: "provider-reported" }));
+    meter.record(record({ pricingConfidence: "secondary" }));
+    expect(meter.totals().pricingConfidence).toBe("secondary");
+  });
+
+  it("a single provider-reported record reports provider-reported", () => {
+    const meter = new CostMeter();
+    meter.record(record({ pricingConfidence: "provider-reported" }));
+    expect(meter.totals().pricingConfidence).toBe("provider-reported");
+  });
+
+  it("verified + provider-reported (rank tie): prefers verified label", () => {
+    const meter = new CostMeter();
+    meter.record(record({ pricingConfidence: "verified" }));
+    meter.record(record({ pricingConfidence: "provider-reported" }));
+    expect(meter.totals().pricingConfidence).toBe("verified");
+  });
+
+  it("provider-reported alone (no verified): reports provider-reported label", () => {
+    const meter = new CostMeter();
+    meter.record(record({ pricingConfidence: "provider-reported" }));
+    meter.record(record({ pricingConfidence: "provider-reported" }));
+    expect(meter.totals().pricingConfidence).toBe("provider-reported");
+  });
+
+  it("provider-reported + unpriced: unpriced wins (rank 0 < 3)", () => {
+    const meter = new CostMeter();
+    meter.record(record({ pricingConfidence: "provider-reported" }));
+    meter.record(record({ pricingConfidence: "unpriced", costUsd: null }));
+    expect(meter.totals().pricingConfidence).toBe("unpriced");
+  });
 });

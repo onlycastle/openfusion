@@ -35,10 +35,14 @@ export type UsageSource =
 // How much to trust `costUsd` for this record. Set at record() call time
 // from the looked-up ModelPricing's own `confidence` field, or "unpriced"
 // when no pricing entry was found at all (costUsd is null in that case).
+// "provider-reported" is used when the cost comes directly from the provider's
+// own reported figure (e.g., frontier CLI's total_cost_usd), not derived from
+// our verified PRICING table — ranks equal to "verified" as trustworthy since
+// it's the literal amount billed, but the label is distinct for provenance.
 // Surfaced so a consumer (the M6 savings report card) can flag a cost
 // figure that rests on a secondary/unverified/absent price rather than
 // trusting every costUsd number equally.
-export type PricingConfidence = "verified" | "secondary" | "unverified" | "unpriced";
+export type PricingConfidence = "verified" | "provider-reported" | "secondary" | "unverified" | "unpriced";
 
 // One successful `engine.models.complete` attempt. Failed attempts are never
 // recorded here — only what actually consumed tokens (see methods.ts).
@@ -84,12 +88,16 @@ export interface MeterTotals {
 // entry found at all, costUsd null) is worse than "unverified" (a priced
 // entry we simply haven't confirmed against an official source yet) is
 // worse than "secondary" (soft-documented / endpoint-pinned) is worse than
-// "verified".
+// "verified" and "provider-reported" (equal rank 3).
+// "provider-reported" (e.g., frontier CLI's own reported cost) ranks equal
+// to "verified" since both are authoritative — it's the literal amount billed
+// or our sourced verified table. The label is distinct for provenance display.
 const CONFIDENCE_RANK: Record<PricingConfidence, number> = {
   unpriced: 0,
   unverified: 1,
   secondary: 2,
   verified: 3,
+  "provider-reported": 3,
 };
 
 // In-memory cost/usage ledger for the engine process's lifetime. Never
@@ -116,6 +124,8 @@ export class CostMeter {
       pricingConfidence: "verified",
     };
     let worstRank = CONFIDENCE_RANK.verified;
+    let hasVerified = false;
+    let hasProviderReported = false;
 
     for (const r of this.#records) {
       totals.calls += 1;
@@ -129,10 +139,21 @@ export class CostMeter {
         totals.costUsd += r.costUsd;
       }
 
+      if (r.pricingConfidence === "verified") {
+        hasVerified = true;
+      }
+      if (r.pricingConfidence === "provider-reported") {
+        hasProviderReported = true;
+      }
+
       const rank = CONFIDENCE_RANK[r.pricingConfidence];
       if (rank < worstRank) {
         worstRank = rank;
         totals.pricingConfidence = r.pricingConfidence;
+      } else if (rank === worstRank && rank === CONFIDENCE_RANK.verified && totals.pricingConfidence === "verified" && r.pricingConfidence === "provider-reported") {
+        // First provider-reported record at rank 3: update the label, but
+        // prefer "verified" at the end if any verified record exists
+        totals.pricingConfidence = "provider-reported";
       }
 
       const key = `${r.kind}/${r.model}`;
@@ -159,6 +180,15 @@ export class CostMeter {
       sourceEntry.outputTokens += r.usage.outputTokens;
       if (r.costUsd !== null) sourceEntry.costUsd += r.costUsd;
       totals.bySource[r.source] = sourceEntry;
+    }
+
+    // When worst rank is 3 (both "verified" and "provider-reported" share this rank),
+    // prefer the "verified" label if any verified record exists, for determinism.
+    // This ensures a meter mixing frontier provider-reported + table-verified costs
+    // reports "verified" (same highest rank, preferred label). A meter with ONLY
+    // provider-reported reports "provider-reported" (its own distinct label).
+    if (worstRank === CONFIDENCE_RANK.verified && hasVerified && hasProviderReported && totals.pricingConfidence === "provider-reported") {
+      totals.pricingConfidence = "verified";
     }
 
     return totals;

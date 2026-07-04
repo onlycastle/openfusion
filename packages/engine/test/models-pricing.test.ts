@@ -98,32 +98,35 @@ describe("PRICING — 2026-07-04 refresh", () => {
     });
   });
 
-  it("qwen3-coder-next: updated rates with a cache-read price, still verified", () => {
+  // Finding 2: OpenRouter qwen/minimax have multi-endpoint price spread, so
+  // confidence is downgraded to "secondary" — we can't know which endpoint
+  // served a call, so the price is genuinely uncertain (same caveat as kimi).
+  it("qwen3-coder-next: secondary confidence due to multi-endpoint spread", () => {
     expect(lookupPricing("openai-compatible", "qwen3-coder-next")).toMatchObject({
       inputPerMtok: 0.11,
       outputPerMtok: 0.8,
       cacheReadPerMtok: 0.07,
-      confidence: "verified",
+      confidence: "secondary",
       verifiedAt: REFRESH_DATE,
     });
   });
 
-  it("adds openai-compatible/qwen3-coder", () => {
+  it("qwen3-coder: secondary confidence due to multi-endpoint spread", () => {
     expect(lookupPricing("openai-compatible", "qwen3-coder")).toMatchObject({
       inputPerMtok: 0.22,
       outputPerMtok: 1.8,
       cacheReadPerMtok: 0.1,
-      confidence: "verified",
+      confidence: "secondary",
       verifiedAt: REFRESH_DATE,
     });
   });
 
-  it("adds openai-compatible/minimax-m2.5", () => {
+  it("minimax-m2.5: secondary confidence due to multi-endpoint spread", () => {
     expect(lookupPricing("openai-compatible", "minimax-m2.5")).toMatchObject({
       inputPerMtok: 0.15,
       outputPerMtok: 1.0,
       cacheReadPerMtok: 0.03,
-      confidence: "verified",
+      confidence: "secondary",
       verifiedAt: REFRESH_DATE,
     });
   });

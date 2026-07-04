@@ -89,17 +89,17 @@ export const PRICING: Record<string, ModelPricing> = {
     confidence: "verified",
   },
   // OpenRouter multi-endpoint spread (doc's meter-shape notes): qwen/minimax
-  // route through 4-16 differently-priced endpoints, so "the OpenRouter
-  // price" is not a single number — these three rows pin the specific
-  // endpoint the doc verified rather than downgrading confidence; re-verify
-  // per-endpoint before relying on this for high-precision billing.
+  // route through 4-16 differently-priced endpoints, so we can't know which
+  // endpoint served a call — confidence is "secondary" (same caveat as kimi).
+  // These rows pin a specific endpoint the doc verified, but the shipped
+  // price is genuinely uncertain without knowing which endpoint routed the call.
   "openai-compatible/qwen3-coder-next": {
     inputPerMtok: 0.11,
     outputPerMtok: 0.8,
     cacheReadPerMtok: 0.07,
     source: `${SOURCE} — OpenRouter multi-endpoint spread; price pinned to the doc's verified endpoint`,
     verifiedAt: VERIFIED_AT,
-    confidence: "verified",
+    confidence: "secondary",
   },
   "openai-compatible/qwen3-coder": {
     inputPerMtok: 0.22,
@@ -107,7 +107,7 @@ export const PRICING: Record<string, ModelPricing> = {
     cacheReadPerMtok: 0.1,
     source: `${SOURCE} — OpenRouter multi-endpoint spread; price pinned to the doc's verified endpoint`,
     verifiedAt: VERIFIED_AT,
-    confidence: "verified",
+    confidence: "secondary",
   },
   "openai-compatible/minimax-m2.5": {
     inputPerMtok: 0.15,
@@ -115,7 +115,7 @@ export const PRICING: Record<string, ModelPricing> = {
     cacheReadPerMtok: 0.03,
     source: `${SOURCE} — OpenRouter multi-endpoint spread; price pinned to the doc's verified endpoint (promo 0.12/0.48 also observed)`,
     verifiedAt: VERIFIED_AT,
-    confidence: "verified",
+    confidence: "secondary",
   },
   // Reference rows for counterfactual cost comparisons — not callable
   // provider/model presets (no "reference" ProviderConfig kind exists).
