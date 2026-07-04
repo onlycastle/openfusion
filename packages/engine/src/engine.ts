@@ -1,4 +1,5 @@
 import { RpcDispatcher } from "./rpc/dispatcher.js";
+import { EvalsService, registerEvalsMethods } from "./evals/methods.js";
 import { FrontierService, registerFrontierMethods } from "./engines/methods.js";
 import { HarnessService, registerHarnessMethods } from "./harness/methods.js";
 import { registerCoreMethods } from "./methods.js";
@@ -27,6 +28,7 @@ export class Engine {
   readonly harness = new HarnessService();
   readonly worker = new WorkerService();
   readonly orchestrate = new OrchestrateService();
+  readonly evals = new EvalsService();
 
   constructor(options: EngineOptions = {}) {
     this.log = options.log ?? (() => {});
@@ -46,6 +48,14 @@ export class Engine {
     // constructor's own reading order matching the real dependency
     // direction.
     registerOrchestrateMethods(this);
+    // Registered LAST of all: engine.evals.run composes engine.orchestrate
+    // (the harness side of the report card) AND engine.frontier/worker
+    // directly (the baseline side + worktree cleanup) — it must be able to
+    // reach every method engine.orchestrate itself depends on, so this stays
+    // ordered after it for the same "constructor reading order matches
+    // dependency direction" reason (registration order itself doesn't gate
+    // anything — dispatch() resolves handlers at CALL time).
+    registerEvalsMethods(this);
   }
 
   async close(): Promise<void> {
@@ -133,3 +143,9 @@ export type { ReviewVerdict, ReviewDiffInput, ReviewDiffOpts } from "./orchestra
 export { OrchestrateService, registerOrchestrateMethods } from "./orchestrate/methods.js";
 export { orchestrate } from "./orchestrate/orchestrate.js";
 export type { OrchestrateParams, OrchestrateAttempt, OrchestrateResult } from "./orchestrate/orchestrate.js";
+export { runOracle, synthEvalTask, goldenTaskFromCommit } from "./evals/tasks.js";
+export type { EvalTask, OracleResult, SynthEvalTaskOptions } from "./evals/tasks.js";
+export { EvalsService, registerEvalsMethods } from "./evals/methods.js";
+export { runEvals } from "./evals/run.js";
+export type { EvalsRunParams, EvalsReportCard, PerTaskResult, HarnessTaskOutcome } from "./evals/run.js";
+export { setEvalsVerdict } from "./harness/store.js";

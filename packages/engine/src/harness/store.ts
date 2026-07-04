@@ -435,3 +435,42 @@ export function harnessStatus(projectDir: string): {
     headSha: manifest.headSha,
   };
 }
+
+// M6 Task 4 (the ETH-hazard gate manifest flip): updates ONLY
+// manifest.verification.evals, in place — every other manifest field
+// (schemaVersion, generatorVersion, engine, headSha, generatedAt,
+// verification.structural, and — load-bearing — `artifacts`, the pruning
+// bookkeeping writeHarness relies on) is preserved verbatim. Deliberately
+// does NOT go through writeHarness/HarnessBundleSchema (which would require
+// re-reading and re-validating wiki/agents/routing just to flip one boolean-
+// ish field, and would rewrite every artifact file on disk for no content
+// change): this reads manifest.json directly and rewrites ONLY that one
+// file, reusing atomicWriteFile for the same tmp-then-rename atomicity
+// writeHarness itself relies on. Since manifest.json is the ONLY file this
+// function touches, "manifest-last atomicity" is trivially satisfied — there
+// is nothing else to sequence before it.
+//
+// Throws HarnessValidationError (not a silent no-op) when no harness has
+// been generated yet, or the on-disk manifest is corrupt/invalid — flipping
+// an evals verdict for a harness that doesn't exist (or can't be trusted) is
+// a caller error, not a case to swallow quietly. engine.evals.run
+// (evals/run.ts) calls this only on "pass"/"fail" verdicts; an
+// "inconclusive" run deliberately never calls this at all, leaving whatever
+// value was already on disk (typically "pending" from generation, but also
+// possibly a prior real run's "pass"/"fail" — this function does not force
+// it back to "pending").
+export async function setEvalsVerdict(
+  projectDir: string,
+  verdict: Manifest["verification"]["evals"],
+): Promise<void> {
+  const mPath = manifestPath(projectDir);
+  if (!existsSync(mPath)) {
+    throw new HarnessValidationError("no harness; run engine.harness.generate first");
+  }
+  const manifest = parseManifestFile(mPath);
+  const updated: Manifest = {
+    ...manifest,
+    verification: { ...manifest.verification, evals: verdict },
+  };
+  await atomicWriteFile(mPath, `${JSON.stringify(updated, null, 2)}\n`);
+}
