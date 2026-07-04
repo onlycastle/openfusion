@@ -187,6 +187,26 @@ async function git(cwd: string, args: string[]): Promise<string> {
 // brief. A later version could apply the commit's test-only hunks
 // separately from its source hunks to lift this constraint; that is
 // explicitly out of scope here.
+//
+// SIGNATURE DEVIATION: This function's 3-arg signature (repoDir,
+// commitSha, testCommand) deviates from the plan's literal 2-arg
+// specification. The deviation is intentional: test-command detection
+// and selection is the caller's responsibility in v1, not a
+// responsibility of this function. Callers must supply testCommand
+// explicitly based on their own repo analysis.
+//
+// SECURITY SCOPE: The "unreachable by construction" guarantee refers ONLY
+// to the git object graph of the produced directory -- no history, remote,
+// alternates, or reflog points back at repoDir. It does NOT guarantee an
+// agent process cannot reach repoDir by another channel (e.g., a known
+// filesystem path + `git fetch <repoDir> <sha>`, since the target commit
+// is a live ref there; or a raw filesystem read of repoDir/.git). The
+// calling eval harness MUST place the eval directory away from repoDir
+// and rely on the worker/orchestrate sandbox (cwd-pinned bash; full
+// process isolation deferred to M7) to keep an adversarial worker from
+// reaching repoDir. This module guarantees only that it hands the agent
+// no pointer to repoDir in the returned task (id/prompt/testCommand carry
+// no such leak).
 export async function goldenTaskFromCommit(
   repoDir: string,
   commitSha: string,
