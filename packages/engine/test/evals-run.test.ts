@@ -759,6 +759,23 @@ describe("runEvals — measurement-failure gate applies symmetrically to pass an
     expect(report.verdict).toBe("inconclusive");
     expect(report.note).toContain("2 of 5 task(s) hit a measurement failure");
     expect(harnessStatus(dir).evals).toBe("pending");
+
+    // M7c Task 1: the structured clean-subset fields must match the EXACT
+    // numbers the verdict above was computed from (see the "clean subset"
+    // block in runEvals) -- not the raw, all-task figures. Clean subset here
+    // is t3/t4/t5 (t1/t2 measurement-failed on the baseline side):
+    // baseline passes all 3 clean tasks, harness passes only t3 of the 3.
+    expect(report.measurementFailureCount).toBe(2);
+    expect(report.cleanTaskCount).toBe(3);
+    expect(report.cleanBaselinePassed).toBe(3);
+    expect(report.cleanHarnessPassed).toBe(1);
+    // Clean-subset cost: baseline 0.5 * 3 = 1.5, harness 0.05 * 3 = 0.15 ->
+    // (1.5 - 0.15) / 1.5 = 0.9 -- deliberately different from the raw,
+    // all-task report.savingsPct (~0.833) asserted above, proving these are
+    // genuinely the clean-subset figures and not a copy of the raw ones.
+    expect(report.cleanSavingsPct).not.toBeNull();
+    expect(report.cleanSavingsPct!).toBeCloseTo(0.9, 5);
+    expect(report.cleanSavingsPct).not.toBeCloseTo(report.savingsPct!, 2);
   }, 30_000);
 });
 
@@ -851,6 +868,14 @@ describe("runEvals — genuine pass", () => {
     expect(report.savingsPct).toBeCloseTo(0.9, 5);
     expect(report.verdict).toBe("pass");
     expect(harnessStatus(dir).evals).toBe("pass");
+
+    // M7c Task 1: on a run with NO measurement failures, the clean-subset
+    // structured fields equal the raw, all-task figures exactly.
+    expect(report.measurementFailureCount).toBe(0);
+    expect(report.cleanTaskCount).toBe(report.taskCount);
+    expect(report.cleanBaselinePassed).toBe(report.baseline.passed);
+    expect(report.cleanHarnessPassed).toBe(report.harness.passed);
+    expect(report.cleanSavingsPct).toBeCloseTo(report.savingsPct!, 5);
   }, 30_000);
 });
 

@@ -166,3 +166,64 @@ describe("wiki RPC methods", () => {
     expect(res.result.truncated).toBe(false);
   }, 30_000);
 });
+
+describe("wiki RPC methods — wiki.build.progress notifications (M7c Task 1)", () => {
+  it("emits wiki.build.progress with {projectDir, detail} matching the invoked projectDir, never leaking file content", async () => {
+    dir = mkdtempSync(path.join(os.tmpdir(), "of-rpc-progress-"));
+    execFileSync("git", ["init", "-q", dir]);
+    execFileSync("git", ["-C", dir, "config", "user.email", "t@t"]);
+    execFileSync("git", ["-C", dir, "config", "user.name", "t"]);
+    const SENTINEL = "SUPER_SECRET_RPC_CONTENT_SENTINEL_7c1b";
+    writeFileSync(path.join(dir, "secret.ts"), `// ${SENTINEL}\nexport function withSecret() {}\n`);
+    for (let i = 0; i < 5; i += 1) {
+      writeFileSync(path.join(dir, `f${i}.ts`), `export function fn${i}() {}\n`);
+    }
+    execFileSync("git", ["-C", dir, "add", "-A"]);
+    execFileSync("git", ["-C", dir, "commit", "-qm", "init"]);
+
+    const notifications: Array<{ method: string; params: unknown }> = [];
+    engine = createEngine({ notify: (method, params) => notifications.push({ method, params }) });
+
+    const res = await call("engine.wiki.build", { projectDir: dir });
+    expect(res.error).toBeUndefined();
+
+    const progressNotifications = notifications.filter((n) => n.method === "wiki.build.progress");
+    expect(progressNotifications.length).toBeGreaterThan(0);
+    for (const n of progressNotifications) {
+      const params = n.params as { projectDir?: string; detail?: string };
+      expect(params.projectDir).toBe(dir);
+      expect(typeof params.detail).toBe("string");
+      expect(params.detail!.length).toBeGreaterThan(0);
+      expect(params.detail).not.toContain(SENTINEL);
+    }
+  }, 30_000);
+
+  it("echoes back the caller's exact projectDir string, not a resolved/canonicalized path", async () => {
+    // dir + "/." resolves to the SAME directory but is not byte-identical to
+    // its resolved form (resolveProjectKey strips the trailing "."). A
+    // subscriber's own filter (e.g. the desktop ProjectScreen) compares
+    // params.projectDir against the exact string it itself passed in, so the
+    // notification must echo that raw string back, never
+    // resolveProjectKey(projectDir)'s canonicalized output.
+    dir = mkdtempSync(path.join(os.tmpdir(), "of-rpc-progress-raw-"));
+    execFileSync("git", ["init", "-q", dir]);
+    execFileSync("git", ["-C", dir, "config", "user.email", "t@t"]);
+    execFileSync("git", ["-C", dir, "config", "user.name", "t"]);
+    writeFileSync(path.join(dir, "x.ts"), "export function xray() {}\n");
+    execFileSync("git", ["-C", dir, "add", "-A"]);
+    execFileSync("git", ["-C", dir, "commit", "-qm", "init"]);
+
+    const rawProjectDir = `${dir}${path.sep}.`;
+    const notifications: Array<{ method: string; params: unknown }> = [];
+    engine = createEngine({ notify: (method, params) => notifications.push({ method, params }) });
+
+    const res = await call("engine.wiki.build", { projectDir: rawProjectDir });
+    expect(res.error).toBeUndefined();
+
+    const progressNotifications = notifications.filter((n) => n.method === "wiki.build.progress");
+    expect(progressNotifications.length).toBeGreaterThan(0);
+    for (const n of progressNotifications) {
+      expect((n.params as { projectDir: string }).projectDir).toBe(rawProjectDir);
+    }
+  }, 30_000);
+});

@@ -333,6 +333,19 @@ export interface EvalsReportCard {
   pricingConfidence: PricingConfidence;
   perTask: PerTaskResult[];
   note: string;
+  // M7c Task 1: the CLEAN-SUBSET numbers the verdict computation above was
+  // ACTUALLY computed from (see the "clean subset" comments in runEvals'
+  // own body) — surfaced as structured fields, additively, so a caller (the
+  // eval cockpit screen) can show WHY a verdict is what it is (e.g.
+  // "inconclusive: 3/8 tasks had measurement failures; clean subset harness
+  // 4/5 vs baseline 4/5") without re-deriving them from `perTask` itself.
+  // Purely additive: no verdict-logic change — these are the exact same
+  // values `verdict` above was branched on.
+  cleanTaskCount: number;
+  cleanBaselinePassed: number;
+  cleanHarnessPassed: number;
+  cleanSavingsPct: number | null;
+  measurementFailureCount: number;
 }
 
 // Null-safe running total — same shape as orchestrate.ts's own addCost (and
@@ -937,5 +950,10 @@ export async function runEvals(engine: Engine, params: EvalsRunParams): Promise<
     pricingConfidence,
     perTask,
     note: buildNote({ taskCount, pricingConfidence, sampleNote: params.sampleNote, extraNotes }),
+    cleanTaskCount: cleanTasks.length,
+    cleanBaselinePassed,
+    cleanHarnessPassed,
+    cleanSavingsPct,
+    measurementFailureCount,
   };
 }

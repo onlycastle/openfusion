@@ -18,6 +18,23 @@ export interface IndexStats {
 
 const MAX_FILE_BYTES = 1024 * 1024;
 
+// M7c Task 1 (the M7b-flagged gap): buildIndex previously ran silently from
+// the caller's point of view — engine.wiki.build had no progress signal at
+// all, unlike engine.orchestrate/engine.evals.run's own `*.progress`
+// notifications. `onProgress`, when supplied, is called with a short,
+// human-readable phase/count string ("indexed 42/120 files (last:
+// src/foo.ts)") — a PATH or COUNT, NEVER file contents (the loop below never
+// passes file source text to it, only `relPath`/counters).
+//
+// CADENCE: reuses the SAME `PROGRESS_INTERVAL` (25 files) the loop already
+// yields the event loop on, so this never floods a large repo with a
+// notification per file. A caller gets: one "scanning N files" message up
+// front, one "indexed X/N files" message every 25 processed files, and one
+// final "indexed X/N files (skipped/failed)" summary — bounded to
+// `~2 + floor(N/25)` calls regardless of repo size, not O(N).
+export type BuildIndexProgress = (detail: string) => void;
+const PROGRESS_INTERVAL = 25;
+
 export function getHeadSha(projectDir: string): string {
   return execFileSync("git", ["-C", projectDir, "rev-parse", "HEAD"], {
     encoding: "utf8",
@@ -37,12 +54,15 @@ export async function buildIndex(
   projectDir: string,
   store: WikiStore,
   parser: WikiParser,
+  onProgress?: BuildIndexProgress,
 ): Promise<IndexStats> {
   const headSha = getHeadSha(projectDir);
   const extensions = parser.supportedExtensions();
   const tracked = listTrackedFiles(projectDir).filter((p) =>
     extensions.has(path.extname(p)),
   );
+  const total = tracked.length;
+  onProgress?.(`scanning ${total} file${total === 1 ? "" : "s"}`);
 
   let filesIndexed = 0;
   let filesSkipped = 0;
@@ -54,7 +74,8 @@ export async function buildIndex(
   for (const relPath of tracked) {
     seen.add(relPath);
     processed += 1;
-    if (processed % 25 === 0) {
+    if (processed % PROGRESS_INTERVAL === 0) {
+      onProgress?.(`indexed ${processed}/${total} files (last: ${relPath})`);
       await new Promise<void>((resolve) => setImmediate(resolve));
     }
     const absPath = path.join(projectDir, relPath);
@@ -98,6 +119,10 @@ export async function buildIndex(
 
   const removals = store.listFiles().filter((known) => !seen.has(known));
   store.applyBuild(updates, removals, { headSha });
+
+  onProgress?.(
+    `indexed ${filesIndexed}/${total} files (${filesSkipped} skipped, ${filesFailed} failed)`,
+  );
 
   const counts = store.counts();
   return {

@@ -135,6 +135,61 @@ describe("buildIndex", () => {
   }, 30_000);
 });
 
+describe("buildIndex — onProgress callback (M7c Task 1)", () => {
+  it("emits a bounded number of progress calls for a many-file repo, never one per file", async () => {
+    dir = mkdtempSync(path.join(os.tmpdir(), "of-idx-progress-"));
+    execFileSync("git", ["init", "-q", dir]);
+    execFileSync("git", ["-C", dir, "config", "user.email", "t@t"]);
+    execFileSync("git", ["-C", dir, "config", "user.name", "t"]);
+    const fileCount = 120;
+    for (let i = 0; i < fileCount; i += 1) {
+      writeFileSync(path.join(dir, `f${i}.ts`), `export function fn${i}() {}\n`);
+    }
+    execFileSync("git", ["-C", dir, "add", "-A"]);
+    execFileSync("git", ["-C", dir, "commit", "-qm", "many"]);
+    store = openWikiStore(dir);
+
+    const calls: string[] = [];
+    const stats = await buildIndex(dir, store, parser, (detail) => calls.push(detail));
+
+    expect(stats.filesIndexed).toBe(fileCount);
+    expect(calls.length).toBeGreaterThan(0);
+    // Bounded cadence: nowhere near one notification per file (120 files) —
+    // generously bounded well under half the file count so this can't flake
+    // on cadence tuning, while still proving it isn't O(files).
+    expect(calls.length).toBeLessThan(fileCount / 2);
+    for (const detail of calls) {
+      expect(typeof detail).toBe("string");
+      expect(detail.length).toBeGreaterThan(0);
+    }
+    // The final summary call carries the total count.
+    expect(calls.some((d) => d.includes(`${fileCount}`))).toBe(true);
+  }, 30_000);
+
+  it("never includes file CONTENT in a progress detail — only paths/counts", async () => {
+    dir = mkdtempSync(path.join(os.tmpdir(), "of-idx-progress-content-"));
+    execFileSync("git", ["init", "-q", dir]);
+    execFileSync("git", ["-C", dir, "config", "user.email", "t@t"]);
+    execFileSync("git", ["-C", dir, "config", "user.name", "t"]);
+    const SENTINEL = "SUPER_SECRET_FILE_CONTENT_SENTINEL_9f3a";
+    writeFileSync(path.join(dir, "secret.ts"), `// ${SENTINEL}\nexport function withSecret() {}\n`);
+    for (let i = 0; i < 5; i += 1) {
+      writeFileSync(path.join(dir, `f${i}.ts`), `export function fn${i}() {}\n`);
+    }
+    execFileSync("git", ["-C", dir, "add", "-A"]);
+    execFileSync("git", ["-C", dir, "commit", "-qm", "with secret"]);
+    store = openWikiStore(dir);
+
+    const calls: string[] = [];
+    await buildIndex(dir, store, parser, (detail) => calls.push(detail));
+
+    expect(calls.length).toBeGreaterThan(0);
+    for (const detail of calls) {
+      expect(detail).not.toContain(SENTINEL);
+    }
+  });
+});
+
 describe("getHeadSha", () => {
   it("throws outside a git repository", () => {
     const plain = mkdtempSync(path.join(os.tmpdir(), "of-nogit-"));
