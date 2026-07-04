@@ -103,7 +103,27 @@ function main() {
   chmodSync(destBinary, 0o755);
   cpSync(srcAssets, destAssets, { recursive: true });
 
-  log(`staged ${binaryName} (+ .assets) into ${path.relative(repoRoot, binariesDir)}/`);
+  // M8: `tauri.conf.json`'s `bundle.resources` ships `.assets/` into the
+  // packaged app's `Contents/Resources/assets` (see
+  // `apps/desktop/src-tauri/src/lib.rs`'s `resolve_packaged_assets_dir` doc
+  // comment for the Rust-side half of this mapping). `tauri.conf.json` is a
+  // static, non-templated file, so its `resources` map needs a FIXED
+  // (non-triple-suffixed) source path -- it cannot glob/interpolate the
+  // host's target triple the way `bundle.externalBin` does for the binary
+  // itself. So, in addition to the triple-suffixed `.assets` copy above
+  // (needed for `tauri dev`'s spawn -- see this file's top-of-file doc
+  // comment on why the sidecar's own `${execPath}.assets` self-location only
+  // works with the triple-suffixed name in dev), also stage a second,
+  // triple-LESS copy at a fixed name purely for `bundle.resources` to pick
+  // up at build time. This is a plain second copy (not a symlink) to match
+  // this script's existing copy-not-link convention and to avoid any
+  // symlink-resolution surprises in the bundler's own resource-copying step.
+  const destAssetsFixedName = path.join(binariesDir, "openfusion-engine.assets");
+  rmSync(destAssetsFixedName, { recursive: true, force: true });
+  cpSync(srcAssets, destAssetsFixedName, { recursive: true });
+
+  log(`staged ${binaryName} (+ .assets, + a triple-less .assets copy for bundle.resources) into ` +
+    `${path.relative(repoRoot, binariesDir)}/`);
 }
 
 main();

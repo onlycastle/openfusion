@@ -34,6 +34,9 @@
       "icons/icon.ico"
     ],
     "externalBin": ["binaries/openfusion-engine"],
+    "resources": {
+      "binaries/openfusion-engine.assets": "assets"
+    },
     "macOS": {
       "entitlements": "Entitlements.plist"
     }

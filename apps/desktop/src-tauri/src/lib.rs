@@ -56,7 +56,18 @@ pub fn run() {
         // calls the same way they would gate a call into `commands.rs`).
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
-            let binary_path = resolve_dev_sidecar_binary_path()?;
+            // M8 Task 2: dev-vs-packaged dispatch. See
+            // `exe_dir_has_packaged_sidecar`'s doc comment for why this is a
+            // filesystem existence check rather than `cfg(dev)`/
+            // `tauri::is_dev()`. Computed once here (both the binary-path
+            // and assets-dir resolutions below reuse `exe_dir`) so the two
+            // can never disagree about which mode they're in.
+            let exe_path = std::env::current_exe()?;
+            let exe_dir = exe_path.parent().ok_or_else(|| {
+                std::io::Error::other(format!("current_exe() {} has no parent directory", exe_path.display()))
+            })?;
+            let binary_path = resolve_sidecar_binary_path_for_exe_dir(exe_dir)?;
+            let assets_dir = resolve_assets_dir_for_exe_dir(app, exe_dir, &binary_path)?;
 
             // `EngineBridge::spawn` is synchronous but calls `tokio::spawn`
             // internally (its reader/stderr background tasks) — it must run
@@ -72,7 +83,7 @@ pub fn run() {
             let bridge = {
                 let runtime_handle = tauri::async_runtime::handle();
                 let _guard = runtime_handle.inner().enter();
-                EngineBridge::spawn(binary_path)?
+                EngineBridge::spawn_with_assets_dir(binary_path, Some(assets_dir))?
             };
             app.manage(Arc::new(bridge));
 
@@ -236,7 +247,7 @@ fn resolve_dev_sidecar_binary_path() -> std::io::Result<PathBuf> {
 /// Packaged-build (`tauri build` `.app`/installer) resolution of the engine
 /// sidecar binary path.
 ///
-/// ## The mechanism (implementable now, verified against Tauri's own source)
+/// ## The mechanism (verified against Tauri's own source)
 ///
 /// A bundled sidecar lands next to the app's own executable —
 /// `<App>.app/Contents/MacOS/` on macOS — with the `externalBin` naming
@@ -255,27 +266,10 @@ fn resolve_dev_sidecar_binary_path() -> std::io::Result<PathBuf> {
 /// isn't possible without OS-level tricks); this function is the thin,
 /// untestable-without-a-real-binary wrapper around it.
 ///
-/// ## M8 boundary — why this is NOT wired into `.setup()`'s dispatch yet
-///
-/// `setup()` above unconditionally calls [`resolve_dev_sidecar_binary_path`].
-/// Switching between that and this function at runtime needs a reliable
-/// "am I in a packaged build or `tauri dev`" signal. Tauri provides exactly
-/// one, a `cfg(dev)` alias `tauri-build`'s `build.rs` sets — but it derives
-/// from the crate's own `custom-protocol` Cargo feature
-/// (`dev = !custom_protocol`), and this scaffold's `Cargo.toml` (Task 2)
-/// never defined that feature or wired the Tauri CLI's usual
-/// `--no-default-features`-in-dev / default-features-in-build convention —
-/// so `cfg(dev)` would evaluate `true` unconditionally here, in *both*
-/// `tauri dev` and `tauri build`. Branching on it as-is would silently
-/// always pick the dev path, which is worse than not branching at all.
-///
-/// Wiring that convention (the `custom-protocol` feature + `cfg(dev)`
-/// dispatch) belongs with the rest of M8's packaging work — the same
-/// milestone that does signing/entitlements/notarization (see
-/// `apps/desktop/README.md`'s "Packaging (M8)" section) and is the first
-/// point this path can actually be exercised end-to-end anyway (it only
-/// means anything inside a real `tauri build` bundle). Flagging the exact
-/// gap here rather than guessing at a half-wired runtime switch.
+/// Wired into `.setup()`'s dispatch via [`resolve_sidecar_binary_path_for_exe_dir`]
+/// — see that function's doc comment, and [`exe_dir_has_packaged_sidecar`]'s,
+/// for the dev-vs-packaged signal that decides when this gets called instead
+/// of [`resolve_dev_sidecar_binary_path`].
 pub fn resolve_packaged_sidecar_binary_path() -> std::io::Result<PathBuf> {
     let exe_path = std::env::current_exe()?;
     let exe_dir = exe_path.parent().ok_or_else(|| {
@@ -291,6 +285,138 @@ pub fn resolve_packaged_sidecar_binary_path() -> std::io::Result<PathBuf> {
 fn packaged_sidecar_path_from_exe_dir(exe_dir: &Path) -> PathBuf {
     let name = if cfg!(windows) { "openfusion-engine.exe" } else { "openfusion-engine" };
     exe_dir.join(name)
+}
+
+// --- M8 Task 2: dev-vs-packaged dispatch ------------------------------
+
+/// True if `exe_dir` (the directory containing the currently-running
+/// executable) also contains the packaged sidecar binary sitting right next
+/// to it. This — not `cfg(dev)`/`tauri::is_dev()` — is the dev-vs-packaged
+/// signal [`resolve_sidecar_binary_path_for_exe_dir`] and
+/// [`resolve_assets_dir_for_exe_dir`] dispatch on.
+///
+/// ## Why not `cfg(dev)` / `tauri::is_dev()`
+///
+/// [`resolve_packaged_sidecar_binary_path`]'s previous doc comment (see git
+/// history) found that `tauri-build`'s `cfg(dev)` alias evaluates `true`
+/// unconditionally here, in *both* `tauri dev` and `tauri build`: it derives
+/// from `dev = !custom_protocol`, where `custom_protocol` is whether the
+/// `tauri` crate itself was compiled with its own `custom-protocol`
+/// feature, and this crate's `Cargo.toml` never forwards that feature
+/// (`tauri/custom-protocol`) — so it's permanently off, and `cfg(dev)`
+/// permanently true. `tauri::is_dev()` (`tauri`'s public runtime helper,
+/// `!cfg!(feature = "custom-protocol")` evaluated inside the `tauri` crate
+/// itself) is driven by the *exact same* feature and has the identical gap.
+///
+/// Fixing that gap by adding `custom-protocol = ["tauri/custom-protocol"]`
+/// to `Cargo.toml` (the standard Tauri scaffold convention) is possible, but
+/// it would mean trusting that the Tauri CLI reliably toggles that feature
+/// between `tauri dev` and `tauri build` invocations — real, documented
+/// Tauri behavior, but its exact invocation flags live inside a compiled
+/// `@tauri-apps/cli` platform binary, not source available in this repo to
+/// independently confirm. Getting this wrong would silently break the
+/// packaged app's sidecar dispatch in a way this milestone's headless tests
+/// cannot catch (the packaged branch can only be proven end-to-end against
+/// a real `.app` — see the module-level "M8 boundary" notes throughout this
+/// file).
+///
+/// ## The mechanism actually used
+///
+/// A packaged `.app` always ships the sidecar right next to its main
+/// executable (`Contents/MacOS/openfusion-engine`, see
+/// [`packaged_sidecar_path_from_exe_dir`]); `tauri dev` never does — the
+/// main binary runs from `target/debug/`, and the staged sidecar is a
+/// *differently named* (triple-suffixed), sibling-directory file
+/// (`binaries/openfusion-engine-<triple>`), never a bare
+/// `openfusion-engine` sitting next to `target/debug/openfusion-desktop`.
+/// Checking "does `<exe_dir>/openfusion-engine` exist" is therefore a
+/// direct, self-verifying test of the exact condition this dispatch cares
+/// about — no Cargo feature, no assumption about CLI invocation flags, and
+/// (unlike `cfg(dev)`) it is a *runtime* check, so both branches of the
+/// dispatch it feeds are real, reachable code paths a single test binary
+/// can exercise by injecting a fake `exe_dir` (see the tests module below).
+fn exe_dir_has_packaged_sidecar(exe_dir: &Path) -> bool {
+    packaged_sidecar_path_from_exe_dir(exe_dir).is_file()
+}
+
+/// Resolves the engine sidecar binary path for either mode, given the
+/// directory the running executable lives in. The only I/O here is
+/// [`exe_dir_has_packaged_sidecar`]'s `is_file` check and, in the dev
+/// branch, [`resolve_dev_sidecar_binary_path`]'s directory scan — so tests
+/// exercise both branches by injecting a fake `exe_dir` (a temp dir with or
+/// without a dummy packaged-sidecar file), without needing a real `.app`.
+/// `.setup()` is the only real call site, passing the actual running
+/// process's own exe dir.
+fn resolve_sidecar_binary_path_for_exe_dir(exe_dir: &Path) -> std::io::Result<PathBuf> {
+    if exe_dir_has_packaged_sidecar(exe_dir) {
+        Ok(packaged_sidecar_path_from_exe_dir(exe_dir))
+    } else {
+        resolve_dev_sidecar_binary_path()
+    }
+}
+
+/// Dev-mode assets dir: the engine sidecar's own `${execPath}.assets`
+/// self-location convention (see `stage-sidecar.mjs`'s module doc) —
+/// computed directly from the resolved `binary_path` so this crate and the
+/// engine can never disagree about it, rather than re-deriving
+/// `CARGO_MANIFEST_DIR`-relative paths a second time. Setting
+/// `OPENFUSION_ASSETS_DIR` to this in dev too (rather than leaving it unset
+/// and relying purely on the engine's own fallback) is deliberate: one
+/// resolution path for both modes is simpler to reason about and test than
+/// "set it in packaged, leave it unset in dev" would be, and it is
+/// semantically a no-op in dev — the value computed here is identical to
+/// what `${execPath}.assets` already resolves to on the engine side, since
+/// `binary_path` in dev *is* the sidecar's own `execPath`.
+fn dev_assets_dir_from_binary_path(binary_path: &Path) -> PathBuf {
+    let mut assets = binary_path.as_os_str().to_os_string();
+    assets.push(".assets");
+    PathBuf::from(assets)
+}
+
+/// Packaged-mode assets dir shape: `<resource_dir>/assets`. Pure half of
+/// [`resolve_packaged_assets_dir`] below, unit-tested with a fake resource
+/// dir since a real one needs a live `tauri::App` — mirrors the
+/// [`packaged_sidecar_path_from_exe_dir`] split above.
+///
+/// This is the same shape `app.path().resolve("assets",
+/// BaseDirectory::Resource)` produces: reading tauri 2.11.5's
+/// `path::resolve_path` (`tauri-2.11.5/src/path/mod.rs`) shows that for a
+/// single-component relative path like `"assets"` — no root/`..` components
+/// to sanitize — `BaseDirectory::Resource` resolution reduces to exactly
+/// `resource_dir().join("assets")`. Calling `resource_dir()` and joining
+/// ourselves (see [`resolve_packaged_assets_dir`]) is therefore equivalent
+/// while staying independently testable here.
+fn packaged_assets_dir_from_resource_dir(resource_dir: &Path) -> PathBuf {
+    resource_dir.join("assets")
+}
+
+/// Packaged-mode assets dir, resolved through Tauri's own resource-dir API
+/// (`${exe_dir}/../Resources` on macOS, i.e. `Contents/Resources`). Needs a
+/// real `tauri::App` — like [`resolve_packaged_sidecar_binary_path`], this
+/// is the thin, untestable-without-a-real-app wrapper around the tested
+/// pure half, [`packaged_assets_dir_from_resource_dir`].
+///
+/// `tauri.conf.json`'s `bundle.resources` entry
+/// (`"binaries/openfusion-engine.assets": "assets"`) maps the staged
+/// `.assets/` dir to an `assets/` subdirectory of `Contents/Resources`,
+/// matching this exactly — see that file and `stage-sidecar.mjs` for the
+/// other end of this mapping.
+fn resolve_packaged_assets_dir(app: &tauri::App) -> tauri::Result<PathBuf> {
+    let resource_dir = app.path().resource_dir()?;
+    Ok(packaged_assets_dir_from_resource_dir(&resource_dir))
+}
+
+/// `.setup()`'s assets-dir dispatch, using the exact same
+/// [`exe_dir_has_packaged_sidecar`] signal as
+/// [`resolve_sidecar_binary_path_for_exe_dir`] so the two resolutions can
+/// never disagree about which mode they're in (`.setup()` computes
+/// `exe_dir` once and passes it to both).
+fn resolve_assets_dir_for_exe_dir(app: &tauri::App, exe_dir: &Path, binary_path: &Path) -> tauri::Result<PathBuf> {
+    if exe_dir_has_packaged_sidecar(exe_dir) {
+        resolve_packaged_assets_dir(app)
+    } else {
+        Ok(dev_assets_dir_from_binary_path(binary_path))
+    }
 }
 
 #[cfg(test)]
@@ -315,5 +441,105 @@ mod tests {
         // appear here -- the bundler strips it, matching
         // `tauri-plugin-shell`'s own sidecar-resolution convention.
         assert!(!resolved.to_string_lossy().contains("-apple-darwin"));
+    }
+
+    // --- M8 Task 2: dev-vs-packaged dispatch --------------------------
+
+    /// Creates a fresh, empty temp directory unique to this test process +
+    /// an incrementing counter (parallel `cargo test` runs many tests
+    /// concurrently in the same process, so a counter -- not just the pid --
+    /// keeps every call's directory distinct). No `tempfile` dependency
+    /// needed for this: plain `std::fs` is enough for a directory that only
+    /// needs to exist for the duration of one test.
+    fn unique_temp_dir(label: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!("openfusion-desktop-test-{label}-{}-{n}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create unique temp test dir");
+        dir
+    }
+
+    #[test]
+    fn exe_dir_has_packaged_sidecar_false_when_absent() {
+        let dir = unique_temp_dir("no-sidecar");
+        assert!(!exe_dir_has_packaged_sidecar(&dir), "an empty dir must not look packaged");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn exe_dir_has_packaged_sidecar_true_when_present() {
+        let dir = unique_temp_dir("with-sidecar");
+        let expected_name = if cfg!(windows) { "openfusion-engine.exe" } else { "openfusion-engine" };
+        std::fs::write(dir.join(expected_name), b"#!/bin/sh\n").expect("write dummy sidecar file");
+        assert!(exe_dir_has_packaged_sidecar(&dir), "a dir with the triple-less sidecar name must look packaged");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn exe_dir_has_packaged_sidecar_false_for_a_directory_of_that_name() {
+        // The check is deliberately `is_file`, not just `exists` -- a
+        // directory happening to share the name must not be mistaken for
+        // the packaged sidecar binary.
+        let dir = unique_temp_dir("sidecar-is-a-dir");
+        let expected_name = if cfg!(windows) { "openfusion-engine.exe" } else { "openfusion-engine" };
+        std::fs::create_dir_all(dir.join(expected_name)).expect("create dir shadowing the sidecar name");
+        assert!(!exe_dir_has_packaged_sidecar(&dir));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_sidecar_binary_path_for_exe_dir_prefers_packaged_when_present() {
+        let dir = unique_temp_dir("dispatch-packaged");
+        let expected_name = if cfg!(windows) { "openfusion-engine.exe" } else { "openfusion-engine" };
+        std::fs::write(dir.join(expected_name), b"#!/bin/sh\n").expect("write dummy sidecar file");
+
+        let resolved =
+            resolve_sidecar_binary_path_for_exe_dir(&dir).expect("packaged branch never touches CARGO_MANIFEST_DIR");
+        assert_eq!(resolved, dir.join(expected_name));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_sidecar_binary_path_for_exe_dir_falls_back_to_dev_when_absent() {
+        // No packaged sidecar next to this fake exe_dir -- falls through to
+        // `resolve_dev_sidecar_binary_path`, which scans the REAL
+        // `binaries/` dir staged by `stage-sidecar.mjs` for this crate's own
+        // tests (see that function's doc comment). This is the "dev-cfg"
+        // branch proof: a real filesystem scan, not a further mock.
+        let dir = unique_temp_dir("dispatch-dev");
+
+        let resolved = resolve_sidecar_binary_path_for_exe_dir(&dir).expect(
+            "dev binaries dir should be staged for tests -- run `pnpm --filter @openfusion/engine build:sidecar \
+             && pnpm --filter @openfusion/desktop stage-sidecar` first",
+        );
+        assert!(
+            resolved.to_string_lossy().contains("openfusion-engine-"),
+            "dev resolution must return the triple-suffixed staged binary, got {resolved:?}"
+        );
+        // Must NOT be inside our fake packaged exe_dir -- proves the dev
+        // branch, not the packaged one, was actually taken.
+        assert!(!resolved.starts_with(&dir));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dev_assets_dir_appends_dot_assets_suffix_to_binary_filename() {
+        let binary = Path::new("/repo/apps/desktop/src-tauri/binaries/openfusion-engine-aarch64-apple-darwin");
+        let assets = dev_assets_dir_from_binary_path(binary);
+        assert_eq!(
+            assets,
+            PathBuf::from("/repo/apps/desktop/src-tauri/binaries/openfusion-engine-aarch64-apple-darwin.assets")
+        );
+    }
+
+    #[test]
+    fn packaged_assets_dir_joins_resource_dir_with_assets() {
+        let resource_dir = Path::new("/Applications/OpenFusion.app/Contents/Resources");
+        let assets = packaged_assets_dir_from_resource_dir(resource_dir);
+        assert_eq!(assets, resource_dir.join("assets"));
+        assert_eq!(assets, PathBuf::from("/Applications/OpenFusion.app/Contents/Resources/assets"));
     }
 }
