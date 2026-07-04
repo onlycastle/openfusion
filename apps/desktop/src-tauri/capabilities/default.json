@@ -1,0 +1,19 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Capability for the main window — grants the sidecar spawn permission the Task 3 engine bridge will use, and no more.",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    {
+      "identifier": "shell:allow-spawn",
+      "allow": [
+        {
+          "name": "binaries/openfusion-engine",
+          "sidecar": true,
+          "args": true
+        }
+      ]
+    }
+  ]
+}
