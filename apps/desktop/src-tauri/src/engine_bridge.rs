@@ -27,9 +27,10 @@
 //!
 //! `tokio::process::Child` gives us owned `ChildStdin`/`ChildStdout`/
 //! `ChildStderr` handles we can hand to independent tasks — the reader task
-//! owns stdout, a drain task owns stderr, and `call()` takes the stdin lock
-//! only for the duration of a single write. That ownership split is exactly
-//! what a bidirectional, concurrently-called JSON-RPC client needs.
+//! owns stdout, a drain task owns stderr, and a dedicated writer task owns
+//! stdin (see "M7b Task 1" below for why `call()` itself no longer touches
+//! it directly). That ownership split is exactly what a bidirectional,
+//! concurrently-called JSON-RPC client needs.
 //!
 //! The tradeoff: this module resolves its own sidecar binary path (the
 //! caller passes a `PathBuf`) rather than getting one for free from Tauri's
@@ -49,6 +50,93 @@
 //! drained to this process's own stderr, never mixed into stdout parsing
 //! and never forwarded to the webview.
 //!
+//! ## M7b Task 1: atomic wire-writes via a dedicated writer task
+//!
+//! `call()` never touches `ChildStdin` directly. A single **writer task**
+//! (spawned once, in [`EngineBridge::spawn_with_shutdown_timeout`]) owns the
+//! `ChildStdin` handle for the bridge's entire lifetime and is the only code
+//! that ever calls `write_all` on it. `call()` instead serializes its
+//! request line and hands the finished `Vec<u8>` to the writer task over an
+//! `mpsc::UnboundedSender<Vec<u8>>`, then awaits its response.
+//!
+//! **Why this matters (the hard gate this task closes):** in the prior
+//! design, `call()` awaited `write_all` directly, holding the stdin lock
+//! across it. If the *caller's* future was dropped mid-await (a wrapping
+//! `tokio::time::timeout` firing, or the cockpit's future cancel/cancel
+//! button — Task 2), whatever prefix of the request line had already been
+//! flushed to the OS pipe stayed there, unterminated, and the *next*
+//! request's bytes would land right after it. The child's line-oriented
+//! reader has no way to tell "a request got cut off here" from "these are
+//! just two long lines" — it concatenates them into one unparseable blob,
+//! and the next request desyncs. Nothing in M7a ever cancelled a `call()`
+//! mid-write (no caller wrapped it in a timeout), so this bug was latent;
+//! the cockpit's upcoming per-call timeouts (Task 2) would trigger it
+//! routinely.
+//!
+//! **Why the fix works:** `mpsc::UnboundedSender::send` is a synchronous,
+//! non-blocking call — it either fully enqueues the request's `Vec<u8>` or
+//! it doesn't (the channel is closed); there is no "partially enqueued"
+//! state, so a caller cancelled while sending never leaves a fragment
+//! behind. Once a request's bytes are enqueued, they belong to the writer
+//! task, not to the calling `call()`'s future — dropping the caller's
+//! future (a `tokio::time::timeout` firing, an explicit cancel) has no
+//! effect on the writer task, which is a separate `tokio::spawn`ed future
+//! entirely. The writer task's own `stdin.write_all(&bytes).await` always
+//! runs to completion (or to a hard I/O error, e.g. the child died) — never
+//! to a caller-cancellation. So every request is either written to the wire
+//! in full, or never sent at all; partial writes are no longer possible.
+//!
+//! **mpsc channel choice — unbounded, not bounded:** this bridge exists to
+//! serve request/response RPC calls the cockpit issues one at a time or in
+//! small bursts (a handful of concurrent orchestration calls at most), not
+//! a high-throughput byte stream — so there is no meaningful backpressure
+//! case to design for, and an unbounded queue's worst case (a wedged child
+//! that never drains stdin) is already bounded by `shutdown()`'s existing
+//! kill-on-overrun path (see below), not by queue capacity. A bounded
+//! channel would be equally cancellation-safe (a `Sender::send` on a full
+//! bounded channel that gets cancelled mid-await also never partially
+//! enqueues), but it would just relocate today's "a stuck write blocks the
+//! next request" problem from the stdin lock to the channel's capacity
+//! without buying any additional safety — so the unbounded channel is kept
+//! for its simplicity: `call()` never needs an extra `.await` point (and
+//! therefore an extra cancellation-safety argument) just to hand bytes to
+//! the writer.
+//!
+//! **Ordering invariant:** requests are written in the order `call()`
+//! enqueues them. `call()` acquires `writer_tx`'s `AsyncMutex` only for the
+//! synchronous `send()` call itself (never across an `.await`), so the order
+//! in which concurrent callers acquire that lock is the order their bytes
+//! land in the mpsc queue, which is the order the writer task drains and
+//! writes them (`mpsc` is FIFO). Response correlation still happens purely
+//! by `id` (assigned before the write is even queued), so out-of-order
+//! *responses* from the child remain perfectly fine — only write *order*
+//! is FIFO, not response order.
+//!
+//! **Per-call timeout, safe now:** [`EngineBridge::call_with_timeout`] wraps
+//! only the response-`oneshot` await in `tokio::time::timeout` — never the
+//! write. On timeout, the response wait is dropped; [`PendingGuard`] removes
+//! the pending entry (a late response, if the child does eventually answer,
+//! finds no entry and is logged + dropped, same as any other
+//! unknown/already-resolved id); the request itself was already handed off
+//! to (or written by) the writer task, so the stream is never corrupted by
+//! a timeout the way a mid-write cancel used to corrupt it. This is exactly
+//! why the writer-task refactor had to land first: without it, adding
+//! per-call timeouts would have made the mid-write-cancel bug routine
+//! instead of latent.
+//!
+//! **Shutdown adapts accordingly:** `shutdown()` no longer closes `ChildStdin`
+//! directly (there is no `ChildStdin` on `EngineBridge` anymore — the writer
+//! task owns it locally). Instead it drops the bridge's `writer_tx` sender,
+//! which closes the mpsc channel; the writer task drains anything already
+//! queued, then its `rx.recv()` returns `None`, its local `ChildStdin`
+//! binding goes out of scope (EOF to the child), and the task exits. That
+//! drain-and-exit is bounded by `shutdown_timeout` exactly like the old
+//! stdin-close step was — a writer stuck mid-`write_all` (a wedged child
+//! that never reads its stdin) can't be un-stuck by closing the channel
+//! alone, so a timed-out drain falls through to killing the child directly,
+//! which unblocks the writer's write with a broken-pipe error so it can
+//! finish and be joined.
+//!
 //! ## What this module deliberately does NOT log
 //!
 //! Diagnostic lines below (`eprintln!`) are metadata only — method names,
@@ -66,7 +154,7 @@ use std::time::Duration;
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
-use tokio::sync::{broadcast, oneshot, watch, Mutex as AsyncMutex};
+use tokio::sync::{broadcast, mpsc, oneshot, watch, Mutex as AsyncMutex};
 use tokio::task::JoinHandle;
 
 /// Default bound `shutdown()` waits for the child to exit on its own
@@ -82,6 +170,12 @@ const ERR_BRIDGE_CLOSED: i64 = -32002;
 const ERR_IO: i64 = -32003;
 const ERR_SERIALIZE: i64 = -32004;
 const ERR_UNKNOWN: i64 = -32005;
+/// Per-call timeout (`call_with_timeout`) fired before the engine responded.
+/// The task brief's suggested code (-32001) is already `ERR_CHILD_EXITED`
+/// in this codebase, so this uses the next free slot instead — still a
+/// distinct, dedicated code a caller can match on, same spirit as the rest
+/// of this block.
+const ERR_TIMEOUT: i64 = -32006;
 
 type PendingMap = Arc<StdMutex<HashMap<u64, oneshot::Sender<Result<Value, RpcError>>>>>;
 
@@ -159,6 +253,10 @@ impl RpcError {
     fn serialize(err: &serde_json::Error) -> Self {
         Self::internal(ERR_SERIALIZE, format!("request serialization failed: {err}"))
     }
+
+    fn timed_out() -> Self {
+        Self::internal(ERR_TIMEOUT, "request timed out")
+    }
 }
 
 impl std::fmt::Display for RpcError {
@@ -170,10 +268,17 @@ impl std::fmt::Display for RpcError {
 impl std::error::Error for RpcError {}
 
 /// Owns the spawned engine sidecar child and speaks JSON-RPC 2.0 over its
-/// stdio. See module docs for the tokio::process-vs-plugin-shell decision.
+/// stdio. See module docs for the tokio::process-vs-plugin-shell decision,
+/// and the "M7b Task 1" module doc section for why `ChildStdin` is owned by
+/// a dedicated writer task rather than by this struct directly.
 pub struct EngineBridge {
     child: AsyncMutex<Child>,
-    stdin: AsyncMutex<Option<ChildStdin>>,
+    /// The writer task's request queue. `call()` only ever holds this lock
+    /// for a synchronous, non-blocking `send()` — never across an `.await`
+    /// — so a caller cancelled while sending never leaves anything
+    /// half-enqueued. `None` once `shutdown()` has dropped it (closing the
+    /// channel so the writer task can drain + exit).
+    writer_tx: AsyncMutex<Option<mpsc::UnboundedSender<Vec<u8>>>>,
     pending: PendingMap,
     next_id: AtomicU64,
     notify_tx: broadcast::Sender<Value>,
@@ -181,6 +286,7 @@ pub struct EngineBridge {
     shutdown_timeout: Duration,
     reader_task: AsyncMutex<Option<JoinHandle<()>>>,
     stderr_task: AsyncMutex<Option<JoinHandle<()>>>,
+    writer_task: AsyncMutex<Option<JoinHandle<()>>>,
     /// Signals `false` -> `true` exactly once, the moment `shutdown()` is
     /// called. See [`shutdown_signal`](Self::shutdown_signal) for why this
     /// exists (M7a Task 5: notification-pump teardown).
@@ -217,13 +323,15 @@ impl EngineBridge {
         let pending: PendingMap = Arc::new(StdMutex::new(HashMap::new()));
         let (notify_tx, _initial_receiver) = broadcast::channel(NOTIFY_CHANNEL_CAPACITY);
         let (shutdown_signal_tx, _initial_shutdown_receiver) = watch::channel(false);
+        let (writer_tx, writer_rx) = mpsc::unbounded_channel::<Vec<u8>>();
 
         let reader_task = tokio::spawn(read_stdout(stdout, pending.clone(), notify_tx.clone()));
         let stderr_task = tokio::spawn(drain_stderr(stderr));
+        let writer_task = tokio::spawn(run_writer(stdin, writer_rx, pending.clone()));
 
         Ok(Self {
             child: AsyncMutex::new(child),
-            stdin: AsyncMutex::new(Some(stdin)),
+            writer_tx: AsyncMutex::new(Some(writer_tx)),
             pending,
             next_id: AtomicU64::new(1),
             notify_tx,
@@ -231,16 +339,45 @@ impl EngineBridge {
             shutdown_timeout,
             reader_task: AsyncMutex::new(Some(reader_task)),
             stderr_task: AsyncMutex::new(Some(stderr_task)),
+            writer_task: AsyncMutex::new(Some(writer_task)),
             shutdown_signal_tx,
         })
     }
 
     /// Sends `{method, params}` as a JSON-RPC request and awaits the
-    /// matching-id response. Safe to call concurrently — each call gets its
-    /// own id and its own oneshot; the background reader task correlates
-    /// responses back to the right caller no matter what order they arrive
-    /// in.
+    /// matching-id response, with no deadline (the call waits as long as
+    /// the bridge/child lets it). Safe to call concurrently — each call
+    /// gets its own id and its own oneshot; the background reader task
+    /// correlates responses back to the right caller no matter what order
+    /// they arrive in.
     pub async fn call(&self, method: &str, params: Value) -> Result<Value, RpcError> {
+        self.call_with_optional_timeout(method, params, None).await
+    }
+
+    /// Same as [`call`](Self::call), but the response wait is bounded by
+    /// `timeout`. If the engine hasn't responded within `timeout`, this
+    /// returns an [`RpcError`] with the dedicated timeout code
+    /// (`ERR_TIMEOUT`) instead of waiting indefinitely.
+    ///
+    /// Safe to add now (M7b Task 1) precisely *because* the write itself is
+    /// never part of what gets cancelled: the request was already handed
+    /// off to (or fully written by) the writer task before this ever starts
+    /// waiting on the response, so a fired timeout can never leave a
+    /// partial line on the wire — see the module's "M7b Task 1" doc section.
+    /// [`PendingGuard`] cleans up the pending-map entry exactly as it does
+    /// for any other cancelled `call()`; a late response that arrives after
+    /// the timeout finds no matching entry and is logged + dropped (same as
+    /// any unknown/already-resolved id).
+    pub async fn call_with_timeout(&self, method: &str, params: Value, timeout: Duration) -> Result<Value, RpcError> {
+        self.call_with_optional_timeout(method, params, Some(timeout)).await
+    }
+
+    async fn call_with_optional_timeout(
+        &self,
+        method: &str,
+        params: Value,
+        timeout: Option<Duration>,
+    ) -> Result<Value, RpcError> {
         if self.closed.load(Ordering::SeqCst) {
             return Err(RpcError::bridge_closed());
         }
@@ -264,20 +401,41 @@ impl EngineBridge {
         };
         line.push(b'\n');
 
-        let write_outcome = {
-            let mut guard = self.stdin.lock().await;
-            match guard.as_mut() {
-                Some(stdin) => Some(stdin.write_all(&line).await),
-                None => None,
+        // Hand the fully-serialized line off to the writer task. This lock
+        // is only ever held for the synchronous `UnboundedSender::send`
+        // call below — never across an `.await` — so there is no window in
+        // which a cancelled caller could leave a partial enqueue behind:
+        // either `send` returns before this future can be dropped (the
+        // bytes are now the writer task's problem, not this call's), or the
+        // channel is already closed and nothing was sent at all. See the
+        // module's "M7b Task 1" doc section for the full argument.
+        let enqueued = {
+            let guard = self.writer_tx.lock().await;
+            match guard.as_ref() {
+                Some(tx) => tx.send(line).is_ok(),
+                None => false,
             }
         };
-        match write_outcome {
-            Some(Ok(())) => {}
-            Some(Err(err)) => return Err(RpcError::io(&err)),
-            None => return Err(RpcError::bridge_closed()),
+        if !enqueued {
+            return Err(RpcError::bridge_closed());
         }
 
-        match rx.await {
+        let response = match timeout {
+            Some(bound) => match tokio::time::timeout(bound, rx).await {
+                Ok(inner) => inner,
+                // The deadline fired while waiting on the response, not the
+                // write (the request was already handed to the writer task
+                // above, so it is either fully written or the writer hasn't
+                // gotten to it yet — never partially written). Dropping
+                // `rx` here is exactly what a cancelled `call()` already did
+                // before per-call timeouts existed; `_pending_guard`'s Drop
+                // removes the pending entry the same way.
+                Err(_elapsed) => return Err(RpcError::timed_out()),
+            },
+            None => rx.await,
+        };
+
+        match response {
             Ok(result) => result,
             // Sender dropped without sending — the reader task exited
             // (child died) in the narrow window after our insert but
@@ -331,48 +489,78 @@ impl EngineBridge {
         self.child.lock().await.id()
     }
 
-    /// Closes stdin (EOF — the engine's cue to exit), waits up to the
-    /// configured bound for the child to exit, and kills it if it overruns.
-    /// Idempotent: a second call is a no-op. After this returns, any call()
-    /// still pending (or made afterward) resolves to an error rather than
-    /// hanging.
+    /// Test-support only, same spirit as `pending_len()`: reports whether
+    /// the writer task's `JoinHandle` has already resolved. Lets tests
+    /// directly observe "the writer task actually exited" (e.g. once it
+    /// detects a broken pipe after the child dies) rather than only
+    /// inferring it from side effects like a `call()` erroring.
+    pub async fn writer_task_finished(&self) -> bool {
+        match self.writer_task.lock().await.as_ref() {
+            Some(handle) => handle.is_finished(),
+            None => true, // already taken/joined by a prior shutdown()
+        }
+    }
+
+    /// Closes the writer task's input (EOF — the engine's cue to exit),
+    /// waits up to the configured bound for the child to exit, and kills it
+    /// if it overruns. Idempotent: a second call is a no-op. After this
+    /// returns, any call() still pending (or made afterward) resolves to an
+    /// error rather than hanging.
     pub async fn shutdown(&self) {
         if self.closed.swap(true, Ordering::SeqCst) {
             return;
         }
 
         // Signal every notification-pump task tied to this bridge to exit.
-        // Fired first (before the potentially slower stdin-close/kill/reap
-        // steps below) so pumps can drain and exit promptly rather than
-        // waiting on the child's own teardown. See `shutdown_signal`'s doc
-        // comment for why this explicit signal is necessary at all.
+        // Fired first (before the potentially slower drain/kill/reap steps
+        // below) so pumps can drain and exit promptly rather than waiting
+        // on the child's own teardown. See `shutdown_signal`'s doc comment
+        // for why this explicit signal is necessary at all.
         let _ = self.shutdown_signal_tx.send(true);
 
-        // Bound the stdin-close step itself, not just the wait-for-exit
-        // below. `self.stdin` is the same lock a concurrent `call()` holds
-        // for the full duration of its `write_all().await` — if that write
-        // is blocked (a payload larger than the OS pipe buffer and a child
-        // that isn't reading, which is a realistic shape for this bridge:
-        // prompts/model output can be large), acquiring the lock here with
-        // no timeout would queue shutdown() behind it indefinitely,
-        // defeating the whole "bounded, kill-on-overrun" contract. Timing
-        // out here instead falls through straight to killing the child:
-        // the kill doesn't need stdin, and it's exactly what unblocks the
-        // stuck write (the child's read end closes, so the pending
-        // `write_all` gets a broken-pipe error instead of hanging forever).
-        let stdin_close_timed_out = tokio::time::timeout(self.shutdown_timeout, async {
-            let mut guard = self.stdin.lock().await;
-            *guard = None; // drop ChildStdin -> EOF on the child's stdin
-        })
-        .await
-        .is_err();
+        // Close the writer task's input: drop the mpsc sender so no new
+        // request can be enqueued and the writer's `rx.recv()` returns
+        // `None` once it has drained anything already queued. Unlike the
+        // old direct-stdin-lock design, this never blocks — `call()` never
+        // holds this same lock across a slow write (see `call_with_optional_timeout`),
+        // so grabbing it here to `take()` is always fast; no timeout is
+        // needed just for this step.
+        self.writer_tx.lock().await.take();
+
+        // Bound how long we wait for the writer task itself to actually
+        // finish draining its queue and exit (which is what sends the
+        // child its graceful EOF — the writer's local `ChildStdin` only
+        // drops once its loop returns). A well-behaved child lets this
+        // resolve promptly; a child that never reads its stdin at all
+        // leaves the writer permanently blocked inside a single in-flight
+        // `write_all`, which closing the sender above cannot un-stick — so
+        // this needs its own bound, exactly like the old code bounded the
+        // stdin-lock acquisition. `&mut handle` (not `handle` by value) so
+        // that if this *does* time out, the still-unresolved `JoinHandle`
+        // remains valid to await again later, after the kill below gives it
+        // a real chance to finish.
+        let mut writer_handle = self.writer_task.lock().await.take();
+        let writer_drain_timed_out = match writer_handle.as_mut() {
+            Some(handle) => tokio::time::timeout(self.shutdown_timeout, handle).await.is_err(),
+            None => false,
+        };
+        if !writer_drain_timed_out {
+            // Polled to completion above (successfully) — a `JoinHandle`
+            // must not be polled again after resolving, so don't retain it
+            // for the later bounded join further down.
+            writer_handle = None;
+        }
 
         {
             let mut child = self.child.lock().await;
-            if stdin_close_timed_out {
-                // The graceful EOF cue never went out (a stuck concurrent
-                // write is still holding the stdin lock), so there's
-                // nothing to wait for — go straight to kill.
+            if writer_drain_timed_out {
+                // The writer never got to finish draining (a stuck
+                // concurrent write is still in flight), so the graceful
+                // EOF cue never went out — there's nothing to wait for.
+                // Go straight to kill: this also unblocks the writer's
+                // stuck `write_all` (the child's stdin read end closes,
+                // turning the pending write into a broken-pipe error
+                // instead of hanging forever).
                 let _ = child.start_kill();
                 let _ = child.wait().await;
             } else {
@@ -386,6 +574,14 @@ impl EngineBridge {
             }
         }
 
+        // If the writer was still draining when we moved on to killing the
+        // child above, give it a bounded moment now to actually unwind (the
+        // kill should have turned its stuck write into a broken-pipe error)
+        // so its `JoinHandle` gets reclaimed rather than leaked.
+        if let Some(handle) = writer_handle {
+            let _ = tokio::time::timeout(Duration::from_secs(1), handle).await;
+        }
+
         // The reader/stderr tasks end on their own once the child's
         // stdout/stderr pipes close (exit or kill both close them). Give
         // them a bounded moment to finish so we don't leak the JoinHandle,
@@ -397,7 +593,7 @@ impl EngineBridge {
             let _ = tokio::time::timeout(Duration::from_secs(1), handle).await;
         }
 
-        fail_all_pending(&self.pending, RpcError::bridge_closed);
+        fail_all_pending(&self.pending, RpcError::bridge_closed());
     }
 }
 
@@ -425,7 +621,47 @@ async fn read_stdout(stdout: ChildStdout, pending: PendingMap, notify_tx: broadc
     }
     // The child is gone (or its stdout is unusable either way) — anyone
     // still waiting on a response needs to be told, not left hanging.
-    fail_all_pending(&pending, RpcError::child_exited);
+    fail_all_pending(&pending, RpcError::child_exited());
+}
+
+/// The dedicated writer task (see the module's "M7b Task 1" doc section):
+/// owns `stdin` for the bridge's entire lifetime and is the only code that
+/// ever calls `write_all` on it. Drains `rx` strictly in FIFO order —
+/// `call()` enqueues fully-serialized request lines, and each one is
+/// written to completion before the next is even looked at, so writes can
+/// never interleave and a line can never be partially written because some
+/// *caller's* future got dropped (dropping a caller's `call()` cannot touch
+/// this task, which is entirely separate from it).
+///
+/// Exits when either:
+/// - `rx.recv()` returns `None` — every `mpsc::UnboundedSender` clone was
+///   dropped, i.e. `shutdown()` took and dropped the bridge's sender and
+///   nothing was left queued. This is the clean-shutdown path: `stdin`
+///   (owned locally by this task) drops when the function returns, which is
+///   the actual EOF cue delivered to the child.
+/// - `write_all` fails — almost always because the child died (its stdin
+///   read end closed, turning our next write into a broken-pipe error).
+///
+/// Either way, any request already sitting in the pending map that this
+/// task will now never get a chance to write for (or already tried and
+/// failed) can never receive a response — so this fails every remaining
+/// pending call before exiting, exactly mirroring what `read_stdout` already
+/// does on its own EOF/error path. Whichever of the two tasks notices first
+/// drains the (shared) pending map; the other's call is then a harmless
+/// no-op (draining an already-empty map).
+async fn run_writer(mut stdin: ChildStdin, mut rx: mpsc::UnboundedReceiver<Vec<u8>>, pending: PendingMap) {
+    let mut write_error = None;
+    while let Some(line) = rx.recv().await {
+        if let Err(err) = stdin.write_all(&line).await {
+            eprintln!("[engine-bridge] writer task: stdin write failed ({err}); stopping writer");
+            write_error = Some(err);
+            break;
+        }
+    }
+    match write_error {
+        Some(err) => fail_all_pending(&pending, RpcError::io(&err)),
+        None => fail_all_pending(&pending, RpcError::bridge_closed()),
+    }
 }
 
 fn route_message(value: Value, pending: &PendingMap, notify_tx: &broadcast::Sender<Value>) {
@@ -472,13 +708,13 @@ fn route_message(value: Value, pending: &PendingMap, notify_tx: &broadcast::Send
     let _ = sender.send(result);
 }
 
-fn fail_all_pending(pending: &PendingMap, error_factory: fn() -> RpcError) {
+fn fail_all_pending(pending: &PendingMap, error: RpcError) {
     let stragglers: Vec<_> = {
         let mut pending = pending.lock().expect("pending mutex poisoned");
         pending.drain().collect()
     };
     for (_, tx) in stragglers {
-        let _ = tx.send(Err(error_factory()));
+        let _ = tx.send(Err(error.clone()));
     }
 }
 

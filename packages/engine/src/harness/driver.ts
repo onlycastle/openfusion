@@ -1,5 +1,6 @@
 import type { z } from "zod";
 import type { FrontierSession } from "../engines/types.js";
+import { RunCancelledError } from "../rpc/cancel-registry.js";
 
 // promptForJson (M4 Task 3) is the sole way harnessgen elicits structured
 // content from a frontier session: it prompts, accumulates the turn's `text`
@@ -68,6 +69,30 @@ export interface PromptForJsonOpts {
   // implementation (equivalent to the pre-Task-4 `session.prompt(text)` call
   // with no opts at all).
   timeoutMs?: number;
+  // M7b Task 2: this run's own cancellation signal — checked/threaded
+  // per-ATTEMPT (see the loop below), matching timeoutMs's own per-attempt
+  // semantics: a cancellation is checked before each attempt starts, listens
+  // for `abort` during that attempt only (the listener is removed once the
+  // attempt's own for-await loop settles), and is checked again in that
+  // attempt's catch AND right after its loop ends normally. A cancelled
+  // attempt throws RunCancelledError immediately — it is NEVER treated as
+  // "produced malformed JSON, retry with validation feedback"; the
+  // validation-retry path below is unreachable once this fires.
+  //
+  // IMPORTANT -- pair this with `timeoutMs`: this signal only reaches the
+  // real Claude adapter (engines/claude.ts) as a call to `handle.abort()`,
+  // which is just `abortController.abort()` -- a COOPERATIVE signal the
+  // underlying SDK query/subprocess is expected to notice and unwind from
+  // on its own. The adapter only force-kills the subprocess (`q.close()`)
+  // from the combined-signal handler it builds around
+  // `AbortSignal.timeout(opts.timeoutMs)`, and that handler is wired up
+  // ONLY `if (opts?.timeoutMs !== undefined)`. So an `abortSignal` passed
+  // here WITHOUT a `timeoutMs` degrades to a best-effort cooperative abort
+  // that a genuinely wedged subprocess can simply ignore forever -- no
+  // forced kill will ever fire. Any caller using `abortSignal` for
+  // prompt-level cancellation MUST also pass `timeoutMs` to get the actual
+  // kill guarantee.
+  abortSignal?: AbortSignal;
 }
 
 // A validation problem in a schema/path/message shape uniform enough to
@@ -195,9 +220,12 @@ export async function promptForJson<S extends z.ZodType>(
   let lastIssues: Issue[] = [];
 
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    if (opts.abortSignal?.aborted) throw new RunCancelledError();
     notify({ kind: "attempt", detail: `prompt attempt ${attempt}/${maxAttempts}` });
 
     const handle = session.prompt(currentPrompt, { timeoutMs: opts.timeoutMs });
+    const onCancel = (): void => handle.abort();
+    opts.abortSignal?.addEventListener("abort", onCancel, { once: true });
     let text = "";
     try {
       for await (const event of handle.events) {
@@ -219,8 +247,16 @@ export async function promptForJson<S extends z.ZodType>(
       }
     } catch (err) {
       handle.abort();
+      if (opts.abortSignal?.aborted) throw new RunCancelledError();
       throw err;
+    } finally {
+      opts.abortSignal?.removeEventListener("abort", onCancel);
     }
+    // Checked right after this attempt's loop ends NORMALLY, before ever
+    // falling through into JSON-parse/validation-retry logic — a
+    // cancellation that happened to land exactly as the turn's own events
+    // finished must never be scored as "produced malformed JSON, retry".
+    if (opts.abortSignal?.aborted) throw new RunCancelledError();
 
     const attemptResult = parseJsonCandidate(text, schema);
     if (attemptResult.ok) {

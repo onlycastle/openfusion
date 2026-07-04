@@ -222,6 +222,7 @@ import type { PricingConfidence } from "../models/meter.js";
 import { validateHarness } from "../harness/schema.js";
 import { HarnessValidationError, loadHarness, setEvalsVerdict, writeHarness } from "../harness/store.js";
 import { orchestrate, type OrchestrateResult } from "../orchestrate/orchestrate.js";
+import { RunCancelledError } from "../rpc/cancel-registry.js";
 import { RpcMethodError } from "../rpc/errors.js";
 import { requireGitRepo } from "../rpc/guards.js";
 import type { EvalTask } from "./tasks.js";
@@ -268,6 +269,12 @@ export interface EvalsRunParams {
   // cross a real wire.
   tasks: EvalTask[];
   sampleNote?: string;
+  // M7b Task 2: READ-ONLY lookup only -- runEvals never register()s or
+  // deregister()s this runId's controller; that is engine.evals.run's own
+  // RPC handler's job (methods.ts). See cancel-registry.ts's header comment
+  // for the full ownership split, and OrchestrateParams.runId's identical
+  // doc comment in orchestrate.ts for the sibling convention this mirrors.
+  runId?: string;
 }
 
 // The harness side's per-task result, one step wider than
@@ -369,13 +376,21 @@ async function callEngineMethod<T>(engine: Engine, method: string, params: unkno
 // baseline primitive below, whose whole point is to make tool calls (write
 // scoped to the baseline dir) and finish with a short prose summary, not a
 // structured verdict. Mirrors orchestrate.ts's own private runFrontierTurn
-// (duplicated locally for the same reason as callEngineMethod above).
+// (duplicated locally for the same reason as callEngineMethod above),
+// including its M7b Task 2 abort-threading pattern (see that function's own
+// doc comment for why THREE separate `.aborted` checks are needed rather
+// than one): `abortSignal`, when provided, is this eval run's own
+// cancellation signal (runEvals's own cancelSignal, below).
 async function drainFrontierTurn(
   session: FrontierSession,
   prompt: string,
   timeoutMs: number,
+  abortSignal?: AbortSignal,
 ): Promise<{ text: string; costUsd: number | null }> {
+  if (abortSignal?.aborted) throw new RunCancelledError();
   const handle = session.prompt(prompt, { timeoutMs });
+  const onCancel = (): void => handle.abort();
+  abortSignal?.addEventListener("abort", onCancel, { once: true });
   let text = "";
   let costUsd: number | null = null;
   try {
@@ -396,8 +411,12 @@ async function drainFrontierTurn(
     }
   } catch (err) {
     handle.abort();
+    if (abortSignal?.aborted) throw new RunCancelledError();
     throw err;
+  } finally {
+    abortSignal?.removeEventListener("abort", onCancel);
   }
+  if (abortSignal?.aborted) throw new RunCancelledError();
   return { text, costUsd };
 }
 
@@ -409,6 +428,7 @@ async function runBaselineTask(
   engine: Engine,
   dir: string,
   task: EvalTask,
+  abortSignal?: AbortSignal,
 ): Promise<{ passed: boolean; costUsd: number | null; outcome: BaselineTaskOutcome }> {
   let costUsd: number | null = null;
   try {
@@ -440,7 +460,7 @@ async function runBaselineTask(
     // review/escalation sessions (M6 Task 1's eval-batch safety gate).
     const untrack = engine.frontier.track(session);
     try {
-      const turn = await drainFrontierTurn(session, task.prompt, DEFAULT_BASELINE_TIMEOUT_MS);
+      const turn = await drainFrontierTurn(session, task.prompt, DEFAULT_BASELINE_TIMEOUT_MS, abortSignal);
       costUsd = turn.costUsd;
     } finally {
       await session.close().catch(() => {
@@ -449,6 +469,11 @@ async function runBaselineTask(
       untrack();
     }
   } catch (err) {
+    // M7b Task 2: a cancellation must propagate out of runBaselineTask, NOT
+    // be soft-scored as an infra failure the way the rest of this catch
+    // treats every other throw -- checked FIRST, ahead of the existing
+    // message/log/runOracle-fallback code below.
+    if (abortSignal?.aborted) throw err;
     // A per-task baseline infra failure (missing adapter, a session/turn
     // that throws) must not abort the WHOLE report card — mirrors
     // runHarnessTask's identical posture for engine.orchestrate below. This
@@ -525,11 +550,22 @@ async function runHarnessTask(
   engine: Engine,
   harnessDir: string,
   task: EvalTask,
+  opts: { runId?: string; abortSignal?: AbortSignal } = {},
 ): Promise<{ passed: boolean; costUsd: number | null; outcome: HarnessTaskOutcome }> {
   let result: OrchestrateResult;
   try {
-    result = await orchestrate(engine, { projectDir: harnessDir, task: task.prompt });
+    // M7b Task 2: `runId` forwarded VERBATIM -- this is the SAME batch-level
+    // runId runEvals only ever get()s (never register()s/deregister()s;
+    // that's engine.evals.run's own handler's job). orchestrate()'s own
+    // cancelSignal resolves this identical runId to the SAME
+    // AbortController via its own get()-only read, so a cancel reaches this
+    // per-task harness run exactly as it reaches the baseline turn above.
+    result = await orchestrate(engine, { projectDir: harnessDir, task: task.prompt, runId: opts.runId });
   } catch (err) {
+    // M7b Task 2: a cancellation must propagate, never be soft-scored as an
+    // infra failure -- checked FIRST, ahead of the existing per-task-failure
+    // handling below (mirrors runBaselineTask's identical guard).
+    if (opts.abortSignal?.aborted) throw err;
     // A per-task infra failure (e.g. the frontier adapter throwing) must not
     // abort the WHOLE report card — score this task as not passed and keep
     // going. See HarnessTaskOutcome's own doc comment: this is a MEASUREMENT
@@ -643,6 +679,12 @@ export async function runEvals(engine: Engine, params: EvalsRunParams): Promise<
   // card. See CostMeter.recordCount()'s own doc comment.
   const runMeterStartIndex = engine.models.meter.recordCount();
 
+  // M7b Task 2: READ-ONLY lookup only -- see EvalsRunParams.runId's own doc
+  // comment. `undefined` both when no runId was given and when a given
+  // runId doesn't resolve to a registered controller -- either way, every
+  // downstream `cancelSignal?.` check below degrades to a no-op.
+  const cancelSignal = params.runId !== undefined ? engine.cancelRegistry.get(params.runId)?.signal : undefined;
+
   let baselinePassed = 0;
   let harnessPassed = 0;
   let baselineCostTotal: number | null = null;
@@ -650,52 +692,75 @@ export async function runEvals(engine: Engine, params: EvalsRunParams): Promise<
   let escalations = 0;
   const perTask: PerTaskResult[] = [];
 
-  for (const task of params.tasks) {
-    // TMP placement — see this module's header comment. Never nested inside
-    // params.projectDir.
-    const baselineDir = await mkdtemp(path.join(os.tmpdir(), "of-eval-baseline-"));
-    const harnessDir = await mkdtemp(path.join(os.tmpdir(), "of-eval-harness-"));
-    try {
-      progress(engine, "baseline", task.id);
-      await task.setup(baselineDir);
-      const baseline = await runBaselineTask(engine, baselineDir, task);
+  try {
+    for (const task of params.tasks) {
+      // Checked at the very top of each iteration, BEFORE this task's own
+      // mkdtemp calls -- this is the "check the cancel signal between
+      // tasks" requirement, and it also guarantees a cancelled run never
+      // even starts a new task's scratch dirs.
+      if (cancelSignal?.aborted) throw new RunCancelledError();
 
-      progress(engine, "harness", task.id);
-      // Fix 1 (base identity — see this module's header comment): harnessDir
-      // gets the SAME task.setup() base state the baseline used, THEN a
-      // committed git repo, THEN the real project's harness bundle copied
-      // in (untracked) — only after all three is it a valid substrate for
-      // engine.orchestrate to work the task against.
-      await task.setup(harnessDir);
-      await initEvalGitRepo(harnessDir);
-      await writeHarness(harnessDir, harnessBundle);
-      const harnessResult = await runHarnessTask(engine, harnessDir, task);
+      // TMP placement — see this module's header comment. Never nested inside
+      // params.projectDir.
+      const baselineDir = await mkdtemp(path.join(os.tmpdir(), "of-eval-baseline-"));
+      const harnessDir = await mkdtemp(path.join(os.tmpdir(), "of-eval-harness-"));
+      try {
+        progress(engine, "baseline", task.id);
+        await task.setup(baselineDir);
+        const baseline = await runBaselineTask(engine, baselineDir, task, cancelSignal);
 
-      progress(engine, "scored", task.id);
+        progress(engine, "harness", task.id);
+        // Fix 1 (base identity — see this module's header comment): harnessDir
+        // gets the SAME task.setup() base state the baseline used, THEN a
+        // committed git repo, THEN the real project's harness bundle copied
+        // in (untracked) — only after all three is it a valid substrate for
+        // engine.orchestrate to work the task against.
+        await task.setup(harnessDir);
+        await initEvalGitRepo(harnessDir);
+        await writeHarness(harnessDir, harnessBundle);
+        const harnessResult = await runHarnessTask(engine, harnessDir, task, {
+          runId: params.runId,
+          abortSignal: cancelSignal,
+        });
 
-      if (baseline.passed) baselinePassed += 1;
-      if (harnessResult.passed) harnessPassed += 1;
-      if (harnessResult.outcome === "escalated") escalations += 1;
-      baselineCostTotal = addCost(baselineCostTotal, baseline.costUsd);
-      harnessCostTotal = addCost(harnessCostTotal, harnessResult.costUsd);
+        progress(engine, "scored", task.id);
 
-      perTask.push({
-        id: task.id,
-        baselinePassed: baseline.passed,
-        baselineOutcome: baseline.outcome,
-        harnessPassed: harnessResult.passed,
-        harnessOutcome: harnessResult.outcome,
-        baselineUsd: baseline.costUsd,
-        harnessUsd: harnessResult.costUsd,
-      });
-    } finally {
-      // Eval scratch is transient (unlike orchestrate's own user-facing
-      // worktrees) — always auto-remove, success or failure. This also
-      // removes any worktree engine.orchestrate created for the harness
-      // side, since (post Fix 1) those always live INSIDE harnessDir.
-      await rm(baselineDir, { recursive: true, force: true });
-      await rm(harnessDir, { recursive: true, force: true });
+        if (baseline.passed) baselinePassed += 1;
+        if (harnessResult.passed) harnessPassed += 1;
+        if (harnessResult.outcome === "escalated") escalations += 1;
+        baselineCostTotal = addCost(baselineCostTotal, baseline.costUsd);
+        harnessCostTotal = addCost(harnessCostTotal, harnessResult.costUsd);
+
+        perTask.push({
+          id: task.id,
+          baselinePassed: baseline.passed,
+          baselineOutcome: baseline.outcome,
+          harnessPassed: harnessResult.passed,
+          harnessOutcome: harnessResult.outcome,
+          baselineUsd: baseline.costUsd,
+          harnessUsd: harnessResult.costUsd,
+        });
+      } finally {
+        // Eval scratch is transient (unlike orchestrate's own user-facing
+        // worktrees) — always auto-remove, success or failure (including a
+        // cancellation re-thrown from inside this try — a JS `finally`
+        // runs on any exit path). This also removes any worktree
+        // engine.orchestrate created for the harness side, since (post Fix
+        // 1) those always live INSIDE harnessDir.
+        await rm(baselineDir, { recursive: true, force: true });
+        await rm(harnessDir, { recursive: true, force: true });
+      }
     }
+  } catch (err) {
+    if (cancelSignal?.aborted) {
+      throw new RpcMethodError(RpcErrorCodes.SERVER_ERROR, "evals.run cancelled", {
+        cancelled: true,
+        taskCount: params.tasks.length,
+        completedTasks: perTask.length,
+        perTask,
+      });
+    }
+    throw err; // a genuine bug/crash, not cancellation — unchanged behavior
   }
 
   progress(engine, "done");

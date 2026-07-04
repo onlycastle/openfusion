@@ -34,6 +34,7 @@ import type { FrontierSession } from "../engines/types.js";
 import type { AgentDef, WikiPage } from "../harness/schema.js";
 import { validateHarness } from "../harness/schema.js";
 import { HarnessValidationError, loadHarness } from "../harness/store.js";
+import { RunCancelledError } from "../rpc/cancel-registry.js";
 import { RpcMethodError } from "../rpc/errors.js";
 import { requireGitRepo } from "../rpc/guards.js";
 import { wikiDbPath } from "../wiki/store.js";
@@ -82,6 +83,14 @@ export interface OrchestrateParams {
   maxWorkerAttempts?: number;
   workerTimeoutMs?: number;
   reviewTimeoutMs?: number;
+  // M7b Task 2: client-supplied (or evals.run-forwarded) run identifier used
+  // ONLY to look up (never register/deregister) this run's cancellation
+  // signal — see cancel-registry.ts's header comment for the ownership
+  // split. orchestrate() itself never mints or owns a registry entry; that
+  // is engine.orchestrate's own RPC handler's job (methods.ts), which is
+  // what lets evals.run's per-task nested orchestrate() call reuse the SAME
+  // batch-level runId without this function clobbering that registration.
+  runId?: string;
 }
 
 export interface OrchestrateAttempt {
@@ -314,12 +323,28 @@ function buildWorkerTask(agent: AgentDef, task: string, prior?: PriorAttempt): s
 // summary, not a structured verdict. Mirrors promptForJson's own
 // event-draining loop (text/result/notice/error handling) minus the JSON
 // extraction/retry.
+//
+// M7b Task 2: `abortSignal`, when provided, is this run's own cancellation
+// signal (see OrchestrateParams.runId's doc comment) — a listener calls
+// handle.abort() the instant it fires, and the turn is reported as cancelled
+// via THREE separate `.aborted` checks (before starting, in the catch, and
+// right after the loop ends normally) rather than relying on any one of them
+// alone. That triple-check is deliberate, not defensive overkill: a manual
+// handle.abort() (as opposed to a timeout) does not reliably make the
+// underlying adapter THROW a recognizable error — per claude.ts's own doc
+// comment, an abort with no timeoutMs deadline armed can just let the
+// query's iterator end quietly (`{done: true}`) — so a catch-only check
+// would miss that path entirely; the post-loop check closes that gap.
 async function runFrontierTurn(
   session: FrontierSession,
   prompt: string,
   timeoutMs: number | undefined,
+  abortSignal?: AbortSignal,
 ): Promise<{ text: string; costUsd: number | null }> {
+  if (abortSignal?.aborted) throw new RunCancelledError();
   const handle = session.prompt(prompt, { timeoutMs });
+  const onCancel = (): void => handle.abort();
+  abortSignal?.addEventListener("abort", onCancel, { once: true });
   let text = "";
   let costUsd: number | null = null;
   try {
@@ -340,8 +365,12 @@ async function runFrontierTurn(
     }
   } catch (err) {
     handle.abort();
+    if (abortSignal?.aborted) throw new RunCancelledError();
     throw err;
+  } finally {
+    abortSignal?.removeEventListener("abort", onCancel);
   }
+  if (abortSignal?.aborted) throw new RunCancelledError();
   return { text, costUsd };
 }
 
@@ -409,6 +438,7 @@ async function runEscalation(
   params: OrchestrateParams,
   agent: AgentDef,
   timeoutMs: number,
+  abortSignal?: AbortSignal,
 ): Promise<EscalationResult> {
   const manager = await engine.worker.getManager(params.projectDir);
   const worktree = await manager.create(randomUUID());
@@ -460,6 +490,7 @@ async function runEscalation(
         // the worktree (see the createSession call above).
         `${agent.prompt}\n\nComplete this task by editing files in the current working directory: ${params.task}`,
         timeoutMs,
+        abortSignal,
       );
       const diff = await manager.diff(worktree);
       const diffStat = await manager.diffStat(worktree);
@@ -495,6 +526,15 @@ async function runEscalation(
 // maxWorkerAttempts) -> escalate. See this module's header comment for the
 // composition rationale, and the M5b Task 4 brief for the full contract.
 export async function orchestrate(engine: Engine, params: OrchestrateParams): Promise<OrchestrateResult> {
+  // M7b Task 2: READ-ONLY lookup only — orchestrate() never register()s or
+  // deregister()s a runId's controller (see OrchestrateParams.runId's own
+  // doc comment and cancel-registry.ts's header comment for the ownership
+  // split this depends on). `undefined` both when no runId was given at all
+  // and when a given runId doesn't (yet, or any longer) resolve to a
+  // registered controller — either way, every downstream `abortSignal?.`
+  // check below degrades to a no-op, so an un-cancellable run behaves
+  // exactly as it did before this task.
+  const cancelSignal = params.runId !== undefined ? engine.cancelRegistry.get(params.runId)?.signal : undefined;
   const attempts: OrchestrateAttempt[] = [];
   // Tracks the most recent worktree that exists on disk and hasn't been
   // cleaned up yet — set as soon as a worktree is known to exist (BEFORE any
@@ -623,6 +663,13 @@ export async function orchestrate(engine: Engine, params: OrchestrateParams): Pr
             // undefined, so this sub-call is ALREADY self-bounding without
             // orchestrate needing to duplicate that default.
             timeoutMs: params.workerTimeoutMs,
+            // M7b Task 2: forwarded VERBATIM (including undefined) — this is
+            // the SAME runId this function only ever get()s (see the
+            // cancelSignal comment above); engine.worker.run's own handler
+            // resolves it to the identical AbortController via the same
+            // get()-only read, so engine.cancel({runId}) reaches whichever
+            // worker attempt happens to be in flight.
+            runId: params.runId,
           });
         } catch (err) {
           // FIX (M5b Task 4 review round 1, Finding 2 — Important): a
@@ -676,7 +723,7 @@ export async function orchestrate(engine: Engine, params: OrchestrateParams): Pr
           const reviewResult = await reviewDiff(
             reviewSession,
             { task: params.task, diff: workerResult.diff, summary: workerResult.summary },
-            { timeoutMs: reviewTimeoutMs },
+            { timeoutMs: reviewTimeoutMs, abortSignal: cancelSignal },
           );
           verdict = reviewResult.verdict;
           reviewUsd = addCost(reviewUsd, reviewResult.costUsd);
@@ -712,7 +759,7 @@ export async function orchestrate(engine: Engine, params: OrchestrateParams): Pr
     progress(engine, "escalate", "escalating to the frontier with write access");
     let escalation: EscalationResult;
     try {
-      escalation = await runEscalation(engine, params, routed.agent, escalateTimeoutMs);
+      escalation = await runEscalation(engine, params, routed.agent, escalateTimeoutMs, cancelSignal);
     } catch (err) {
       // Mirrors the worker-attempt catch's identical lift, above.
       const worktree = liftWorktreeFromError(err);
@@ -741,16 +788,46 @@ export async function orchestrate(engine: Engine, params: OrchestrateParams): Pr
       escalation.worktree,
     );
   } catch (err) {
+    // M7b Task 2: determined by checking the resolved cancelSignal's OWN
+    // `.aborted` flag directly (mirrors worker/methods.ts's existing
+    // timeoutSignal.aborted / controller.signal.aborted convention) rather
+    // than `err instanceof RunCancelledError` — an intermediate catch
+    // (runEscalation's own, notably) already wraps a RunCancelledError into
+    // a plain RpcMethodError by the time it reaches here, so an
+    // `instanceof` check would miss it. Checking the signal itself stays
+    // robust no matter how many layers re-wrapped the error on the way up.
+    const cancelled = cancelSignal?.aborted === true;
     // Nothing ran yet (a load/route failure before any attempt or worktree
     // existed) -> pass the original, already-correctly-coded error through
-    // untouched, matching every sibling pipeline's own guard/routing errors.
+    // untouched, matching every sibling pipeline's own guard/routing errors
+    // -- UNLESS this is a cancellation, which always gets its own dedicated
+    // "orchestrate cancelled" SERVER_ERROR with the `cancelled` marker (a
+    // caller must be able to tell "cancelled" apart from "failed" even when
+    // cancellation landed before any attempt/worktree existed at all, e.g.
+    // during the load/route stage).
     if (attempts.length === 0 && lastWorktree === null) {
+      if (cancelled) {
+        throw new RpcMethodError(RpcErrorCodes.SERVER_ERROR, "orchestrate cancelled", {
+          cancelled: true,
+          attempts: [],
+          worktree: null,
+        });
+      }
       throw err;
     }
+    // No special-case cleanup is added for the cancelled case here: a
+    // cancellation flows through the exact SAME "leave lastWorktree in
+    // place, report its path" discipline every other failure already uses
+    // (the worker-attempt catch's liftWorktreeFromError, the escalation
+    // catch's identical lift, above) — cancelling mid-run is deliberately
+    // treated just like any other failure for worktree-preservation
+    // purposes: leave a breadcrumb on disk for inspection, don't auto-delete
+    // possibly-uncommitted work.
     const message = err instanceof Error ? err.message : String(err);
     throw new RpcMethodError(RpcErrorCodes.SERVER_ERROR, `orchestrate failed: ${message}`, {
       attempts,
       worktree: lastWorktree,
+      ...(cancelled ? { cancelled: true } : {}),
     });
   }
 }

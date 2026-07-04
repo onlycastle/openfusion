@@ -23,6 +23,8 @@ fn mock_path(name: &str) -> std::path::PathBuf {
         "clean_exit_on_eof" => env!("CARGO_BIN_EXE_mock_clean_exit_on_eof"),
         "ignore_eof" => env!("CARGO_BIN_EXE_mock_ignore_eof"),
         "stdin_black_hole" => env!("CARGO_BIN_EXE_mock_stdin_black_hole"),
+        "delayed_drain_echo" => env!("CARGO_BIN_EXE_mock_delayed_drain_echo"),
+        "slow_response_echo" => env!("CARGO_BIN_EXE_mock_slow_response_echo"),
         other => panic!("no mock binary registered for scenario '{other}'"),
     })
 }
@@ -58,6 +60,75 @@ async fn concurrent_calls_each_get_their_own_response_no_cross_talk() {
     assert_eq!(a.expect("call a"), json!({"who": "a"}));
     assert_eq!(b.expect("call b"), json!({"who": "b"}));
     assert_eq!(c.expect("call c"), json!({"who": "c"}));
+}
+
+// --- M7b Task 1: framing-safe wire-writes under cancellation -------------
+//
+// THE HARD GATE (see task brief): a `call()` cancelled mid-`write_all` used
+// to leave a partial ndjson line on the engine's stdin. The *next* request's
+// bytes would land right after that unterminated partial line, and the
+// child's line-oriented reader would concatenate them into a single
+// garbage "line" -- corrupting that next request's framing. Nothing in
+// M7a ever cancelled a `call()` mid-write (no caller wrapped it in a
+// timeout), so this never fired in practice, but the cockpit's upcoming
+// per-call timeouts/cancel (Task 2) will trigger exactly this shape
+// constantly. This test proves the fix: writes must be atomic with respect
+// to caller-side cancellation, no matter when the caller's own future gets
+// dropped.
+#[tokio::test]
+async fn cancelled_mid_write_of_large_request_does_not_corrupt_next_calls_framing() {
+    // `delayed_drain_echo` deliberately does not read a single byte from
+    // stdin for 300ms, then drains + echoes every complete line forever.
+    // That delay is what makes this test deterministic rather than a race:
+    // a 4 MiB write cannot possibly complete into the OS pipe buffer (a few
+    // tens of KiB at most) before the mock starts reading, so *any*
+    // cancellation that fires while the mock is still asleep is guaranteed
+    // to interrupt a write that is genuinely still in flight, not one that
+    // (by sheer luck) already finished.
+    let bridge = std::sync::Arc::new(
+        EngineBridge::spawn(mock_path("delayed_drain_echo")).expect("spawn mock_delayed_drain_echo"),
+    );
+
+    // 4 MiB: comfortably larger than any realistic OS pipe buffer, so
+    // write_all() is guaranteed to still be mid-flight (blocked on a full
+    // pipe) when the tiny timeout below fires.
+    let huge_payload = "x".repeat(4 * 1024 * 1024);
+    let first_bridge = bridge.clone();
+    let first_outcome = tokio::time::timeout(
+        // Fires almost immediately -- well before the mock wakes up at
+        // 300ms, and well before a 4 MiB write could complete even if the
+        // mock were draining eagerly.
+        Duration::from_millis(20),
+        first_bridge.call("big.first", json!({"payload": huge_payload})),
+    )
+    .await;
+    assert!(first_outcome.is_err(), "the 20ms timeout must fire mid-write, cancelling the first call() future");
+
+    // Give the mock time to wake up (300ms sleep) and fully drain whatever
+    // ended up on the wire -- both the (possibly partial) first line and
+    // the second call's line below, however they ended up framed.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // The load-bearing assertion: a normal SUBSEQUENT call must still work.
+    // Under the old inline-write model, the first call's partial bytes (no
+    // trailing newline) sit on the wire; this second call's full line gets
+    // appended right after by the (by-then-unlocked) stdin writer, and the
+    // mock's line reader concatenates them into one unparseable line --
+    // producing no response, so this call would time out. Under the fixed
+    // writer-task model, the first call's line is either written to
+    // completion by the writer task (regardless of the caller having given
+    // up) or never sent at all -- never partial -- so this call's own line
+    // is always well-framed and gets its own correct response.
+    let second = tokio::time::timeout(Duration::from_secs(3), bridge.call("second", json!({"marker": "intact"})))
+        .await
+        .expect("a subsequent call must resolve promptly -- a corrupted stream desyncs framing and hangs it");
+
+    assert_eq!(
+        second.expect("the subsequent call must succeed, not error"),
+        json!({"marker": "intact"}),
+        "the subsequent call's response must correlate to what it actually sent -- proving its request line \
+         was not corrupted by the earlier cancelled write"
+    );
 }
 
 #[tokio::test]
@@ -178,8 +249,91 @@ async fn second_call_after_full_child_death_also_resolves_promptly_not_a_hang() 
 }
 
 #[tokio::test]
+async fn writer_task_exits_after_detecting_child_death() {
+    let bridge = EngineBridge::spawn(mock_path("die_on_request")).expect("spawn mock_die_on_request");
+
+    // First call: mock_die_on_request reads it then exit(1)s without
+    // responding, so this resolves to an error once stdout EOFs.
+    let first = tokio::time::timeout(Duration::from_secs(5), bridge.call("first", json!({})))
+        .await
+        .expect("first call must resolve within the bound, not hang");
+    assert!(first.is_err(), "child dies without responding; the first call must error");
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // The writer task itself only learns the child is dead the next time it
+    // actually tries to write (nothing proactively tells it "the child
+    // exited" the way the reader task learns via stdout EOF) -- so a second
+    // call is what gives the writer task its own chance to hit a
+    // broken-pipe write error and exit. This is the direct, mechanism-level
+    // counterpart to `second_call_after_full_child_death_..._not_a_hang`
+    // above (which only observes the *caller-facing* symptom): here we
+    // assert the writer task's `JoinHandle` itself has resolved, proving
+    // the task didn't just silently sit forever blocked on `rx.recv()`.
+    let second = tokio::time::timeout(Duration::from_secs(5), bridge.call("second", json!({})))
+        .await
+        .expect("second call must resolve within the bound, not hang");
+    assert!(second.is_err(), "a second call after the child is fully dead must also error, not hang");
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        bridge.writer_task_finished().await,
+        "the writer task must exit once it detects the child is gone (a failed write), not linger forever"
+    );
+}
+
+#[tokio::test]
+async fn call_with_timeout_fires_and_leaves_the_stream_usable_for_the_next_call() {
+    // mock_slow_response_echo sleeps 250ms before answering *each* request
+    // it reads, then loops forever (until EOF) echoing the next one the
+    // same way.
+    let bridge = EngineBridge::spawn(mock_path("slow_response_echo")).expect("spawn mock_slow_response_echo");
+
+    // Comfortably shorter than the mock's 250ms per-response delay, so this
+    // reliably fires before any response could possibly arrive.
+    let timed_out = bridge.call_with_timeout("first", json!({"n": 1}), Duration::from_millis(30)).await;
+    let err = timed_out.expect_err("a 30ms timeout against a 250ms-delayed response must time out");
+    // Mirrors `ERR_TIMEOUT` in `src/engine_bridge.rs` (private to that
+    // module, so asserted here by value) -- distinct from every other
+    // error code this bridge produces (child-exited, bridge-closed, io,
+    // serialize, unknown all live at -32001..-32005).
+    assert_eq!(err.code, -32006, "a timed-out call must report the dedicated timeout error code");
+
+    assert_eq!(
+        bridge.pending_len(),
+        0,
+        "the timed-out call's pending-map entry must be cleaned up, not leaked"
+    );
+
+    // The load-bearing part: the timed-out call's request was already fully
+    // written by the writer task (a per-call timeout only ever bounds the
+    // *response* wait -- see the module doc), so the stream is intact and a
+    // normal subsequent call must still work correctly.
+    let second = tokio::time::timeout(
+        Duration::from_secs(2),
+        bridge.call("second", json!({"marker": "still-intact"})),
+    )
+    .await
+    .expect("a subsequent call must resolve promptly -- the timed-out call must not have corrupted the stream");
+
+    assert_eq!(
+        second.expect("the subsequent call must succeed"),
+        json!({"marker": "still-intact"}),
+        "the subsequent call's response must correlate to what it actually sent"
+    );
+}
+
+#[tokio::test]
 async fn shutdown_terminates_cleanly_when_child_exits_on_eof() {
-    let bridge = EngineBridge::spawn_with_shutdown_timeout(mock_path("clean_exit_on_eof"), Duration::from_secs(2))
+    // The CONFIGURED shutdown timeout here is deliberately generous (30s --
+    // previously 2s, which flaked once under parallel-suite load) so this
+    // test's pass/fail hinges on whether the clean-EOF-exit path was taken
+    // at all, decoupled from wall-clock noise. The `elapsed < 5s` assertion
+    // below is the real check: a well-behaved child exits on EOF near-
+    // instantly, so even a heavily loaded CI box has ample margin under 5s
+    // -- while 30s is only ever approached by the (separate) kill-fallback
+    // test below, never by this one.
+    let bridge = EngineBridge::spawn_with_shutdown_timeout(mock_path("clean_exit_on_eof"), Duration::from_secs(30))
         .expect("spawn mock_clean_exit_on_eof");
 
     let started = Instant::now();
@@ -187,8 +341,9 @@ async fn shutdown_terminates_cleanly_when_child_exits_on_eof() {
     let elapsed = started.elapsed();
 
     assert!(
-        elapsed < Duration::from_secs(2),
-        "a well-behaved child should exit on EOF well before the shutdown timeout, took {elapsed:?}"
+        elapsed < Duration::from_secs(5),
+        "a well-behaved child should exit on EOF well under the (generous, 30s) shutdown timeout -- \
+         this bound proves the clean-exit path was taken, not the kill fallback, took {elapsed:?}"
     );
 
     // A call after shutdown must error, not hang.

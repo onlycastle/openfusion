@@ -46,6 +46,14 @@ const RunParamsSchema = z.object({
   // completion, so it legitimately needs more room. Mirrors the M3 pattern
   // (models/methods.ts's own timeoutMs -> AbortSignal.timeout()).
   timeoutMs: z.number().int().min(1000).max(1_800_000).optional(),
+  // M7b Task 2: when this run is itself a sub-call of engine.orchestrate (or
+  // evals.run's nested orchestrate() call), the SAME runId that call's own
+  // outermost handler registered is forwarded here verbatim -- this handler
+  // only ever get()s it (READ-ONLY; never register()s/deregister()s its
+  // own entry -- see cancel-registry.ts's header comment), so
+  // engine.cancel({runId}) reaches a worker attempt exactly as it would a
+  // review/escalation turn.
+  runId: z.string().min(1).optional(),
 });
 
 const DEFAULT_RUN_TIMEOUT_MS = 600_000;
@@ -194,6 +202,18 @@ export function registerWorkerMethods(engine: Engine): void {
     const controller = new AbortController();
     engine.worker.beginRun(controller);
 
+    // M7b Task 2: a THIRD abort source, alongside timeoutSignal/controller
+    // above -- the SAME per-run AbortController engine.orchestrate's own
+    // handler registered for `params.runId`, reached here via a READ-ONLY
+    // get() (never register()/deregister() -- see cancel-registry.ts's
+    // header comment). undefined whenever this run has no runId at all, or
+    // a runId that (for whatever reason) doesn't resolve to a registered
+    // controller -- either way AbortSignal.any below just combines whatever
+    // signals actually exist.
+    const cancelController = params.runId !== undefined ? engine.cancelRegistry.get(params.runId) : undefined;
+    const signals: AbortSignal[] = [timeoutSignal, controller.signal];
+    if (cancelController !== undefined) signals.push(cancelController.signal);
+
     try {
       const loopResult = await runWorkerLoop({
         model: languageModel,
@@ -201,7 +221,7 @@ export function registerWorkerMethods(engine: Engine): void {
         wikiDigest: params.wikiDigest,
         tools,
         maxSteps: params.maxSteps,
-        abortSignal: AbortSignal.any([timeoutSignal, controller.signal]),
+        abortSignal: AbortSignal.any(signals),
         // Step progress is likewise structured + truncated (loop.ts's own
         // ON_STEP_TEXT_TRUNCATE_CHARS) — never the model's full raw output.
         onStep: (s) => {
@@ -269,13 +289,22 @@ export function registerWorkerMethods(engine: Engine): void {
       // signal setup above for why that's safe to do here. `timeoutSignal`
       // is checked first: if BOTH happened to be aborted (a close raced a
       // timeout), "timed out" is the more informative half of that story.
+      // M7b Task 2: `cancelled` (engine.cancel({runId}) fired this run's own
+      // controller) is checked NEXT, ahead of the generic
+      // `controller.signal.aborted` (Engine.close()'s "abort ALL worker
+      // runs" mechanism) -- the two are orthogonal abort sources that just
+      // happen to share the same combined signal.
+      const cancelled = cancelController?.signal.aborted === true;
       const message = timeoutSignal.aborted
         ? `worker run timed out after ${timeoutMs}ms: ${rawMessage}`
-        : controller.signal.aborted
-          ? `worker run aborted: ${rawMessage}`
-          : rawMessage;
+        : cancelled
+          ? `worker run cancelled: ${rawMessage}`
+          : controller.signal.aborted
+            ? `worker run aborted: ${rawMessage}`
+            : rawMessage;
       throw new RpcMethodError(RpcErrorCodes.SERVER_ERROR, `worker run failed: ${message}`, {
         worktree: { path: worktree.path, branch: worktree.branch },
+        ...(cancelled ? { cancelled: true } : {}),
       });
     } finally {
       // Matches beginRun() above — every registered controller must be

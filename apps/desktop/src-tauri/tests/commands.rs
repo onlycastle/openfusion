@@ -50,6 +50,7 @@ fn mock_path(name: &str) -> std::path::PathBuf {
         "echo" => env!("CARGO_BIN_EXE_mock_echo"),
         "error" => env!("CARGO_BIN_EXE_mock_error"),
         "notify" => env!("CARGO_BIN_EXE_mock_notify"),
+        "slow_response_echo" => env!("CARGO_BIN_EXE_mock_slow_response_echo"),
         other => panic!("no mock binary registered for scenario '{other}'"),
     })
 }
@@ -58,7 +59,7 @@ fn mock_path(name: &str) -> std::path::PathBuf {
 async fn engine_call_success_passes_through_bridge_result() {
     let bridge = EngineBridge::spawn(mock_path("echo")).expect("spawn mock_echo");
 
-    let result = route_engine_call(&bridge, "wiki.search", json!({"n": 7})).await;
+    let result = route_engine_call(&bridge, "wiki.search", json!({"n": 7}), None).await;
 
     assert_eq!(result, Ok(json!({"n": 7})));
 }
@@ -67,7 +68,7 @@ async fn engine_call_success_passes_through_bridge_result() {
 async fn engine_call_error_maps_rpc_error_to_engine_call_error() {
     let bridge = EngineBridge::spawn(mock_path("error")).expect("spawn mock_error");
 
-    let err = route_engine_call(&bridge, "worker.run", json!({}))
+    let err = route_engine_call(&bridge, "worker.run", json!({}), None)
         .await
         .expect_err("error scenario always fails");
 
@@ -75,6 +76,31 @@ async fn engine_call_error_maps_rpc_error_to_engine_call_error() {
         err,
         EngineCallError { code: 123, message: "boom".to_string(), data: Some(json!({"detail": "nope"})) }
     );
+}
+
+#[tokio::test]
+async fn engine_call_with_timeout_ms_times_out_and_maps_to_engine_call_error() {
+    // mock_slow_response_echo sleeps 250ms before responding; a 20ms
+    // `timeout_ms` must fire well before that, proving the M7b Task 1
+    // `timeoutMs` wiring reaches `EngineBridge::call_with_timeout`, not just
+    // `EngineBridge::call`.
+    let bridge = EngineBridge::spawn(mock_path("slow_response_echo")).expect("spawn mock_slow_response_echo");
+
+    let err = route_engine_call(&bridge, "worker.run", json!({}), Some(20))
+        .await
+        .expect_err("a 20ms timeout against a 250ms-delayed response must time out");
+    assert_eq!(err.code, -32006, "the timeout must map to the dedicated timeout error code");
+
+    // The stream must stay usable afterward -- same framing-safety property
+    // `tests/engine_bridge.rs`'s own timeout test asserts directly against
+    // `EngineBridge`, exercised here through the command-layer entry point.
+    let second = tokio::time::timeout(
+        Duration::from_secs(2),
+        route_engine_call(&bridge, "worker.run", json!({"marker": "ok"}), None),
+    )
+    .await
+    .expect("a subsequent call through the command layer must resolve promptly");
+    assert_eq!(second, Ok(json!({"marker": "ok"})));
 }
 
 #[tokio::test]

@@ -29,6 +29,8 @@
 //! module ever grows a log line, it must stay metadata-only (e.g. "channel
 //! closed", never the JSON payload that was being forwarded).
 
+use std::time::Duration;
+
 use serde::Serialize;
 use serde_json::Value;
 use tauri::ipc::Channel;
@@ -66,28 +68,44 @@ impl std::fmt::Display for EngineCallError {
 
 impl std::error::Error for EngineCallError {}
 
-/// `invoke('engine_call', { method, params })` — generic JSON-RPC
-/// passthrough to the engine sidecar.
+/// `invoke('engine_call', { method, params, timeoutMs })` — generic
+/// JSON-RPC passthrough to the engine sidecar. `timeoutMs` is optional; Tauri
+/// maps this Rust parameter's snake_case name to the JS-facing camelCase key
+/// automatically (the same convention already relied on for `method`/
+/// `params`).
 ///
-/// Deliberately does NOT wrap `EngineBridge::call` in a timeout. A per-call
-/// deadline is an M7b concern (see the module-level engine_bridge.rs
-/// discussion of cancellation); this backbone passthrough must not
-/// introduce mid-write cancellation, so this is a plain awaited call.
+/// M7a deliberately shipped this WITHOUT a timeout: `EngineBridge::call`
+/// wrote the request line inline, and cancelling that write mid-flight
+/// would have corrupted the stream's framing (see `engine_bridge.rs`'s "M7b
+/// Task 1" module doc section). That hard gate is now closed — a dedicated
+/// writer task makes every write atomic with respect to caller
+/// cancellation — so a per-call deadline is safe to wire through here: on
+/// timeout, only the *response wait* gets cancelled, never a write.
 #[tauri::command]
 pub async fn engine_call(
     state: State<'_, std::sync::Arc<EngineBridge>>,
     method: String,
     params: Value,
+    timeout_ms: Option<u64>,
 ) -> Result<Value, EngineCallError> {
-    route_engine_call(state.inner(), &method, params).await
+    route_engine_call(state.inner(), &method, params, timeout_ms).await
 }
 
 /// The actual `engine_call` routing logic, factored out of the
 /// `#[tauri::command]` wrapper so it can be exercised in `cargo test`
 /// against a real (mock-sidecar-backed) `EngineBridge` without a Tauri
 /// `State`/`App`.
-pub async fn route_engine_call(bridge: &EngineBridge, method: &str, params: Value) -> Result<Value, EngineCallError> {
-    bridge.call(method, params).await.map_err(EngineCallError::from)
+pub async fn route_engine_call(
+    bridge: &EngineBridge,
+    method: &str,
+    params: Value,
+    timeout_ms: Option<u64>,
+) -> Result<Value, EngineCallError> {
+    let result = match timeout_ms {
+        Some(ms) => bridge.call_with_timeout(method, params, Duration::from_millis(ms)).await,
+        None => bridge.call(method, params).await,
+    };
+    result.map_err(EngineCallError::from)
 }
 
 /// `invoke('engine_events', { channel })` — the webview calls this once to

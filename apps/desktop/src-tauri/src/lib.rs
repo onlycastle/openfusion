@@ -6,18 +6,23 @@
 // `invoke`/`Channel` surface to the bridge), and Task 5's engine lifecycle
 // ownership (spawn in `.setup()`, explicit bounded `shutdown()` wired to
 // `RunEvent::ExitRequested` — see `shutdown_engine_bridge_on_exit` below).
+// M7b Task 4 adds `secrets` — the Keychain BYOK secret store (memory-default,
+// opt-in persist; see that module's docs for the full flow and the
+// opted-in-persisted-ids index mechanism).
 // See docs/research/2026-07-04-m7-tauri-verification.md for the full
 // architecture this scaffold is built toward, and
 // docs/superpowers/specs/2026-07-03-harness-fusion-app-design.md §5/§9 for
 // how this realizes the spec's shell architecture.
 pub mod commands;
 pub mod engine_bridge;
+pub mod secrets;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use engine_bridge::EngineBridge;
+use secrets::{KeyringImpl, SecretStore};
 use tauri::Manager;
 
 /// Outer bound on the app-exit shutdown path (`shutdown_engine_bridge_on_exit`).
@@ -41,6 +46,15 @@ const EXIT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(8);
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let app = tauri::Builder::default()
+        // The Project screen's "Choose project…" directory picker
+        // (`apps/desktop/src/screens/ProjectScreen.tsx`) calls
+        // `@tauri-apps/plugin-dialog`'s `open({directory: true})` — that JS
+        // API is backed by this plugin's own Tauri commands (not something
+        // `commands.rs` wraps), so it needs registering here plus the
+        // `dialog:allow-open` permission grant in
+        // `capabilities/default.json` (capabilities gate webview->plugin
+        // calls the same way they would gate a call into `commands.rs`).
+        .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             let binary_path = resolve_dev_sidecar_binary_path()?;
 
@@ -61,9 +75,30 @@ pub fn run() {
                 EngineBridge::spawn(binary_path)?
             };
             app.manage(Arc::new(bridge));
+
+            // Keychain BYOK secret store (see `secrets.rs` module doc for
+            // the full memory-default/opt-in-persist flow). Managed state
+            // is created fresh (empty memory map) every launch; the
+            // `load_persisted()` call right after is what restores any
+            // previously opted-in-to-persist secrets from the Keychain
+            // BEFORE the webview can possibly ask for one — this is the
+            // Rust-side half of the "persist a key -> quit -> relaunch ->
+            // restored" operator smoke (see `secrets.rs` tests module doc).
+            let secret_store = Arc::new(SecretStore::new(Arc::new(KeyringImpl::new())));
+            secret_store.load_persisted();
+            app.manage(secret_store);
+
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![commands::engine_call, commands::engine_events])
+        .invoke_handler(tauri::generate_handler![
+            commands::engine_call,
+            commands::engine_events,
+            secrets::set_secret,
+            secrets::get_secret,
+            secrets::delete_secret,
+            secrets::list_secret_ids,
+            secrets::load_persisted_secrets,
+        ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application");
 

@@ -13,6 +13,7 @@ import { harnessStatus, writeHarness } from "../src/harness/store.js";
 import type { CostMeter } from "../src/models/meter.js";
 import { goldenTaskFromCommit, synthEvalTask, type EvalTask } from "../src/evals/tasks.js";
 import { runEvals } from "../src/evals/run.js";
+import { RpcMethodError } from "../src/rpc/errors.js";
 
 // Fixture literal only — must never appear outside test files (mirrors
 // orchestrate.test.ts's identical TEST_API_KEY constant/rationale).
@@ -885,6 +886,159 @@ describe("runEvals — eval scratch dir placement + cleanup", () => {
       expect(existsSync(d)).toBe(false);
     }
   });
+});
+
+// M7b Task 2: mid-batch cancellation. Unlike makeFakeEvalsFrontierAdapter's
+// own blockReviewUntilClose-style fixtures elsewhere in this codebase (whose
+// prompt handle's abort() is a no-op — only close() ever unblocked them,
+// which was fine for the M6 close()-only mechanism), engine.cancel's new
+// per-run signal reaches a session via `handle.abort()`, NOT `session.close()`
+// — so THIS fixture wires abort() to actually unblock its blocked generator.
+//
+// Distinguishes baseline vs. harness-escalation calls via resultLabel
+// (mirrors makeFakeEvalsFrontierAdapter above), and counts ESCALATE calls
+// (1-based) so a specific one — the second, i.e. the SECOND task's harness
+// side — can be scripted to block until aborted. The FIRST escalate call
+// (task 1) and every baseline call complete immediately and normally.
+interface CancelEvalsFrontierOptions {
+  blockOnEscalateCallIndex: number;
+  blockReached: { count: number };
+}
+
+function makeCancelEvalsFrontierAdapter(opts: CancelEvalsFrontierOptions): FrontierAdapter {
+  let escalateCallIndex = 0;
+  return {
+    kind: "claude-code",
+    async createSession({ projectDir, resultLabel }): Promise<FrontierSession> {
+      const isEscalate = resultLabel === "frontier-escalate";
+      let thisEscalateIndex = 0;
+      if (isEscalate) {
+        escalateCallIndex += 1;
+        thisEscalateIndex = escalateCallIndex;
+      }
+      const shouldBlock = isEscalate && thisEscalateIndex === opts.blockOnEscalateCallIndex;
+
+      let resolveUnblock: () => void = () => {};
+      const unblock = new Promise<void>((resolve) => {
+        resolveUnblock = resolve;
+      });
+
+      return {
+        id: randomUUID(),
+        projectDir,
+        prompt(_text: string, _promptOpts?: { timeoutMs?: number }): FrontierPromptHandle {
+          if (shouldBlock) {
+            opts.blockReached.count += 1;
+            async function* gen(): AsyncGenerator<FrontierEvent> {
+              await unblock;
+              // Ends without ever yielding a result event -- mirrors a
+              // wedged turn that never got to finish; cancellation, not
+              // the turn itself, ended it.
+            }
+            // The load-bearing difference from every OTHER fake adapter's
+            // no-op abort() in this test suite: abort() is what a
+            // cancellation actually calls (via orchestrate.ts's
+            // runFrontierTurn abort-threading), so it must be wired to
+            // really unblock the generator above.
+            return { events: gen(), abort: () => resolveUnblock() };
+          }
+          async function* gen(): AsyncGenerator<FrontierEvent> {
+            yield { type: "text", text: "done" };
+            yield {
+              type: "result",
+              resultText: "done",
+              costUsd: 0.01,
+              usage: { inputTokens: 10, outputTokens: 5, cacheReadTokens: 0 },
+              numTurns: 1,
+              durationMs: 1,
+              engineSessionId: null,
+            };
+          }
+          return { events: gen(), abort: () => {} };
+        },
+        async close(): Promise<void> {},
+      };
+    },
+  };
+}
+
+describe("runEvals — mid-batch cancel (M7b Task 2)", () => {
+  it("cancels between/within tasks: in-flight scratch dirs are removed, remaining tasks never even start, and the registry empties", async () => {
+    dir = await makeHarnessFixture();
+    engine = createEngine();
+    const blockReached = { count: 0 };
+    engine.frontier.registerAdapter(
+      makeCancelEvalsFrontierAdapter({ blockOnEscalateCallIndex: 2, blockReached }),
+    );
+
+    const capturedDirs: string[] = [];
+    const capturedTaskIds: string[] = [];
+    const tasks: EvalTask[] = ["t1", "t2", "t3"].map((id) => {
+      const base = synthEvalTask({ id, sourceFile: `source-${id}.js`, testFile: `test-${id}.js` });
+      return {
+        ...base,
+        setup: async (d: string) => {
+          capturedDirs.push(d);
+          capturedTaskIds.push(id);
+          await base.setup(d);
+        },
+      };
+    });
+
+    // runEvals() is the engine-internal API (see this file's own
+    // WIRE-SAFETY comment on EvalTask.setup) -- it only ever get()s a
+    // runId's controller, never register()s/deregister()s it (that is
+    // engine.evals.run's own RPC handler's job, methods.ts). This test
+    // calls runEvals directly (required so its EvalTask fixtures, with real
+    // setup() closures, never have to cross a wire) but must therefore
+    // stand in for that handler's own register/finally-deregister wrapping
+    // itself, so the registry-no-leak property is genuinely exercised.
+    const runId = "eval-batch-1";
+    engine.cancelRegistry.register(runId);
+    let caught: unknown;
+    try {
+      const runPromise = runEvals(engine, { projectDir: dir, tasks, runId });
+
+      const deadline = Date.now() + 10_000;
+      while (blockReached.count < 1) {
+        if (Date.now() > deadline) throw new Error("harness escalation call never started blocking");
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+
+      const cancelRes = await call(engine, "engine.cancel", { runId });
+      expect(cancelRes.error).toBeUndefined();
+      expect(cancelRes.result.cancelled).toBe(true);
+
+      try {
+        await runPromise;
+      } catch (err) {
+        caught = err;
+      }
+    } finally {
+      engine.cancelRegistry.deregister(runId);
+    }
+
+    expect(caught).toBeInstanceOf(RpcMethodError);
+    const err = caught as RpcMethodError;
+    expect(err.code).toBe(RpcErrorCodes.SERVER_ERROR);
+    expect((err.data as { cancelled?: boolean }).cancelled).toBe(true);
+
+    // Task 1 (baseline + harness, both completed normally) and task 2
+    // (baseline completed normally; harness escalation was in flight when
+    // cancelled) each contributed one baseline dir + one harness dir --
+    // task 3 never even started: its own scratch dirs were never created,
+    // so task.setup was never called for it, so its id was never captured
+    // (checked directly below, not just inferred from a total count).
+    expect(capturedDirs).toHaveLength(4);
+    expect(capturedTaskIds).toEqual(["t1", "t1", "t2", "t2"]);
+    for (const d of capturedDirs) {
+      expect(existsSync(d)).toBe(false);
+    }
+
+    // No leak: this registry entry is gone once the (manually wrapped)
+    // register/deregister scope above has closed.
+    expect(engine.cancelRegistry.size()).toBe(0);
+  }, 15_000);
 });
 
 describe("runEvals — evals.progress notifications", () => {

@@ -44,6 +44,14 @@ const OrchestrateParamsSchema = z.object({
   maxWorkerAttempts: z.number().int().min(1).max(3).optional(),
   workerTimeoutMs: z.number().int().min(WORKER_TIMEOUT_MIN_MS).max(WORKER_TIMEOUT_MAX_MS).optional(),
   reviewTimeoutMs: z.number().int().min(REVIEW_TIMEOUT_MIN_MS).max(REVIEW_TIMEOUT_MAX_MS).optional(),
+  // M7b Task 2: client-supplied (or evals.run-forwarded) run identifier —
+  // OPTIONAL, so an omitted runId keeps this run entirely un-cancellable
+  // (no engine.cancel({runId}) call could ever reach it) without changing
+  // any other behavior. THIS handler is the ONLY place that ever
+  // register()s/deregister()s the AbortController this runId maps to (see
+  // cancel-registry.ts's header comment) — every nested call
+  // (orchestrate()'s own pipeline, engine.worker.run) only ever get()s it.
+  runId: z.string().min(1).optional(),
 });
 
 const ApplyParamsSchema = z.object({
@@ -63,11 +71,24 @@ export class OrchestrateService {}
 
 export function registerOrchestrateMethods(engine: Engine): void {
   registerMethod(engine.dispatcher, "engine.orchestrate", OrchestrateParamsSchema, async (params) => {
-    const result: OrchestrateResult = await orchestrate(engine, params as OrchestrateParams);
-    engine.log(
-      `orchestrate ${params.projectDir}: outcome=${result.outcome} attempts=${result.attempts.length}`,
-    );
-    return result;
+    // M7b Task 2: THIS handler is the outermost owner of `runId`'s
+    // lifecycle — register() right before the run starts, deregister() in
+    // `finally` regardless of outcome (success, failure, or cancellation),
+    // so CancelRegistry never leaks an entry for a run that has already
+    // ended. orchestrate() itself (and, for a nested evals.run-driven call,
+    // engine.worker.run's own handler) only ever get()s this SAME runId —
+    // see cancel-registry.ts's header comment for the full ownership split.
+    const runId = params.runId;
+    if (runId !== undefined) engine.cancelRegistry.register(runId);
+    try {
+      const result: OrchestrateResult = await orchestrate(engine, params as OrchestrateParams);
+      engine.log(
+        `orchestrate ${params.projectDir}: outcome=${result.outcome} attempts=${result.attempts.length}`,
+      );
+      return result;
+    } finally {
+      if (runId !== undefined) engine.cancelRegistry.deregister(runId);
+    }
   });
 
   registerMethod(engine.dispatcher, "engine.orchestrate.apply", ApplyParamsSchema, async ({ projectDir, diff }) => {

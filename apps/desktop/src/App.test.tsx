@@ -1,0 +1,96 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { render, screen, fireEvent, waitFor, cleanup } from "@testing-library/react";
+
+// `vitest.config`'s `test.globals` is `false` (every test file imports its
+// own vitest globals explicitly — see vite.config.ts), so
+// @testing-library/react's usual auto-registered `afterEach(cleanup)` can't
+// detect a global test framework and never runs; do it explicitly instead,
+// or the second test in this file finds two mounted trees (the previous
+// test's + this one's) and every `getByRole` query throws "found multiple
+// elements".
+afterEach(cleanup);
+
+// Same mocking approach as engineClient.test.ts: see that file's comment on
+// why `vi.hoisted` is needed for a factory that needs to reference outer-
+// scope values (a plain `class`/`const` declared below the hoisted
+// `vi.mock` call would still be in its temporal dead zone when the factory
+// runs).
+const { invokeMock, FakeChannel } = vi.hoisted(() => {
+  class FakeChannel<T> {
+    onmessage: ((message: T) => void) | undefined;
+  }
+  return { invokeMock: vi.fn(), FakeChannel };
+});
+
+vi.mock("@tauri-apps/api/core", () => ({
+  invoke: (...args: unknown[]) => invokeMock(...args),
+  Channel: FakeChannel,
+}));
+
+beforeEach(() => {
+  invokeMock.mockReset();
+  invokeMock.mockImplementation((cmd: string) => {
+    if (cmd === "engine_call") return Promise.resolve({ providers: [] });
+    if (cmd === "list_secret_ids") return Promise.resolve([]);
+    return Promise.resolve(undefined);
+  });
+  // Reset route state between tests — jsdom's `window` persists across
+  // `it` blocks within this file.
+  window.location.hash = "";
+});
+
+/** `engineClient` (imported by App.tsx) is a real module-level singleton —
+ * on purpose, that's what makes "one subscription for the whole app" hold
+ * in production. In tests that means it'd otherwise stay subscribed across
+ * `it()` blocks in this file (only the mock's call history resets, not the
+ * client's internal `#subscribed` flag). `vi.resetModules()` plus a fresh
+ * dynamic import gives each test its own `App` + `engineClient` instance,
+ * mirroring one real app launch per test. */
+async function freshApp() {
+  vi.resetModules();
+  const mod = await import("./App");
+  return mod.App;
+}
+
+describe("App shell", () => {
+  it("renders the nav and the default Project route, using the mocked engine client", async () => {
+    const App = await freshApp();
+    render(<App />);
+
+    expect(screen.getByRole("navigation")).toBeTruthy();
+    expect(screen.getByRole("heading", { level: 1, name: "Project" })).toBeTruthy();
+
+    // ProjectScreen's engineClient.modelsList() call resolves asynchronously
+    // (mocked invoke); wait for the ready state so this test doesn't leave
+    // a dangling unresolved effect behind it.
+    await waitFor(() => expect(screen.getByText(/No providers configured/)).toBeTruthy());
+  });
+
+  it("switches routes on nav click, showing the other screen, and the Orchestrate stub says coming in M7c", async () => {
+    const App = await freshApp();
+    render(<App />);
+    await waitFor(() => expect(screen.getByText(/No providers configured/)).toBeTruthy());
+
+    fireEvent.click(screen.getByRole("button", { name: "Keys" }));
+    expect(screen.getByRole("heading", { level: 1, name: "Keys" })).toBeTruthy();
+    await waitFor(() => expect(screen.getByText(/No keys set yet/)).toBeTruthy());
+
+    fireEvent.click(screen.getByRole("button", { name: "Orchestrate" }));
+    expect(screen.getByRole("heading", { level: 1, name: "Orchestrate" })).toBeTruthy();
+    expect(screen.getByText(/Coming in M7c/)).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: "Evals" }));
+    expect(screen.getByRole("heading", { level: 1, name: "Evals" })).toBeTruthy();
+    expect(screen.getByText(/Coming in M7c/)).toBeTruthy();
+  });
+
+  it("establishes exactly one engine_events subscription for the whole app on mount", async () => {
+    const App = await freshApp();
+    render(<App />);
+
+    await waitFor(() => {
+      const engineEventsCalls = invokeMock.mock.calls.filter(([cmd]) => cmd === "engine_events");
+      expect(engineEventsCalls).toHaveLength(1);
+    });
+  });
+});

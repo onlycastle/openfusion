@@ -37,6 +37,23 @@ export interface ReviewDiffOpts {
   // M5b Task 4's orchestrator, which owns overall run deadlines and is the
   // first caller to actually pass a value here.
   timeoutMs?: number;
+  // M7b Task 2: this run's own cancellation signal (orchestrate.ts's
+  // cancelSignal, a READ-ONLY get() off engine.cancelRegistry) — forwarded
+  // verbatim to promptForJson's own opts.abortSignal, which applies it
+  // per-attempt (see driver.ts's own doc comment). Absent -> undefined ->
+  // every downstream `abortSignal?.` check is a no-op, so an un-cancellable
+  // review call behaves exactly as before this task.
+  //
+  // IMPORTANT -- pair this with `timeoutMs` (this opts type's own field
+  // above): per driver.ts's PromptForJsonOpts.abortSignal doc comment, the
+  // forced-subprocess-kill-on-abort guarantee only holds when a timeoutMs
+  // is ALSO armed -- the real Claude adapter (engines/claude.ts) only wires
+  // an abort into its combined, force-killing signal when a timeout is
+  // set; an abortSignal without a timeoutMs degrades to a cooperative
+  // abort a wedged subprocess could simply ignore. Any caller passing
+  // abortSignal here for review-call cancellation MUST also pass
+  // timeoutMs to get an actual kill guarantee, not just a polite request.
+  abortSignal?: AbortSignal;
 }
 
 // Final review Fix 4 (Important): the diff/summary are fenced in
@@ -131,6 +148,7 @@ export async function reviewDiff(
   const result = await promptForJson(session, prompt, ReviewVerdictSchema, {
     stage: "review",
     timeoutMs: opts.timeoutMs,
+    abortSignal: opts.abortSignal,
   });
   return { verdict: result.value, costUsd: result.costUsd };
 }
