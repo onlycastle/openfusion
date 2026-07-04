@@ -81,6 +81,58 @@ export interface CallOptions {
   timeoutMs?: number;
 }
 
+/** Thrown by a `CancellableRun`'s `promise` when the run ended because it was
+ * CANCELLED, as opposed to a genuine failure. `engine.orchestrate`'s and
+ * `engine.evals.run`'s own pipelines (packages/engine/src/orchestrate/
+ * orchestrate.ts, packages/engine/src/evals/run.ts) report a cancellation as
+ * a SERVER_ERROR `EngineError` whose `data.cancelled === true` — this class
+ * is what a `runOrchestrate`/`runEvals` caller actually sees instead, so a UI
+ * catch site can `instanceof RunCancelledError` to render "Cancelled" rather
+ * than "Failed" without inspecting `error.data` itself. `data` carries
+ * whatever the underlying `EngineError` attached (orchestrate's own partial
+ * `attempts`/`worktree`, or evals.run's own `taskCount`/`completedTasks`/
+ * `perTask`) so a caller can still show partial progress if it wants to. */
+export class RunCancelledError extends Error {
+  readonly runId: string;
+  readonly data: unknown;
+
+  constructor(runId: string, data: unknown) {
+    super(`run ${runId} was cancelled`);
+    this.name = "RunCancelledError";
+    this.runId = runId;
+    this.data = data;
+  }
+}
+
+/** True for an `EngineError` carrying the engine's cancellation marker
+ * (`data.cancelled === true` — see `RunCancelledError`'s own doc comment for
+ * exactly which engine-side catch sets it). Anything else — a plain object
+ * `data` with no `cancelled` field, a non-object `data`, or a rejection that
+ * isn't an `EngineError` at all — is a genuine failure, not a cancellation. */
+function isCancelledEngineError(err: unknown): err is EngineError {
+  return (
+    err instanceof EngineError &&
+    typeof err.data === "object" &&
+    err.data !== null &&
+    (err.data as { cancelled?: unknown }).cancelled === true
+  );
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// engine.cancel({runId}) returns {cancelled:false} both for an unknown/
+// already-finished runId AND for the cancel-before-register race (the RPC
+// handler that mints and register()s this runId — orchestrate/methods.ts's
+// or evals/methods.ts's own handler — hasn't reached its register() call
+// yet when engine.cancel arrives). CancellableRun.cancel() can't tell those
+// apart from the response alone, so it retries a bounded few times, a short
+// delay apart, UNLESS the run has already settled on its own (nothing left
+// to cancel) — see `#startCancellableRun`'s own `cancel` closure below.
+const CANCEL_RETRY_ATTEMPTS = 3;
+const CANCEL_RETRY_DELAY_MS = 150;
+
 // ---------------------------------------------------------------------------
 // engine_events notifications: a typed envelope + pub/sub
 // ---------------------------------------------------------------------------
@@ -112,6 +164,20 @@ function toEngineNotification(message: unknown): EngineNotification {
 
 export type EngineEventHandler = (notification: EngineNotification) => void;
 export type Unsubscribe = () => void;
+
+/** The result of starting a cancellable long-running engine call
+ * (`runOrchestrate`/`runEvals` below): a client-minted `runId` (also passed
+ * to the engine RPC call so `engine.cancel({runId})` can reach it), the
+ * call's own `promise` (rejects with a `RunCancelledError` — not a plain
+ * `EngineError` — if the run was cancelled rather than genuinely failing),
+ * and a `cancel()` that requests cancellation (see `#startCancellableRun`'s
+ * own doc comment for the full contract, including the cancel-before-register
+ * retry and the single-run-at-a-time progress-filtering assumption). */
+export interface CancellableRun<T> {
+  runId: string;
+  promise: Promise<T>;
+  cancel: () => Promise<void>;
+}
 
 // ---------------------------------------------------------------------------
 // Hand-mirrored response shapes — evaluated at Task 6, kept hand-mirrored
@@ -185,6 +251,174 @@ export interface WikiStatus {
   refs: number;
 }
 
+// M7c Task 2: the `engine.orchestrate`/`engine.evals.run` result shapes the
+// Orchestrate/Eval-report-card cockpit screens need — same hand-mirror
+// posture and drift caveat as `WikiBuildStats`/`WikiStatus` above (checked
+// field-for-field against `packages/engine/src/orchestrate/orchestrate.ts`'s
+// `OrchestrateResult`/`OrchestrateAttempt` and
+// `packages/engine/src/evals/run.ts`'s `EvalsReportCard`/`PerTaskResult` as
+// of this task; a later engine-side shape change has no compile-time link to
+// these interfaces).
+
+/** Mirrors `packages/engine/src/models/meter.ts`'s `PricingConfidence`. */
+export type PricingConfidence = "verified" | "provider-reported" | "secondary" | "unverified" | "unpriced";
+
+/** Mirrors `packages/engine/src/orchestrate/review.ts`'s `ReviewVerdict` —
+ * the structured decision a read-only frontier review session returns for
+ * one worker attempt's diff. */
+export interface ReviewVerdict {
+  decision: "approve" | "request-changes";
+  reasons: string[];
+  severity: "none" | "minor" | "major";
+}
+
+/** Mirrors `OrchestrateAttempt` (orchestrate.ts) — one worker or frontier
+ * attempt within a single `engine.orchestrate` run. `verdict` is present once
+ * a worker attempt's (non-empty) diff has been reviewed; `empty: true` marks
+ * an attempt that produced no changes at all (never reached review). */
+export interface OrchestrateAttempt {
+  n: number;
+  kind: "worker" | "frontier";
+  summary: string;
+  verdict?: ReviewVerdict;
+  empty?: boolean;
+}
+
+/** Mirrors `OrchestrateResult` (orchestrate.ts) — the full result of one
+ * `engine.orchestrate` run: which agent/model it routed to, every attempt
+ * made, the final diff (empty on `"failed"`), the worktree it was produced
+ * in (`null` once cleaned up — a `"failed"` outcome with an empty escalation
+ * diff, notably), and a cost breakdown.
+ *
+ * `cost.pricingConfidence` is NOT part of the engine's actual
+ * `OrchestrateResult` today — only `EvalsReportCard` carries a top-level
+ * `pricingConfidence` (below), aggregated across a whole eval run. Kept here
+ * as an OPTIONAL field per this task's own brief, so the Orchestrate screen
+ * can read it defensively if a future engine change adds a per-run pricing
+ * confidence to `cost` — but this type must not be read as claiming the
+ * engine returns it today (see this section's drift-caveat header comment).
+ */
+export interface OrchestrateResult {
+  outcome: "worker-approved" | "escalated" | "failed";
+  agent: string;
+  taskClass: string;
+  resolution: { providerId: string; model: string } | "frontier";
+  attempts: OrchestrateAttempt[];
+  diff: string;
+  diffStat: string;
+  worktree: { path: string; branch: string } | null;
+  cost: {
+    workerUsd: number | null;
+    reviewUsd: number | null;
+    frontierUsd: number | null;
+    escalateUsd: number | null;
+    totalUsd: number | null;
+    note: "estimate-class";
+    pricingConfidence?: PricingConfidence;
+  };
+}
+
+/** Mirrors `HarnessTaskOutcome` (evals/run.ts) — the harness side's per-task
+ * outcome, one step wider than `OrchestrateResult["outcome"]` to name the two
+ * ways scoring can fail WITHOUT `engine.orchestrate` itself failing:
+ * `"apply-failed"` (a diff was produced but didn't apply) and `"error"` (the
+ * orchestrate call itself threw). Both are MEASUREMENT failures, not quality
+ * evidence — see `EvalsReportCard.measurementFailureCount`. */
+export type HarnessTaskOutcome = OrchestrateResult["outcome"] | "apply-failed" | "error";
+
+/** Mirrors `BaselineTaskOutcome` (evals/run.ts) — symmetric with
+ * `HarnessTaskOutcome`: `"error"` means the direct frontier baseline turn
+ * itself failed before producing a scoreable attempt; `"completed"` means it
+ * ran to completion (independent of whether it actually passed). */
+export type BaselineTaskOutcome = "completed" | "error";
+
+/** Mirrors `PerTaskResult` (evals/run.ts) — one paired baseline-vs-harness
+ * task result within an `engine.evals.run` report card. */
+export interface PerTaskResult {
+  id: string;
+  baselinePassed: boolean;
+  baselineOutcome: BaselineTaskOutcome;
+  harnessPassed: boolean;
+  harnessOutcome: HarnessTaskOutcome;
+  baselineUsd: number | null;
+  harnessUsd: number | null;
+}
+
+/** Mirrors `EvalsReportCard` (evals/run.ts) — the M6 baseline-vs-harness
+ * report card `engine.evals.run` returns. `savingsPct`/`qualityHeld` are the
+ * RAW (all-task) figures; `verdict` is actually computed off the CLEAN
+ * subset (tasks where neither side hit a measurement failure) — the
+ * `clean*`/`measurementFailureCount` fields (M7c Task 1) surface exactly the
+ * numbers that computation used, so a caller can show WHY a verdict is what
+ * it is without re-deriving them from `perTask`. */
+export interface EvalsReportCard {
+  taskCount: number;
+  baseline: { passed: number; costUsd: number | null };
+  harness: { passed: number; costUsd: number | null; escalations: number };
+  savingsPct: number | null;
+  qualityHeld: boolean;
+  verdict: "pass" | "fail" | "inconclusive";
+  pricingConfidence: PricingConfidence;
+  perTask: PerTaskResult[];
+  note: string;
+  cleanTaskCount: number;
+  cleanBaselinePassed: number;
+  cleanHarnessPassed: number;
+  cleanSavingsPct: number | null;
+  measurementFailureCount: number;
+}
+
+// -- runOrchestrate/runEvals request params (runId is minted internally —
+// see `#startCancellableRun` — so it is deliberately NOT part of either
+// caller-facing params type below) ------------------------------------------
+
+/** Mirrors `OrchestrateParams` (orchestrate.ts), minus `runId` (minted by
+ * `runOrchestrate` itself) — the params a caller supplies. */
+export interface OrchestrateRunParams {
+  projectDir: string;
+  task: string;
+  maxWorkerAttempts?: number;
+  workerTimeoutMs?: number;
+  reviewTimeoutMs?: number;
+}
+
+/** Mirrors `engine.evals.run`'s RPC-level `TaskDescriptorSchema`
+ * (evals/methods.ts) — a JSON-safe golden-commit descriptor, the only task
+ * shape this RPC method accepts (see that file's own header comment for why
+ * the engine-internal `EvalTask` with its `setup()` closure can never cross
+ * the wire). */
+export interface EvalsTaskDescriptor {
+  commitSha: string;
+  testCommand: string[];
+}
+
+/** Mirrors `engine.evals.run`'s RPC-level `RunParamsSchema` (evals/methods.ts),
+ * minus `runId` (minted by `runEvals` itself). */
+export interface EvalsRunRequestParams {
+  projectDir: string;
+  tasks: EvalsTaskDescriptor[];
+  sampleNote?: string;
+}
+
+// -- progress notification payloads ------------------------------------------
+
+/** Mirrors `orchestrate.ts`'s own `progress()` helper's notification params
+ * (`engine.notify("orchestrate.progress", { stage, detail })`) — both fields
+ * are always present on every emission. */
+export interface OrchestrateProgressEvent {
+  stage: string;
+  detail: string;
+}
+
+/** Mirrors `evals/run.ts`'s own `progress()` helper's notification params
+ * (`engine.notify("evals.progress", taskId ? { stage, taskId } : { stage })`)
+ * — `taskId` is only present once a specific task's baseline/harness/scored
+ * stage is reached (absent for the run-level `"start"`/`"done"` stages). */
+export interface EvalsProgressEvent {
+  stage: string;
+  taskId?: string;
+}
+
 /** The engine-RPC half of the client (`call` + typed method wrappers) plus
  * the single-subscription notification pub/sub. Construct your own instance
  * in tests; the app itself imports the `engineClient` singleton below. */
@@ -254,6 +488,146 @@ export class EngineClient {
    * non-git directory. */
   wikiStatus(projectDir: string, opts?: CallOptions): Promise<WikiStatus> {
     return this.call<WikiStatus>("engine.wiki.status", { projectDir }, opts);
+  }
+
+  // -- cancellable long runs (M7c Task 2) ----------------------------------
+
+  /** `engine.orchestrate` as a `CancellableRun<OrchestrateResult>` — see
+   * `#startCancellableRun`'s own doc comment for the full contract (UUID
+   * runId, no timeoutMs, progress filtering + its single-run assumption,
+   * cancel-before-register retry, `RunCancelledError` mapping). */
+  runOrchestrate(
+    params: OrchestrateRunParams,
+    onProgress?: (event: OrchestrateProgressEvent) => void,
+  ): CancellableRun<OrchestrateResult> {
+    return this.#startCancellableRun<OrchestrateResult, OrchestrateProgressEvent>(
+      "engine.orchestrate",
+      "orchestrate.progress",
+      params,
+      onProgress,
+    );
+  }
+
+  /** `engine.evals.run` as a `CancellableRun<EvalsReportCard>` — see
+   * `#startCancellableRun`'s own doc comment for the full contract. */
+  runEvals(
+    params: EvalsRunRequestParams,
+    onProgress?: (event: EvalsProgressEvent) => void,
+  ): CancellableRun<EvalsReportCard> {
+    return this.#startCancellableRun<EvalsReportCard, EvalsProgressEvent>(
+      "engine.evals.run",
+      "evals.progress",
+      params,
+      onProgress,
+    );
+  }
+
+  /** The shared engine behind `runOrchestrate`/`runEvals`:
+   *
+   * 1. Mints a UUID `runId` (`crypto.randomUUID()`, available in the
+   *    webview) and passes it to `method` ALONGSIDE `params`.
+   * 2. Fires that call via the plain `call<T>(method, params)` — NO `opts`,
+   *    and therefore NO `timeoutMs`. HARD RULE: a long `engine.orchestrate`/
+   *    `engine.evals.run` call must NEVER carry a client-side timeoutMs — a
+   *    Rust-side per-call timeout (`commands.rs`'s `call_with_timeout`)
+   *    abandons the RESPONSE while the engine run keeps executing in the
+   *    background; `engine.cancel({runId})` is the only real stop.
+   * 3. Subscribes to `onEngineEvent`, forwarding every notification whose
+   *    `method` equals `progressMethod` (and, when present, whose `runId`
+   *    matches THIS run's) to `onProgress`, and unsubscribes the instant the
+   *    run's promise settles (success, failure, OR cancellation) — no leaked
+   *    subscription.
+   *
+   *    RUNID FILTERING (M7c Task 5): `orchestrate.progress`/`evals.progress`
+   *    now carry a `runId` (the engine-side fix — `orchestrate.ts`'s and
+   *    `evals/run.ts`'s own `progress()` helpers). This filters on it when
+   *    present: a notification whose `params.runId` is defined and does NOT
+   *    equal this run's own `runId` is dropped, so two concurrently in-flight
+   *    runs of the SAME kind no longer interleave onto each other's
+   *    `onProgress`. Kept BACKWARD TOLERANT for a notification with no
+   *    `runId` at all (`params.runId === undefined`) — treated as "not
+   *    filterable, forward it anyway" rather than dropped, so an older
+   *    engine build (or any future notification this client doesn't fully
+   *    type) can't silently go missing.
+   * 4. Returns a `cancel()` that calls `engine.cancel({runId})`. A
+   *    `{cancelled:true}` response means the run's own pipeline will reject
+   *    with the cancellation marker shortly (handled by the `.catch` below).
+   *    A `{cancelled:false}` response is ambiguous — it means either
+   *    "unknown/already-finished runId" OR the CANCEL-BEFORE-REGISTER race
+   *    (this call reached the engine before `engine.orchestrate`'s/
+   *    `engine.evals.run`'s own RPC handler called `CancelRegistry.register`
+   *    for this runId — see `cancel-registry.ts`'s header comment). If the
+   *    run's promise is STILL PENDING when that ambiguous `false` comes
+   *    back, it's treated as the race and retried up to
+   *    `CANCEL_RETRY_ATTEMPTS` times, `CANCEL_RETRY_DELAY_MS` apart, before
+   *    giving up; if the run has already settled on its own, there is
+   *    nothing left to cancel and this returns immediately.
+   * 5. The returned `promise` rejects with a `RunCancelledError` — not a
+   *    plain `EngineError` — when the underlying call's rejection carries
+   *    the engine's cancellation marker (`data.cancelled === true`); any
+   *    other rejection (a genuine failure) is rethrown unchanged as the
+   *    ordinary `EngineError` (or whatever else `call` rejects with). */
+  #startCancellableRun<T, P>(
+    method: string,
+    progressMethod: string,
+    params: object,
+    onProgress?: (event: P) => void,
+  ): CancellableRun<T> {
+    const runId = crypto.randomUUID();
+    let settled = false;
+
+    const unsubscribe = this.onEngineEvent((notification) => {
+      if (notification.method !== progressMethod) return;
+      // See this method's own doc comment ("RUNID FILTERING"): filter on
+      // runId only when the notification actually carries one; an absent
+      // runId is forwarded rather than dropped (backward tolerant).
+      const notificationRunId = (notification.params as { runId?: string } | undefined)?.runId;
+      if (notificationRunId !== undefined && notificationRunId !== runId) return;
+      onProgress?.(notification.params as P);
+    });
+
+    const promise = this.call<T>(method, { ...params, runId })
+      .catch((err: unknown) => {
+        if (isCancelledEngineError(err)) {
+          throw new RunCancelledError(runId, err.data);
+        }
+        throw err;
+      })
+      .finally(() => {
+        settled = true;
+        unsubscribe();
+      });
+
+    const cancel = async (): Promise<void> => {
+      // Always issues AT LEAST ONE engine.cancel call — an explicit cancel()
+      // from the caller always reaches the engine at least once, regardless
+      // of what this client-side `settled` flag (inherently racy/eventually
+      // consistent) currently believes. `settled` only gates whether a
+      // {cancelled:false} response is worth RETRYING (see below).
+      for (let attempt = 1; attempt <= CANCEL_RETRY_ATTEMPTS; attempt++) {
+        let response: { cancelled: boolean };
+        try {
+          response = await this.call<{ cancelled: boolean }>("engine.cancel", { runId });
+        } catch {
+          // engine.cancel itself failing (a transport hiccup) — nothing more
+          // this method can do; the run's own promise still settles on its
+          // own timeline regardless of this failed cancel attempt.
+          return;
+        }
+        if (response.cancelled) return;
+        // {cancelled:false} is ambiguous (unknown/already-finished runId, OR
+        // the cancel-before-register race). If the run has ALREADY settled
+        // naturally by now, there's nothing left to cancel -- stop instead
+        // of burning more attempts. Otherwise, this looks like the race:
+        // retry a bounded few more times, a short delay apart.
+        if (settled) return;
+        if (attempt < CANCEL_RETRY_ATTEMPTS) {
+          await delay(CANCEL_RETRY_DELAY_MS);
+        }
+      }
+    };
+
+    return { runId, promise, cancel };
   }
 }
 

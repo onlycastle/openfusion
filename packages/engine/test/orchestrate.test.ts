@@ -1101,6 +1101,62 @@ describe("engine.orchestrate — progress notifications", () => {
     const deduped = stages.filter((s, i) => s !== stages[i - 1]);
     expect(deduped).toEqual(["load", "route", "worker:1", "review:1", "worker:2", "review:2", "escalate", "done"]);
   });
+
+  // M7c Task 5: orchestrate.progress/evals.progress notifications previously
+  // carried no runId at all -- a client with more than one run in flight (of
+  // the same kind) had no reliable way to filter progress to just ITS run
+  // (the desktop engineClient helper had to fall back to a "filter by method
+  // name only, assume single-run-at-a-time" posture -- see that module's own
+  // doc comment). Every stage's notification must now carry the SAME runId
+  // the caller supplied, end to end, and omit it entirely when none was
+  // given (backward compatible shape for any existing/older caller).
+  it("carries the run's runId on every notification when one was supplied", async () => {
+    dir = makeRepo();
+    await writeTestHarness(dir);
+    const notifications: Array<{ method: string; params: unknown }> = [];
+    engine = createEngine({ notify: (method, params) => notifications.push({ method, params }) });
+    engine.models.registry.configure({ id: "p1", kind: "deepseek", apiKey: TEST_API_KEY });
+    engine.models.registry.setTestModel("p1", makeWorkerMock("hello.txt", "hi", "done"));
+    engine.frontier.registerAdapter(
+      makeFakeFrontierAdapter({ reviewVerdicts: [{ decision: "approve", reasons: [], severity: "none" }] }),
+    );
+
+    await call(engine, "engine.orchestrate", {
+      projectDir: dir,
+      task: "add hello.txt",
+      runId: "orchestrate-progress-1",
+    });
+
+    const events = notifications
+      .filter((n) => n.method === "orchestrate.progress")
+      .map((n) => n.params as { stage: string; runId?: string });
+    expect(events.length).toBeGreaterThan(0);
+    for (const e of events) {
+      expect(e.runId).toBe("orchestrate-progress-1");
+    }
+  });
+
+  it("omits runId entirely when none was supplied (backward compatible shape)", async () => {
+    dir = makeRepo();
+    await writeTestHarness(dir);
+    const notifications: Array<{ method: string; params: unknown }> = [];
+    engine = createEngine({ notify: (method, params) => notifications.push({ method, params }) });
+    engine.models.registry.configure({ id: "p1", kind: "deepseek", apiKey: TEST_API_KEY });
+    engine.models.registry.setTestModel("p1", makeWorkerMock("hello.txt", "hi", "done"));
+    engine.frontier.registerAdapter(
+      makeFakeFrontierAdapter({ reviewVerdicts: [{ decision: "approve", reasons: [], severity: "none" }] }),
+    );
+
+    await call(engine, "engine.orchestrate", { projectDir: dir, task: "add hello.txt" });
+
+    const events = notifications
+      .filter((n) => n.method === "orchestrate.progress")
+      .map((n) => n.params as Record<string, unknown>);
+    expect(events.length).toBeGreaterThan(0);
+    for (const e of events) {
+      expect("runId" in e).toBe(false);
+    }
+  });
 });
 
 describe("engine.orchestrate — failure semantics", () => {

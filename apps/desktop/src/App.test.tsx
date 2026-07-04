@@ -66,7 +66,7 @@ describe("App shell", () => {
     await waitFor(() => expect(screen.getByText(/No providers configured/)).toBeTruthy());
   });
 
-  it("switches routes on nav click, showing the other screen, and the Orchestrate stub says coming in M7c", async () => {
+  it("switches routes on nav click: Orchestrate (M7c Task 3) and Evals (M7c Task 4) are both now real cockpit screens", async () => {
     const App = await freshApp();
     render(<App />);
     await waitFor(() => expect(screen.getByText(/No providers configured/)).toBeTruthy());
@@ -77,11 +77,11 @@ describe("App shell", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Orchestrate" }));
     expect(screen.getByRole("heading", { level: 1, name: "Orchestrate" })).toBeTruthy();
-    expect(screen.getByText(/Coming in M7c/)).toBeTruthy();
+    expect(screen.getByRole("button", { name: /^run$/i })).toBeTruthy();
 
     fireEvent.click(screen.getByRole("button", { name: "Evals" }));
     expect(screen.getByRole("heading", { level: 1, name: "Evals" })).toBeTruthy();
-    expect(screen.getByText(/Coming in M7c/)).toBeTruthy();
+    expect(screen.getByRole("button", { name: /run evals/i })).toBeTruthy();
   });
 
   it("establishes exactly one engine_events subscription for the whole app on mount", async () => {

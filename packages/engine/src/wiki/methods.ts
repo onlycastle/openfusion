@@ -1,11 +1,11 @@
 import { existsSync } from "node:fs";
 import { z } from "zod";
-import { RpcErrorCodes } from "@openfusion/shared";
+import { RpcErrorCodes, type WikiBuildProgress } from "@openfusion/shared";
 import type { Engine } from "../engine.js";
 import { RpcMethodError } from "../rpc/errors.js";
 import { requireGitRepo, resolveProjectKey } from "../rpc/guards.js";
 import { registerMethod } from "../rpc/register.js";
-import { buildIndex, type IndexStats } from "./indexer.js";
+import { buildIndex, type BuildIndexProgress, type IndexStats } from "./indexer.js";
 import { McpWikiServer } from "./mcp.js";
 import { WikiParser } from "./parser.js";
 import { rankFiles, renderRepoMap } from "./rank.js";
@@ -102,7 +102,17 @@ export class WikiService {
 
   // Concurrent build() calls for the same project coalesce onto one in-flight
   // promise instead of racing two builds against the same sqlite file.
-  build(projectDir: string): Promise<IndexStats> {
+  //
+  // `onProgress` (M7c Task 1) is threaded straight through to buildIndex —
+  // see indexer.ts's own doc comment for the emit cadence. NOTE: because
+  // concurrent calls for the same project key coalesce onto ONE in-flight
+  // promise, only the FIRST caller's `onProgress` is ever wired to the
+  // actual buildIndex() run; a second, coalesced caller gets the shared
+  // result but no progress callbacks of its own. This is the same
+  // known trade-off the coalescing itself already accepts (one real build,
+  // shared by every waiter) — acceptable here since progress is a
+  // best-effort UI signal, not something correctness depends on.
+  build(projectDir: string, onProgress?: BuildIndexProgress): Promise<IndexStats> {
     const key = resolveProjectKey(projectDir);
     const inFlight = this.#building.get(key);
     if (inFlight !== undefined) return inFlight;
@@ -110,7 +120,7 @@ export class WikiService {
     const promise = (async () => {
       const store = this.getStore(projectDir);
       const parser = await this.getParser();
-      return buildIndex(key, store, parser);
+      return buildIndex(key, store, parser, onProgress);
     })().finally(() => {
       this.#building.delete(key);
     });
@@ -151,7 +161,18 @@ export function registerWikiMethods(engine: Engine): void {
     ProjectParamsSchema,
     async ({ projectDir }) => {
       requireGitRepo(projectDir);
-      const stats = await engine.wiki.build(projectDir);
+      // M7c Task 1: `projectDir` here is deliberately the RAW string this
+      // handler was invoked with — never resolveProjectKey(projectDir)'s
+      // canonicalized form. A subscriber (the desktop ProjectScreen) filters
+      // notifications by comparing `params.projectDir` against whatever IT
+      // itself passed to engine.wiki.build, which is the raw path from its
+      // own directory picker — echoing back the resolved key here would
+      // silently break that comparison whenever the raw path and its
+      // realpath differ (e.g. a symlinked project directory).
+      const stats = await engine.wiki.build(projectDir, (detail) => {
+        const payload: WikiBuildProgress = { projectDir, detail };
+        engine.notify("wiki.build.progress", payload);
+      });
       engine.log(
         `wiki.build ${projectDir}: ${stats.filesIndexed} indexed, ${stats.filesSkipped} skipped`,
       );

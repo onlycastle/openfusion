@@ -389,8 +389,14 @@ async function cleanupWorktree(engine: Engine, projectDir: string, worktreePath:
   }
 }
 
-function progress(engine: Engine, stage: string, detail: string): void {
-  engine.notify("orchestrate.progress", { stage, detail });
+// M7c Task 5: `runId`, when supplied (the same runId threaded through this
+// run's own cancelSignal lookup above), is included on every notification so
+// a client with more than one concurrent orchestrate run can filter progress
+// to just its own -- omitted entirely (not even `runId: undefined`) when no
+// runId was given, so an older/runId-less caller sees the exact same shape
+// as before this task.
+function progress(engine: Engine, stage: string, detail: string, runId?: string): void {
+  engine.notify("orchestrate.progress", runId !== undefined ? { stage, detail, runId } : { stage, detail });
 }
 
 // Lifts the worktree breadcrumb a failed engine.worker.run (worker/
@@ -564,7 +570,7 @@ export async function orchestrate(engine: Engine, params: OrchestrateParams): Pr
     diffStat: string,
     worktree: { path: string; branch: string } | null,
   ): OrchestrateResult {
-    progress(engine, "done", `outcome: ${outcome}`);
+    progress(engine, "done", `outcome: ${outcome}`, params.runId);
     return {
       outcome,
       agent: agentName,
@@ -586,7 +592,7 @@ export async function orchestrate(engine: Engine, params: OrchestrateParams): Pr
   }
 
   try {
-    progress(engine, "load", "loading harness bundle");
+    progress(engine, "load", "loading harness bundle", params.runId);
     requireGitRepo(params.projectDir);
     let harness;
     try {
@@ -610,9 +616,9 @@ export async function orchestrate(engine: Engine, params: OrchestrateParams): Pr
       throw new RpcMethodError(RpcErrorCodes.SERVER_ERROR, "harness failed structural validation", { issues });
     }
 
-    progress(engine, "route", "classifying and routing the task");
+    progress(engine, "route", "classifying and routing the task", params.runId);
     const routed = routeTask(params.task, harness, engine.models.registry);
-    progress(engine, "route", `routed to agent "${routed.agent.name}" (class ${routed.taskClass})`);
+    progress(engine, "route", `routed to agent "${routed.agent.name}" (class ${routed.taskClass})`, params.runId);
 
     // M6 Task 2: computed ONCE per run (the harness's own pages never change
     // between worker attempts) and threaded into every engine.worker.run
@@ -644,7 +650,7 @@ export async function orchestrate(engine: Engine, params: OrchestrateParams): Pr
 
       for (let i = 0; i < maxWorkerAttempts; i++) {
         const n = nextAttemptNumber();
-        progress(engine, `worker:${n}`, `running worker attempt ${n}/${maxWorkerAttempts}`);
+        progress(engine, `worker:${n}`, `running worker attempt ${n}/${maxWorkerAttempts}`, params.runId);
 
         let workerResult: WorkerRunResponse;
         try {
@@ -697,7 +703,7 @@ export async function orchestrate(engine: Engine, params: OrchestrateParams): Pr
           continue;
         }
 
-        progress(engine, `review:${n}`, "reviewing the worker's diff with a read-only frontier session");
+        progress(engine, `review:${n}`, "reviewing the worker's diff with a read-only frontier session", params.runId);
         const adapter = engine.frontier.getAdapter(FRONTIER_KIND);
         if (adapter === undefined) {
           throw new RpcMethodError(RpcErrorCodes.SERVER_ERROR, `unknown frontier engine: ${FRONTIER_KIND}`);
@@ -756,7 +762,7 @@ export async function orchestrate(engine: Engine, params: OrchestrateParams): Pr
 
     // Escalate: either routing resolved straight to "frontier", or every
     // worker attempt above was rejected or produced an empty diff.
-    progress(engine, "escalate", "escalating to the frontier with write access");
+    progress(engine, "escalate", "escalating to the frontier with write access", params.runId);
     let escalation: EscalationResult;
     try {
       escalation = await runEscalation(engine, params, routed.agent, escalateTimeoutMs, cancelSignal);

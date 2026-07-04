@@ -11,12 +11,13 @@ for the technology decisions this scaffold is built on.
 ## Architecture
 
 ```
-┌────────────────────────┐   invoke /   ┌─────────────────────────┐  stdio ndjson  ┌───────────────────────┐
-│ webview (src/main.ts)   │   Channel    │ Rust — Tauri core       │  JSON-RPC 2.0  │ openfusion-engine      │
-│ @tauri-apps/api/core    │◄────────────►│  commands.rs             │◄──────────────►│ sidecar (compiled      │
-│ (vanilla TS, no         │              │  engine_bridge.rs        │                │ Node binary)           │
-│  framework yet)         │              │  lib.rs (lifecycle)      │                │ packages/engine        │
-└────────────────────────┘              └─────────────────────────┘                └───────────────────────┘
+┌─────────────────────────────┐   invoke /   ┌──────────────────────────┐  stdio ndjson  ┌───────────────────────┐
+│ webview (src/main.tsx)      │   Channel    │ Rust — Tauri core        │  JSON-RPC 2.0  │ openfusion-engine      │
+│ React 18 + Vite             │◄────────────►│  commands.rs             │◄──────────────►│ sidecar (compiled      │
+│ @tauri-apps/api/core        │              │  engine_bridge.rs        │                │ Node binary)           │
+│ 4 cockpit screens: Project /│              │  lib.rs (lifecycle)      │                │ packages/engine        │
+│ Keys / Orchestrate / Evals  │              │                          │                │                        │
+└─────────────────────────────┘              └──────────────────────────┘                └───────────────────────┘
 ```
 
 - **`engine_bridge.rs`** owns the sidecar's `tokio::process::Child` directly
@@ -158,6 +159,113 @@ scans the staged directory for the one entry at `.setup()` time (a separate,
 runtime-only check — the `tauri-build` validation above happens earlier, at
 compile time).
 
+## The Cockpit: Four Screens
+
+The desktop app exposes a "cockpit" UI with four screens:
+
+### Project Screen
+Discover and index a local git repository. The app prompts for a project
+directory, then calls `engine.wiki.build` to construct the symbol index and
+wiki. A live progress panel streams `wiki.build.progress` notifications
+(projectDir, detail) as indexing runs. Once complete, the screen renders
+summary stats (files indexed, symbols found, refs resolved). This screen owns
+project discovery and wiki construction only — it carries no eval references;
+the eval report card (verdict, savings, per-task results) lives on its own
+Evals screen, described below.
+
+### Keys Screen
+Configure frontier engine access (Claude Code / Codex OAuth) and open-model
+providers (BYOK: Moonshot, Z.ai, DeepSeek, OpenAI-compatible). The shell
+securely stores all keys in macOS Keychain — the engine never touches
+credentials, only holds references to them at runtime. Keys configured here
+are write-only to the UI; there is no "view my keys" export (defense in depth
+against accidental exposure).
+
+### Orchestrate Screen
+The marquee "route → cheap worker diff → frontier review → escalate → apply"
+loop, live. Picks a project directory, takes a free-text task description,
+and calls `engineClient.runOrchestrate` — a cancellable run that mints a UUID
+runId and streams progress notifications (`orchestrate.progress`, carrying
+runId + stage + detail). The screen displays:
+- **Route:** which agent and model the task was assigned to (likely an open
+  model by default, escalating to frontier if the worker fails twice).
+- **Live progress:** status updates as the worker or frontier session executes.
+- **Diff review:** the changes the worker or frontier engine produced
+  (a simple syntax-colored preview, not a full diff editor).
+- **Review verdict:** whether the diff was approved or flagged for changes
+  (and if escalated to frontier, a simple "escalated" note).
+- **Cost breakdown:** worker cost and frontier cost separately, both
+  estimate-class and tagged with a pricingConfidence caveat.
+- **Apply button:** `engine.orchestrate.apply` stages the diff into the
+  working tree via `git apply --3way` (never commits; the diff is left staged
+  for human review and commit).
+
+A **Cancel button** is available while a run is in progress. It calls
+`engine.cancel({runId})` (the engine's true stop mechanism), which causes
+the run's promise to reject with a `RunCancelledError` — distinct from a
+genuine failure. The UI renders a "Cancelled" state, not "Failed," once
+the cancellation settles. The app mints a UUID `runId` for every run and
+passes it to the engine so that `engine.cancel` can reliably reach the
+right in-flight request without relying on a per-call timeout (timeouts
+would abandon the promise while the run continued on the engine side).
+
+### Evals Screen
+Run baseline-vs-harness evals to measure whether the generated harness
+held quality against open-model workers vs an all-frontier baseline. Takes
+a list of commit shas and a test command, calls `engineClient.runEvals` as
+a cancellable run streaming `evals.progress` notifications (carrying runId
+for correlation), and renders:
+- **Verdict badge:** pass (green: quality held, savings > 0, ≥5 tasks),
+  fail (red ETH-HAZARD badge: harness degraded quality below baseline —
+  flagged and never shipped regardless of cost savings), or inconclusive
+  (amber: too few tasks, unpriced models, zero baseline pass rate, or ≥20%
+  measurement failures).
+- **Savings percentage:** e.g., "42.5% (estimate-class, pricing confidence:
+  provider-reported)". If models are unpriced or the run is inconclusive,
+  displays "not computable" instead of a fake number.
+- **Per-task table:** each task row shows baseline pass/fail, harness pass/fail,
+  and measurement status (oracle mismatch or infra failure recorded; clean
+  baseline and harness results factored into the verdict only, measurement
+  failures excluded from both).
+- **Clean-subset counts:** cleanTaskCount (tasks where NEITHER side hit a
+  measurement failure — the clean subset the verdict is actually computed
+  from, per `packages/engine/src/evals/run.ts`), cleanBaselinePassed
+  (baseline row of that subset), cleanHarnessPassed, cleanSavingsPct, and
+  measurementFailureCount (infra issues; affects verdict inconclusiveness).
+
+The app **never displays the raw "we saved 42.5% cost but the harness failed
+8 of 10 tasks"** — a quality regression is an ETH hazard, flagged in the UI
+and never shipped as a savings win. All cost estimates carry a `pricingConfidence`
+caveat (verified/provider-reported/secondary/unverified/unpriced) — if that's
+not "verified," a small badge notes it. Unpriced calls taint the entire run to
+"inconclusive" rather than a fake savings number.
+
+A **Cancel button** behaves exactly as in Orchestrate: calls `engine.cancel({runId})`,
+renders "Cancelled" once it settles (distinct from "Failed").
+
+## Content-Security-Policy (CSP)
+
+The app runs under a strict, local-only Content-Security-Policy:
+
+**Production (`tauri build`):** `default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self' ipc: http://ipc.localhost; ...`
+
+This policy permits:
+- Scripts and styles only from the bundled app code (no inline scripts, no `<script src="...external">`).
+- Images from the app bundle or embedded `data:` URIs.
+- Network connections only to `ipc:` and `http://ipc.localhost` — both are Tauri's own IPC origin (the
+  `invoke`/`Channel` transport the webview uses to talk to the Rust core), not a loopback into the engine
+  sidecar: the sidecar is a stdio-only child process (stdin/stdout ndjson JSON-RPC), never reachable over
+  HTTP. This matters for anyone tuning `connect-src` at M8 — relaxing or tightening this entry affects only
+  the webview↔Rust IPC channel, never the engine.
+- No external CDNs, no inline event handlers, no `eval()`.
+
+**Development (`tauri dev`):** Relaxed `devCsp` allows `style-src 'unsafe-inline'` (for Vite HMR hot-reload CSS), `script-src 'unsafe-inline'` (`@vitejs/plugin-react` injects an inline `<script type="module">` react-refresh preamble in dev; without this, `script-src 'self'` blocks it and `tauri dev` fails to load), and `ws://localhost:*` (the dev server's own WebSocket). Both `unsafe-inline` relaxations are **dev only** — the production `security.csp`'s `script-src 'self'` (no inline scripts) is unchanged, since the built bundle has no inline scripts to allow. Styling/script issues that appear in `tauri dev` but not `tauri build` are dev-only artifacts; the production CSP is the authoritative definition.
+
+CSP correctness is an **operator smoke** verified against a real running app
+(see below) — `tauri build` compiles the policy into the binary, but only
+invoking the app and checking for console CSP violation logs confirms it
+works end to end.
+
 ## OPERATOR SMOKES
 
 These require a display/window and are not run in CI or this development
@@ -177,6 +285,32 @@ done:
    `ps -p <pid>` should report no matching process. `tests/lifecycle.rs`
    proves this same property headlessly against mock sidecars; this smoke
    is the real-binary, real-window confirmation.
+4. **Orchestrate screen: route → cheap-worker diff → frontier review → escalate → apply, with a working Cancel button.** Open a real project, enter a task
+   ("add a test for the signup form"), and watch the orchestrator:
+   classify the task → route it to an open model → worker spawns an isolated
+   git worktree → produces a diff → frontier review gate evaluates it → diff
+   is approved/rejected (or escalated to frontier if rejected twice). Once
+   approved, click the Apply button — verify that `git apply --3way` stages
+   the diff (a `git status` shows "Changes to be committed"). Midway through
+   a run, click Cancel and verify it transitions to "Cancelled" (not "Failed").
+5. **Evals screen: run a real eval and see the honest report card.** Run evals
+   on a few golden tasks (commits from the repo's history). Verify that the
+   Evals screen renders:
+   - A verdict (pass/fail/inconclusive — if "fail," there's an ETH-HAZARD red
+     badge, never shown as a savings win).
+   - A savings percentage with a `pricingConfidence` label (e.g., "28% (provider-reported)"),
+     or a generic "not computable" if the figure can't be priced (unpriced models, an empty
+     clean subset, zero clean-baseline cost, or subscription-auth zero-metering — never a fake number).
+   - Per-task results (baseline pass/fail, harness pass/fail, measurement status).
+   - Clean-subset counts at the top (cleanTaskCount, cleanBaselinePassed, etc.).
+   - A working Cancel button that renders "Cancelled" once it settles.
+6. **CSP under a production build.** Run `pnpm --filter @openfusion/desktop build` to produce a
+   release binary (`tauri build` output), launch it directly, open the app,
+   and invoke the Command-line-exposed JSON-RPC calls (or render a simple test screen
+   that makes a Tauri invoke call). Watch the browser console (DevTools via Cmd+Option+I)
+   — verify NO CSP violations appear (no "Content Security Policy has blocked…"
+   messages). If CSP violations appear, that's a regression in the policy or a
+   new inline script/style somewhere in the bundle.
 
 ## Packaging, signing, entitlements (deferred to M8)
 

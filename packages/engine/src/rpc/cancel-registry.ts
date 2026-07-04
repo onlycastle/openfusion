@@ -14,7 +14,9 @@
 // without any nested layer accidentally re-registering (and thereby
 // orphaning) its own controller.
 import { z } from "zod";
+import { RpcErrorCodes } from "@openfusion/shared";
 import type { Engine } from "../engine.js";
+import { RpcMethodError } from "./errors.js";
 import { registerMethod } from "./register.js";
 
 // Thrown the instant a cancellable sub-operation notices its own abortSignal
@@ -42,7 +44,23 @@ export class CancelRegistry {
 
   // Called ONLY by the outermost RPC handler that owns a runId's lifecycle
   // (engine.orchestrate's / engine.evals.run's own handler).
+  //
+  // M7c Task 5 (M7b Minor): REJECTS a runId that is already active, rather
+  // than silently clobbering it. Before this fix, two calls racing on the
+  // SAME client-supplied runId (a client bug, or a naive retry that reuses
+  // an id) would let the second register() overwrite the first's entry in
+  // `#controllers` -- the first run's own AbortController is still the one
+  // actually threaded through its in-flight orchestrate()/runEvals() call,
+  // but engine.cancel({runId}) can now only ever reach the SECOND run's
+  // controller, permanently orphaning the first (a leaked, uncancellable
+  // run). Failing fast here instead means a client that reuses an active
+  // runId gets an immediate, clear SERVER_ERROR at the call that would have
+  // caused the clobber, before any work starts -- not a run that silently
+  // becomes uncancellable later.
   register(runId: string): AbortController {
+    if (this.#controllers.has(runId)) {
+      throw new RpcMethodError(RpcErrorCodes.SERVER_ERROR, `run already active: ${runId}`);
+    }
     const controller = new AbortController();
     this.#controllers.set(runId, controller);
     return controller;

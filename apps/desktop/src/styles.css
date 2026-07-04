@@ -135,3 +135,211 @@ form input {
   display: block;
   margin-top: 0.25rem;
 }
+
+.actions {
+  display: flex;
+  gap: 0.5rem;
+  margin: 0.75rem 0;
+}
+
+textarea {
+  display: block;
+  width: 100%;
+  max-width: 640px;
+  margin-top: 0.25rem;
+  font-family: inherit;
+}
+
+.routed-callout {
+  font-weight: 600;
+}
+
+.progress-list {
+  font-size: 0.9rem;
+}
+
+.progress-list li {
+  margin-bottom: 0.15rem;
+}
+
+.outcome-badge {
+  display: inline-block;
+  padding: 0.15rem 0.6rem;
+  border-radius: 999px;
+  font-weight: 600;
+  font-size: 0.85rem;
+}
+
+.outcome-success {
+  background: #1e7a34;
+  color: #fff;
+}
+
+.outcome-warning {
+  background: #b8860b;
+  color: #fff;
+}
+
+.outcome-failure {
+  background: var(--error);
+  color: #fff;
+}
+
+.outcome-cancelled {
+  background: var(--muted);
+  color: #fff;
+}
+
+.verdict {
+  margin-top: 0.25rem;
+}
+
+.verdict-decision {
+  font-weight: 600;
+}
+
+.verdict-approve {
+  color: #1e7a34;
+}
+
+.verdict-request-changes {
+  color: var(--error);
+}
+
+.verdict-severity {
+  color: var(--muted);
+  font-size: 0.85rem;
+}
+
+.attempts-list li {
+  margin-bottom: 0.75rem;
+}
+
+.diff-view {
+  background: var(--nav-bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0.75rem;
+  overflow-x: auto;
+  font-size: 0.85rem;
+  line-height: 1.4;
+  max-height: 400px;
+  overflow-y: auto;
+}
+
+.diff-line-add {
+  color: #1e7a34;
+}
+
+.diff-line-remove {
+  color: var(--error);
+}
+
+.diff-line-hunk {
+  color: var(--accent);
+}
+
+.diff-line-meta {
+  color: var(--muted);
+}
+
+.cost-split {
+  display: grid;
+  grid-template-columns: max-content max-content;
+  column-gap: 1rem;
+  row-gap: 0.25rem;
+}
+
+.cost-split dt {
+  font-weight: 600;
+}
+
+.cost-split dd {
+  margin: 0;
+}
+
+.verdict-banner {
+  padding: 0.75rem 1rem;
+  border-radius: 8px;
+  font-weight: 600;
+  margin: 0.75rem 0;
+}
+
+.verdict-banner-pass {
+  background: #1e7a34;
+  color: #fff;
+}
+
+.verdict-banner-fail {
+  background: var(--error);
+  color: #fff;
+  border: 2px solid #7a1410;
+}
+
+.verdict-banner-inconclusive {
+  background: #b8860b;
+  color: #fff;
+}
+
+.savings-figure {
+  font-weight: 600;
+  font-size: 1.05rem;
+}
+
+/* A savings figure sitting on a "fail" (ETH-hazard) verdict — the number
+   itself is real, but the verdict above already supersedes it as a claim, so
+   it's visually de-emphasized (muted color, struck through) rather than
+   reading like a normal win. Shared by the main Savings line (SavingsDisplay)
+   and the Clean savings line in the clean-subset table — both qualify the
+   same way on a fail verdict. */
+.savings-figure-disregarded {
+  color: var(--muted);
+  text-decoration: line-through;
+  font-weight: 400;
+}
+
+.disregarded-note {
+  color: var(--muted);
+  text-decoration: none;
+  font-weight: 400;
+  font-style: italic;
+}
+
+.caveat-badge {
+  display: inline-block;
+  padding: 0.15rem 0.6rem;
+  border-radius: 999px;
+  background: var(--border);
+  color: var(--fg);
+  font-size: 0.8rem;
+  font-weight: 600;
+}
+
+.eval-per-task-table {
+  border-collapse: collapse;
+  width: 100%;
+  font-size: 0.85rem;
+  margin: 0.5rem 0;
+}
+
+.eval-per-task-table th,
+.eval-per-task-table td {
+  border: 1px solid var(--border);
+  padding: 0.35rem 0.5rem;
+  text-align: left;
+}
+
+.clean-subset {
+  display: grid;
+  grid-template-columns: max-content max-content;
+  column-gap: 1rem;
+  row-gap: 0.25rem;
+}
+
+.clean-subset dt {
+  font-weight: 600;
+}
+
+.clean-subset dd {
+  margin: 0;
+}

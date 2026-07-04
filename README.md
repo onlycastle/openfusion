@@ -196,10 +196,56 @@ engine as a supervised sidecar process and speaks the same stdio JSON-RPC
 protocol described above to it — Rust owns the sidecar's lifecycle (spawn on
 launch, explicit bounded shutdown on app exit so no engine process is ever
 orphaned) and bridges it to the webview via `invoke`/`Channel`. The shell is
-deliberately dumb: all intelligence stays in the engine, unchanged. See
-`apps/desktop/README.md` for the architecture, how to build/stage the
-sidecar and run `tauri dev`, and the operator smoke checklist; packaging
-(signing, notarization, DMG) is M8 scope.
+deliberately dumb: all intelligence stays in the engine, unchanged.
+
+### The Cockpit UI (M7c)
+
+The shell exposes four cockpit screens:
+
+1. **Project** — discover and index a repo: open a project directory and
+   build its wiki (`wiki.build`) with live progress. The eval report card
+   (pass/fail/inconclusive, savings %, per-task results) lives on its own
+   Evals screen, below — not here.
+2. **Keys** — configure frontier engine (Claude Code/Codex) and open-model
+   providers (BYOK: Moonshot, Z.ai, DeepSeek, generic OpenAI-compatible);
+   all secrets stored in macOS Keychain.
+3. **Orchestrate** — the "route → cheap-worker diff → frontier review →
+   escalate → apply" loop live. Streams progress, shows routed model, worker
+   diff, review verdict, cost breakdown (estimate-class, tagged with
+   `pricingConfidence`). Apply button stages the diff (never commits). Cancel
+   button calls `engine.cancel({runId})`, rendering "Cancelled" (distinct from
+   "Failed") once settled.
+4. **Evals** — baseline-vs-harness report card. Runs real evals, displays
+   honest verdict (pass green / **fail = ETH-HAZARD: harness degraded quality,
+   flagged and never shipped as a win** / inconclusive amber), savings % with
+   pricing caveat or "not computable" (never a fake number), per-task results,
+   and clean-subset counts. Cancel button with the same runId-based semantics.
+
+**Honesty notes:**
+- Displayed savings are **estimate-class** (computed from pricing table +
+  reported token usage, not a billed amount) and carry a `pricingConfidence`
+  caveat (verified/provider-reported/secondary/unverified/unpriced). An unpriced
+  model taints the entire run to "inconclusive," never inflating a savings claim.
+- An **ETH-HAZARD "fail" verdict** means the harness produced WORSE quality than
+  the baseline on the clean subset — a genuine risk, flagged in the UI and never
+  shipped as a savings win, regardless of cost.
+- **Cancel semantics:** every long-running call mints a UUID `runId` and cancels
+  via `engine.cancel({runId})` — the true stop mechanism on the engine side.
+  The app never uses a per-call timeout on long runs (a timeout would abandon
+  the promise while the run continues on the engine). Cancelled is a distinct
+  state from Failed.
+
+**CSP:** The app runs under a strict, local-only Content-Security-Policy
+(production mode). It permits scripts and styles only from the bundled code
+(no inline scripts/styles, no external CDNs), and network connections only to
+`ipc:` (Tauri's IPC) and `http://ipc.localhost` (the engine sidecar). A dev-only
+relaxation allows `ws://localhost:*` for the dev server. CSP correctness is
+verified as an operator smoke: a running `tauri build` app with no console
+CSP violation logs confirms the policy is live.
+
+See `apps/desktop/README.md` for the architecture, how to build/stage the
+sidecar and run `tauri dev`, the four cockpit screens in detail, and the
+operator smoke checklist; packaging (signing, notarization, DMG) is M8 scope.
 
 ## Development
 
