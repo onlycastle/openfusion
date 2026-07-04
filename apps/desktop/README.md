@@ -68,10 +68,19 @@ because the reasoning isn't obvious:
   exit gracefully (and, failing that, a bounded kill+reap).
 - **`RunEvent::ExitRequested`, not `WindowEvent::CloseRequested`.** The
   latter only covers "the user clicked this window's close button" — it
-  misses `AppHandle::exit()`/`restart()` and would need per-window
-  bookkeeping for "is this the last window" once a future multi-window
-  cockpit UI (M7b) exists. `ExitRequested` fires once, covering all of
-  those, right before the process actually exits.
+  misses `AppHandle::exit()` and would need per-window bookkeeping for "is
+  this the last window" once a future multi-window cockpit UI (M7b) exists.
+  `ExitRequested` fires once, covering the last window closing and
+  `AppHandle::exit()`, right before the process actually exits.
+  **Caveat: it does NOT cover main-thread `AppHandle::restart()`** — Tauri
+  2.11's `App::run()` (`app.rs:588`) explicitly skips delivering
+  `ExitRequested` when `restart()` is called from the main thread ("we
+  cannot guarantee the delivery of those events, so we skip them"). A
+  future M8 auto-updater must call `request_restart()` instead, which does
+  go through the normal exit path and deliver `ExitRequested` — reaching
+  for `restart()` directly would reintroduce the orphaned-engine-process
+  bug this milestone fixes. See `lib.rs`'s `shutdown_engine_bridge_on_exit`
+  doc comment for the full detail.
 
 `RunEvent` handlers are synchronous, but `EngineBridge::shutdown()` is
 `async`. `tauri::async_runtime::block_on` bridges the two — it blocks the
@@ -134,10 +143,20 @@ pnpm --filter @openfusion/desktop tauri dev
 `packages/engine/dist-sidecar/openfusion-engine-<triple>` (+ its `.assets`
 sibling directory of native/wasm runtime assets — better-sqlite3's addon,
 tree-sitter query files and wasm) into `src-tauri/binaries/`. This is a
-dev-time-only manual step (not wired into `build.rs`, so a plain `cargo
-build`/`cargo test` stays green on a machine that has never built the
-sidecar). `lib.rs`'s `resolve_dev_sidecar_binary_path()` then scans that
-directory for the one staged entry at `.setup()` time.
+dev-time-only manual step, run by hand rather than wired into `build.rs` —
+but it is NOT optional for `cargo build`/`cargo test` in this crate.
+`tauri-build`'s build script validates that every `tauri.conf.json`
+`bundle.externalBin` entry (`binaries/openfusion-engine`) resolves to a real
+file on disk *during the build itself*, before a single line of this
+crate's own code compiles; with nothing staged, `cargo build` fails with
+exit code 101 ("resource path `binaries/openfusion-engine-<triple>` doesn't
+exist"). So steps 1 and 2 above are prerequisites for ANY `cargo
+build`/`cargo test` in `apps/desktop`, not just `tauri dev` — a fresh
+clone/CI runner must build and stage the sidecar before it can build or
+test this crate at all. `lib.rs`'s `resolve_dev_sidecar_binary_path()` then
+scans the staged directory for the one entry at `.setup()` time (a separate,
+runtime-only check — the `tauri-build` validation above happens earlier, at
+compile time).
 
 ## OPERATOR SMOKES
 

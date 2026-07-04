@@ -1,19 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Capability for the main window — grants the sidecar spawn permission the Task 3 engine bridge will use, and no more.",
+  "description": "Capability for the main window. The engine sidecar is spawned from Rust via tokio::process (engine_bridge.rs), not via plugin-shell webview IPC, so no shell:allow-spawn grant is needed here — capabilities only gate webview->plugin calls, and this app has no plugin-shell usage to gate.",
   "windows": ["main"],
-  "permissions": [
-    "core:default",
-    {
-      "identifier": "shell:allow-spawn",
-      "allow": [
-        {
-          "name": "binaries/openfusion-engine",
-          "sidecar": true,
-          "args": false
-        }
-      ]
-    }
-  ]
+  "permissions": ["core:default"]
 }

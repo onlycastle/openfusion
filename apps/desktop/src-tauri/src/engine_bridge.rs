@@ -431,6 +431,16 @@ async fn read_stdout(stdout: ChildStdout, pending: PendingMap, notify_tx: broadc
 fn route_message(value: Value, pending: &PendingMap, notify_tx: &broadcast::Sender<Value>) {
     let has_id = matches!(value.get("id"), Some(id) if !id.is_null());
     if !has_id {
+        // A `result`/`error` envelope with a null/absent `id` is a malformed
+        // response (JSON-RPC responses must carry the request's original,
+        // non-null id), not a progress notification — broadcasting it would
+        // leak protocol noise into the webview event stream. Log metadata
+        // only and drop it; genuine notifications (method-carrying, no id)
+        // still flow through below.
+        if value.get("result").is_some() || value.get("error").is_some() {
+            eprintln!("[engine-bridge] response-shaped message with null/missing id; dropping");
+            return;
+        }
         // Notification. `send` errors only when there are zero
         // subscribers, which is a normal, non-error outcome here.
         let _ = notify_tx.send(value);
@@ -529,5 +539,26 @@ mod tests {
         let pending: PendingMap = Arc::new(StdMutex::new(HashMap::new()));
         let (tx, _rx) = broadcast::channel(4);
         route_message(json!({"jsonrpc": "2.0", "id": 999, "result": {}}), &pending, &tx);
+    }
+
+    #[test]
+    fn route_message_drops_result_with_null_id_instead_of_broadcasting() {
+        // A `result` envelope with `id: null` is a malformed response, not a
+        // notification — it must NOT be broadcast to `engine_events`
+        // subscribers as protocol noise.
+        let pending: PendingMap = Arc::new(StdMutex::new(HashMap::new()));
+        let (tx, mut rx) = broadcast::channel(4);
+        route_message(json!({"jsonrpc": "2.0", "id": null, "result": {}}), &pending, &tx);
+        assert!(rx.try_recv().is_err(), "malformed null-id response must not be broadcast");
+    }
+
+    #[test]
+    fn route_message_drops_error_with_missing_id_instead_of_broadcasting() {
+        // Same as above but for an `error` envelope with the `id` field
+        // absent entirely rather than explicitly `null`.
+        let pending: PendingMap = Arc::new(StdMutex::new(HashMap::new()));
+        let (tx, mut rx) = broadcast::channel(4);
+        route_message(json!({"jsonrpc": "2.0", "error": {"code": -32000, "message": "boom"}}), &pending, &tx);
+        assert!(rx.try_recv().is_err(), "malformed missing-id error response must not be broadcast");
     }
 }

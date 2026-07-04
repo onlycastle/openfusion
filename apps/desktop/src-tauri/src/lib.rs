@@ -1,4 +1,4 @@
-// M7a shell backbone: a Tauri 2 builder with the shell plugin registered,
+// M7a shell backbone: a Tauri 2 builder,
 // the Task 3 `engine_bridge` (spawns the engine sidecar via tokio::process
 // and speaks JSON-RPC 2.0 over its stdio — see that module's docs for the
 // process-mechanism decision), the Task 4 `commands` layer (the
@@ -26,14 +26,21 @@ use tauri::Manager;
 /// `engine_bridge.rs`), so it always returns on its own; this timeout is
 /// defense in depth, not load-bearing, so a future regression in
 /// `shutdown()`'s own bounds can never turn into "the app hangs on quit" —
-/// it fails open (lets exit proceed) instead, with the sidecar's
-/// `kill_on_drop(true)` as the last-resort backstop if that ever triggers.
+/// it fails open (lets exit proceed) instead. Note that `kill_on_drop(true)`
+/// is NOT what backstops that fail-open case: `App::run()` exits via
+/// `std::process::exit`, which skips Rust destructors, so the
+/// `tokio::process::Child`'s `Drop` (and therefore `kill_on_drop`) never
+/// fires on this path regardless of whether this timeout is hit. The real
+/// backstop for abnormal termination is the engine's own stdin-EOF-exit
+/// discipline: `std::process::exit` tears down this process's file
+/// descriptors, which closes the sidecar's stdin pipe from this end; the
+/// sidecar's own main loop (`packages/engine/src/main.ts`) treats stdin EOF
+/// as "the client is gone" and exits itself, no Rust-side kill required.
 const EXIT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(8);
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let app = tauri::Builder::default()
-        .plugin(tauri_plugin_shell::init())
         .setup(|app| {
             let binary_path = resolve_dev_sidecar_binary_path()?;
 
@@ -75,9 +82,9 @@ pub fn run() {
 }
 
 /// Runs on `RunEvent::ExitRequested` — fired once, whichever comes first of
-/// the last window closing, `AppHandle::exit`/`restart`, or (on macOS)
-/// Cmd+Q. This is the load-bearing hook for "no orphaned engine process on
-/// exit", for two reasons:
+/// the last window closing, `AppHandle::exit()`, or (on macOS) Cmd+Q. This
+/// is the load-bearing hook for "no orphaned engine process on exit", for
+/// two reasons:
 ///
 /// 1. **`kill_on_drop(true)` (`engine_bridge.rs`) is not actually reachable
 ///    on the normal quit path.** Tauri's own `App::run()` docs say plainly:
@@ -92,11 +99,23 @@ pub fn run() {
 ///    failing that, a bounded kill+reap) before the process disappears.
 /// 2. A single `WindowEvent::CloseRequested` handler would only cover "the
 ///    user clicked this window's close button" — it would miss
-///    `AppHandle::exit()`/`restart()` and would need per-window bookkeeping
-///    for "is this the last window" in any future multi-window UI (M7b's
-///    cockpit). `RunEvent::ExitRequested` is the one hook that already
-///    accounts for all of that, which is why it — not `CloseRequested` — is
-///    used here.
+///    `AppHandle::exit()` and would need per-window bookkeeping for "is
+///    this the last window" in any future multi-window UI (M7b's cockpit).
+///    `RunEvent::ExitRequested` is the one hook that already accounts for
+///    all of that, which is why it — not `CloseRequested` — is used here.
+///
+/// **Does NOT cover main-thread `AppHandle::restart()`.** Tauri 2.11's
+/// `App::run()` (`app.rs:588`) explicitly skips delivering `ExitRequested`
+/// (and the rest of the exit-callback machinery) when `restart()` is called
+/// from the main thread — its own comment says "we cannot guarantee the
+/// delivery of those events, so we skip them." A future M8 auto-updater
+/// that wants a clean sidecar shutdown before restarting must call
+/// `request_restart()` instead of `restart()`: unlike main-thread
+/// `restart()`, `request_restart()` always goes through the normal
+/// `request_exit` runtime path and DOES deliver `ExitRequested`, so this
+/// same `shutdown_engine_bridge_on_exit` hook still runs. Reaching for
+/// `restart()` directly on the main thread would reintroduce the orphaned-
+/// engine-process bug this milestone fixes.
 ///
 /// `RunEvent` handlers are synchronous (Tauri's event loop calls this
 /// closure directly on the main/event-loop thread), but `EngineBridge::shutdown()`

@@ -5,15 +5,24 @@
 // convention (tauri.conf.json: `"externalBin": ["binaries/openfusion-engine"]`)
 // and `Command::sidecar`/`Command.sidecar()` (Task 3/4) expect to find it.
 //
-// This is a DEV-time staging step only — running `tauri dev` (or, later,
-// `tauri build`) needs the binary physically present under src-tauri/ first,
-// since Cargo/Tauri don't know how to reach into packages/engine themselves.
-// It is intentionally NOT wired into src-tauri/build.rs: build.rs runs on
-// every `cargo build`, including CI/contributor machines that haven't built
-// the sidecar (or don't have Node/pnpm in the same shell as cargo), and this
-// scaffold's `cargo build` must stay green independent of the sidecar's
-// existence. M8 (actual .app bundling) will decide whether staging becomes
-// a `beforeBundleCommand` hook or stays a manual pnpm script step.
+// This is a manual, DEV-time staging step — it is run by hand (or by CI)
+// rather than wired into src-tauri/build.rs, since build.rs would need
+// Node/pnpm available in the same shell as cargo to reach into
+// packages/engine, which isn't guaranteed on every machine that runs cargo.
+//
+// IMPORTANT: this step is NOT optional. `src-tauri/build.rs` calls
+// `tauri_build::build()`, which validates that every `tauri.conf.json`
+// `bundle.externalBin` entry resolves to a real file on disk *during the
+// build itself* — before this crate's own code even compiles. Without a
+// staged `binaries/openfusion-engine-<triple>` (+ its `.assets` sibling),
+// `cargo build`/`cargo test` in apps/desktop FAILS (exit code 101: "resource
+// path `binaries/openfusion-engine-<triple>` doesn't exist"). So this
+// script (preceded by `pnpm --filter @openfusion/engine build:sidecar`) is a
+// prerequisite for ANY `cargo build`/`cargo test` in apps/desktop, not just
+// `tauri dev` — a fresh clone or CI runner must run both before it can build
+// or test this crate at all. M8 (actual .app bundling) will decide whether
+// staging becomes a `beforeBundleCommand` hook or stays a manual pnpm script
+// step.
 //
 // NOTE on the `.assets` dir specifically: the engine binary self-locates its
 // runtime assets (better-sqlite3's native addon, tree-sitter wasm files,
