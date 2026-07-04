@@ -269,4 +269,47 @@ describe("OrchestrateScreen", () => {
       consoleErrorSpy.mockRestore();
     }
   });
+
+  it("Apply uses the RUN's project directory, not the live picker value (wrong-project safety test)", async () => {
+    await chooseProjectAndFillTask("fix something", "/proj/A");
+
+    const controllable = makeControllableRun();
+    runOrchestrateMock.mockReturnValueOnce(controllable);
+    fireEvent.click(screen.getByRole("button", { name: /^run$/i }));
+
+    const fixture = orchestrateResultFixture();
+    act(() => controllable.resolve(fixture));
+    await waitFor(() => expect(screen.getByRole("button", { name: /apply diff/i })).toBeTruthy());
+
+    // User re-picks a different directory AFTER the run resolves
+    openMock.mockResolvedValueOnce("/proj/B");
+    fireEvent.click(screen.getByRole("button", { name: /choose project/i }));
+    // Give the picker time to update the displayed path
+    await waitFor(() => {
+      const code = screen.getAllByText(/^\/proj\//)[0];
+      expect(code?.textContent).toBe("/proj/B");
+    });
+
+    callMock.mockResolvedValueOnce(undefined);
+    fireEvent.click(screen.getByRole("button", { name: /apply diff/i }));
+
+    // CORRECTNESS: Apply must send the RUN's project (/proj/A), not the live picker (/proj/B)
+    expect(callMock).toHaveBeenCalledWith("engine.orchestrate.apply", { projectDir: "/proj/A", diff: fixture.diff });
+  });
+
+  it("renders the routed model from result.resolution in the final outcome view (structural routed-model test)", async () => {
+    await chooseProjectAndFillTask();
+    const controllable = makeControllableRun();
+    runOrchestrateMock.mockReturnValueOnce(controllable);
+    fireEvent.click(screen.getByRole("button", { name: /^run$/i }));
+
+    // Resolve with a known structured resolution
+    const fixture = orchestrateResultFixture({
+      resolution: { providerId: "deepseek", model: "deepseek-v4-flash" },
+    });
+    act(() => controllable.resolve(fixture));
+
+    // Assert the structural routed model appears in the DOM (not just progress text)
+    await waitFor(() => expect(screen.getByText(/deepseek\/deepseek-v4-flash/)).toBeTruthy());
+  });
 });

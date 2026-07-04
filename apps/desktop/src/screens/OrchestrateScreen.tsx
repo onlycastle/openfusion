@@ -93,6 +93,7 @@ function DiffView({ diff }: { diff: string }) {
  * and a working-tree (not committed) Apply action. */
 export function OrchestrateScreen() {
   const [projectDir, setProjectDir] = useState<string | null>(null);
+  const [runProjectDir, setRunProjectDir] = useState<string | null>(null);
   const [pickerError, setPickerError] = useState<string | null>(null);
   const [task, setTask] = useState("");
   const [phase, setPhase] = useState<Phase>("idle");
@@ -123,6 +124,7 @@ export function OrchestrateScreen() {
     setRunError(null);
     setApplyState({ status: "idle" });
     setPhase("running");
+    setRunProjectDir(projectDir); // Capture the run's project directory
 
     const run = engineClient.runOrchestrate({ projectDir, task }, (event: OrchestrateProgressEvent) => {
       progressKeySeq += 1;
@@ -158,13 +160,13 @@ export function OrchestrateScreen() {
   }, [phase]);
 
   const handleApply = useCallback(() => {
-    if (!projectDir || !result || applyState.status === "applying") return;
+    if (!runProjectDir || !result || applyState.status === "applying") return;
     setApplyState({ status: "applying" });
     engineClient
-      .call<unknown>("engine.orchestrate.apply", { projectDir, diff: result.diff })
+      .call<unknown>("engine.orchestrate.apply", { projectDir: runProjectDir, diff: result.diff })
       .then(() => setApplyState({ status: "applied" }))
       .catch((err: unknown) => setApplyState({ status: "failed", message: friendlyMessage(err) }));
-  }, [projectDir, result, applyState.status]);
+  }, [runProjectDir, result, applyState.status]);
 
   const routeEntry = progress.find((entry) => entry.stage === "route");
   const canRun = Boolean(projectDir) && task.trim().length > 0 && !isBusy;
@@ -318,7 +320,7 @@ export function OrchestrateScreen() {
             <>
               <h2>Apply</h2>
               <p className="muted-text">
-                Applies the diff to the working tree at <code>{projectDir}</code> — this does NOT commit it.
+                Applies the diff to the working tree at <code>{runProjectDir}</code> — this does NOT commit it.
               </p>
               <button type="button" onClick={handleApply} disabled={applyState.status === "applying"}>
                 {applyState.status === "applying" ? "Applying…" : "Apply diff"}
