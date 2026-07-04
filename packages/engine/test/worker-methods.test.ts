@@ -170,6 +170,9 @@ describe("engine.worker.run", () => {
       outputTokens: 80,
       costUsd: usage.result.byModel["deepseek/deepseek-v4-flash"].costUsd,
     });
+    // M6 Task 0: deepseek-v4-flash is a verified PRICING entry, so the
+    // ledger-wide worst-of confidence is "verified" too.
+    expect(usage.result.pricingConfidence).toBe("verified");
   });
 
   it("emits worker.progress notifications for both tool and step events", async () => {

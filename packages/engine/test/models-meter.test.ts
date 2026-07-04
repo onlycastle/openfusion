@@ -10,6 +10,7 @@ function record(overrides: Partial<UsageRecord> = {}): UsageRecord {
     costUsd: 0.01,
     at: Date.now(),
     source: "complete",
+    pricingConfidence: "verified",
     ...overrides,
   };
 }
@@ -93,5 +94,53 @@ describe("CostMeter — per-surface source tagging", () => {
   it("an empty meter has an empty bySource map", () => {
     const meter = new CostMeter();
     expect(meter.totals().bySource).toEqual({});
+  });
+});
+
+describe("CostMeter — totals().pricingConfidence (worst across all records)", () => {
+  it("an empty meter reports the vacuous best case: verified", () => {
+    const meter = new CostMeter();
+    expect(meter.totals().pricingConfidence).toBe("verified");
+  });
+
+  it("a single verified record reports verified", () => {
+    const meter = new CostMeter();
+    meter.record(record({ pricingConfidence: "verified" }));
+    expect(meter.totals().pricingConfidence).toBe("verified");
+  });
+
+  it("a verified record plus a secondary record reports secondary (worst wins)", () => {
+    const meter = new CostMeter();
+    meter.record(record({ pricingConfidence: "verified" }));
+    meter.record(record({ pricingConfidence: "secondary" }));
+    expect(meter.totals().pricingConfidence).toBe("secondary");
+  });
+
+  it("adding an unpriced record on top of verified + secondary drags totals to unpriced (worst wins)", () => {
+    const meter = new CostMeter();
+    meter.record(record({ pricingConfidence: "verified" }));
+    meter.record(record({ pricingConfidence: "secondary" }));
+    meter.record(record({ pricingConfidence: "unpriced", costUsd: null }));
+    expect(meter.totals().pricingConfidence).toBe("unpriced");
+  });
+
+  it("unverified ranks worse than secondary/verified but better than unpriced", () => {
+    const verifiedPlusUnverified = new CostMeter();
+    verifiedPlusUnverified.record(record({ pricingConfidence: "verified" }));
+    verifiedPlusUnverified.record(record({ pricingConfidence: "unverified" }));
+    expect(verifiedPlusUnverified.totals().pricingConfidence).toBe("unverified");
+
+    const unverifiedPlusUnpriced = new CostMeter();
+    unverifiedPlusUnpriced.record(record({ pricingConfidence: "unverified" }));
+    unverifiedPlusUnpriced.record(record({ pricingConfidence: "unpriced", costUsd: null }));
+    expect(unverifiedPlusUnpriced.totals().pricingConfidence).toBe("unpriced");
+  });
+
+  it("record order does not matter — worst-of is order-independent", () => {
+    const meter = new CostMeter();
+    meter.record(record({ pricingConfidence: "unpriced", costUsd: null }));
+    meter.record(record({ pricingConfidence: "verified" }));
+    meter.record(record({ pricingConfidence: "secondary" }));
+    expect(meter.totals().pricingConfidence).toBe("unpriced");
   });
 });

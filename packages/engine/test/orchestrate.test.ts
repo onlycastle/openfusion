@@ -265,6 +265,9 @@ function makeFakeFrontierAdapter(opts: FakeFrontierOptions = {}): FrontierAdapte
       costUsd: event.costUsd,
       at: Date.now(),
       source: resultLabel === "frontier-escalate" ? "frontier-escalate" : "frontier-review",
+      // Mirrors engines/methods.ts's real onResult wiring: frontier cost is
+      // the provider's own reported figure, not a PRICING-table estimate.
+      pricingConfidence: event.costUsd !== null ? "verified" : "unpriced",
     });
   }
 

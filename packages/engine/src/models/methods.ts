@@ -197,8 +197,18 @@ async function runComplete(
       const usage = normalizeUsage(result.usage);
       const pricing = lookupPricing(kind, model);
       const costUsd = pricing !== null ? estimateCostUsd(pricing, usage) : null;
+      const pricingConfidence = pricing !== null ? pricing.confidence : "unpriced";
 
-      engine.models.meter.record({ providerId, kind, model, usage, costUsd, at: Date.now(), source: "complete" });
+      engine.models.meter.record({
+        providerId,
+        kind,
+        model,
+        usage,
+        costUsd,
+        at: Date.now(),
+        source: "complete",
+        pricingConfidence,
+      });
       attempts.push({ providerId, model });
 
       engine.log(`models.complete ${kind}/${model} ${i === 0 ? "ok" : "failover"}`);

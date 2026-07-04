@@ -253,6 +253,17 @@ export function registerFrontierMethods(engine: Engine): void {
           // mapResultLabelToSource's own doc comment above for the full
           // label -> source table.
           source: mapResultLabelToSource(resultLabel),
+          // Frontier cost is never a PRICING-table estimate — it's the
+          // dollar figure the Claude Code CLI itself reports for the turn
+          // (message.total_cost_usd, threaded through as result.costUsd by
+          // claude.ts). That is the provider's own ground truth, so
+          // "verified" here means something stronger than a verified row in
+          // our own pricing table. The null case (an adapter that can't
+          // report a cost at all — no such path exists for claude-code
+          // today, but the FrontierEvent type allows it for a future
+          // engine) is "unpriced", matching the models.complete/worker rule
+          // of "no cost figure at all" -> "unpriced".
+          pricingConfidence: result.costUsd !== null ? "verified" : "unpriced",
         });
       },
     }),

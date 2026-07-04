@@ -255,6 +255,10 @@ describe("createClaudeAdapter", () => {
           costUsd: result.costUsd,
           at: Date.now(),
           source: "frontier-review",
+          // Mirrors engines/methods.ts's real onResult wiring: frontier cost
+          // is the Claude Code CLI's own reported total_cost_usd, not a
+          // PRICING-table estimate, so a non-null costUsd is "verified".
+          pricingConfidence: result.costUsd !== null ? "verified" : "unpriced",
         });
       },
     });
@@ -279,6 +283,9 @@ describe("createClaudeAdapter", () => {
       outputTokens: 200,
       costUsd: 0.12,
     });
+    // M6 Task 0: the CLI's own reported cost is ground truth, not a table
+    // estimate — the ledger's worst-of confidence reflects that.
+    expect(totals.pricingConfidence).toBe("verified");
   });
 
   // M5b Task 4: createSession's opts gained an opaque `resultLabel`
@@ -373,6 +380,7 @@ describe("createClaudeAdapter", () => {
             costUsd: result.costUsd,
             at: Date.now(),
             source: mapResultLabelToSource(label),
+            pricingConfidence: result.costUsd !== null ? "verified" : "unpriced",
           });
         },
       });
@@ -392,6 +400,7 @@ describe("createClaudeAdapter", () => {
         costUsd: 0.12,
       });
       expect(Object.keys(totals.bySource)).toEqual([expectedSource]);
+      expect(totals.pricingConfidence).toBe("verified");
     },
   );
 

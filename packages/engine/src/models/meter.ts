@@ -32,6 +32,14 @@ export type UsageSource =
   | "frontier-generate"
   | "frontier-interactive";
 
+// How much to trust `costUsd` for this record. Set at record() call time
+// from the looked-up ModelPricing's own `confidence` field, or "unpriced"
+// when no pricing entry was found at all (costUsd is null in that case).
+// Surfaced so a consumer (the M6 savings report card) can flag a cost
+// figure that rests on a secondary/unverified/absent price rather than
+// trusting every costUsd number equally.
+export type PricingConfidence = "verified" | "secondary" | "unverified" | "unpriced";
+
 // One successful `engine.models.complete` attempt. Failed attempts are never
 // recorded here — only what actually consumed tokens (see methods.ts).
 export interface UsageRecord {
@@ -42,6 +50,7 @@ export interface UsageRecord {
   costUsd: number | null;
   at: number;
   source: UsageSource;
+  pricingConfidence: PricingConfidence;
 }
 
 export interface ModelTotals {
@@ -63,7 +72,25 @@ export interface MeterTotals {
   // "<kind>/<model>" — a per-surface cost breakdown alongside the existing
   // per-model one.
   bySource: Record<string, ModelTotals>;
+  // The WORST (least-trustworthy) pricingConfidence across every record seen
+  // — see CONFIDENCE_RANK below for the ordering. An empty meter reports
+  // "verified" (the vacuous best case: nothing has been observed to distrust
+  // yet). engine.models.usage exposes this verbatim so the M6 report card
+  // can flag a savings figure that rests on any less-than-verified cost.
+  pricingConfidence: PricingConfidence;
 }
+
+// Worst-to-best. Higher rank = more trustworthy. "unpriced" (no pricing
+// entry found at all, costUsd null) is worse than "unverified" (a priced
+// entry we simply haven't confirmed against an official source yet) is
+// worse than "secondary" (soft-documented / endpoint-pinned) is worse than
+// "verified".
+const CONFIDENCE_RANK: Record<PricingConfidence, number> = {
+  unpriced: 0,
+  unverified: 1,
+  secondary: 2,
+  verified: 3,
+};
 
 // In-memory cost/usage ledger for the engine process's lifetime. Never
 // persisted — a fresh engine starts at zero.
@@ -84,7 +111,11 @@ export class CostMeter {
       unpricedCalls: 0,
       byModel: {},
       bySource: {},
+      // Vacuous best case for an empty ledger — see CONFIDENCE_RANK's doc
+      // comment. Downgraded below as records are folded in.
+      pricingConfidence: "verified",
     };
+    let worstRank = CONFIDENCE_RANK.verified;
 
     for (const r of this.#records) {
       totals.calls += 1;
@@ -96,6 +127,12 @@ export class CostMeter {
         totals.unpricedCalls += 1;
       } else {
         totals.costUsd += r.costUsd;
+      }
+
+      const rank = CONFIDENCE_RANK[r.pricingConfidence];
+      if (rank < worstRank) {
+        worstRank = rank;
+        totals.pricingConfidence = r.pricingConfidence;
       }
 
       const key = `${r.kind}/${r.model}`;
