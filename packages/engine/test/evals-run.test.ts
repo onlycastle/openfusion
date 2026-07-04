@@ -419,6 +419,104 @@ describe("runEvals — measurement failures are not quality evidence (Task 4 Fix
   });
 });
 
+describe("runEvals — measurement-failure gate applies symmetrically to pass and fail (review round 2)", () => {
+  it("baseline errors inflate the harness's raw pass count over a genuine clean-subset quality gap -> verdict must be 'inconclusive', never 'pass'", async () => {
+    dir = await makeHarnessFixture();
+    engine = createEngine();
+
+    // 5 tasks (t1..t5). Baseline ERRORS on t1/t2 (a measurement failure --
+    // the frontier session itself throws, so baselineOutcome is "error" and
+    // baselinePassed is false for both, NOT a completed-but-wrong attempt)
+    // and PASSES cleanly on its other 3 tasks (t3/t4/t5). Harness PASSES
+    // t1/t2 (the two baseline-error tasks) plus ONE clean task (t3), and
+    // FAILS the other two clean tasks (t4/t5).
+    //
+    // Raw counts: baselinePassed = 3 (t3,t4,t5), harnessPassed = 3
+    // (t1,t2,t3) -> harnessPassed >= baselinePassed -> qualityHeld = true.
+    // Before the symmetric fix, the clean-subset + materiality recheck
+    // lived ONLY inside the `!qualityHeld` branch, so this run would sail
+    // straight past it into "pass" territory (priced, 5 tasks, savings >
+    // 0) -- even though on the CLEAN subset (t3,t4,t5, where neither side
+    // measurement-failed) the harness genuinely passed only 1 of 3 against
+    // the baseline's 3 of 3: a real ETH-hazard quality gap, papered over as
+    // a savings win, on a run that is 40% measurement failures (over the
+    // 20% materiality threshold).
+    const baselineShouldError = [true, true, false, false, false];
+    const harnessShouldBeCorrect = [true, true, true, false, false];
+    let baselineCallIndex = 0;
+    let harnessCallIndex = 0;
+
+    engine.frontier.registerAdapter({
+      kind: "claude-code",
+      async createSession({ projectDir, resultLabel }): Promise<FrontierSession> {
+        const isBaseline = resultLabel === "eval-baseline";
+        let index: number;
+        if (isBaseline) {
+          index = baselineCallIndex++;
+          if (baselineShouldError[index]) {
+            throw new Error(`simulated baseline infra failure for task index ${index}`);
+          }
+        } else {
+          index = harnessCallIndex++;
+        }
+        const correct = isBaseline ? true : harnessShouldBeCorrect[index]!;
+        const costUsd = isBaseline ? 0.5 : 0.05;
+        return {
+          id: randomUUID(),
+          projectDir,
+          prompt(_text: string, _promptOpts?: { timeoutMs?: number }): FrontierPromptHandle {
+            async function* gen(): AsyncGenerator<FrontierEvent> {
+              writeFileSync(path.join(projectDir, "source.js"), correct ? CORRECT_SOURCE : WRONG_SOURCE);
+              yield { type: "tool_use", name: "Write", summary: "wrote source.js" };
+              yield { type: "text", text: "done" };
+              const event: FrontierEvent = {
+                type: "result",
+                resultText: "done",
+                costUsd,
+                usage: { inputTokens: 10, outputTokens: 5, cacheReadTokens: 0 },
+                numTurns: 1,
+                durationMs: 1,
+                engineSessionId: null,
+              };
+              engine.models.meter.record({
+                providerId: "claude-code",
+                kind: "frontier-claude",
+                model: "fake-frontier-model",
+                usage: event.usage,
+                costUsd: event.costUsd,
+                at: Date.now(),
+                source: isBaseline ? "frontier-review" : "frontier-escalate",
+                pricingConfidence: "verified",
+              });
+              yield event;
+            }
+            return { events: gen(), abort: () => {} };
+          },
+          async close(): Promise<void> {},
+        };
+      },
+    });
+
+    const tasks: EvalTask[] = Array.from({ length: 5 }, (_, i) => synthEvalTask({ id: `t${i + 1}` }));
+    const report = await runEvals(engine, { projectDir: dir, tasks });
+
+    expect(report.baseline.passed).toBe(3);
+    expect(report.harness.passed).toBe(3);
+    // The raw field stays raw (documented) -- it's the VERDICT that must
+    // not trust this direction on a 40%-corrupted run.
+    expect(report.qualityHeld).toBe(true);
+    expect(report.perTask.filter((t) => t.baselineOutcome === "error")).toHaveLength(2);
+    expect(report.savingsPct).not.toBeNull();
+    expect(report.savingsPct!).toBeGreaterThan(0);
+
+    // THE FIX: the measurement-failure gate must fire on the PASS side
+    // exactly as it already does on the fail side.
+    expect(report.verdict).toBe("inconclusive");
+    expect(report.note).toContain("2 of 5 task(s) hit a measurement failure");
+    expect(harnessStatus(dir).evals).toBe("pending");
+  }, 30_000);
+});
+
 describe("runEvals — 0-vs-0 baseline (Task 4 Fix 3)", () => {
   it("baseline solves 0 tasks -> verdict 'inconclusive' even with held quality and positive savings; never 'pass'", async () => {
     dir = await makeHarnessFixture();
