@@ -143,6 +143,23 @@ README's "How the loop works" for the full flow and its caveats.
 own rejected attempts and leaves the surviving worktree for apply, but a
 crash mid-run needs an explicit sweep.
 
+**Realized in the shell (M7a):** the §4.1 process diagram's "shell ↔ engine
+JSON-RPC" link is now a real, tested Rust backbone, not just a design —
+`apps/desktop/src-tauri/src/engine_bridge.rs` owns the engine sidecar's
+`tokio::process::Child` directly (a bare `PathBuf` in, so it's unit-testable
+against mock sidecars with zero Tauri runtime bootstrap), speaking
+ndjson-encoded JSON-RPC 2.0 over its piped stdio exactly as §9 below
+describes; `commands.rs` exposes `engine_call` (generic passthrough) and
+`engine_events` (notification pump onto a webview `Channel`) as the two
+Tauri commands the webview talks to; `lib.rs` spawns the bridge in
+`.setup()` and drives its clean, bounded shutdown from `RunEvent::ExitRequested`
+so the sidecar is never orphaned on app exit (see §9 and
+`apps/desktop/README.md`'s "Lifecycle" section for why that specific hook,
+not `kill_on_drop` or a window-close handler, is the one that's load-bearing).
+This is still backbone only: the actual cockpit UI (chat, task tree, worker
+cards, diff review, cost meter) is M7b; today's webview is a single proof
+screen that calls `engine.models.list` end to end.
+
 ## 6. Eval Loop
 
 After generation (and after major refreshes), run micro-evals baseline-vs-harness.
@@ -206,7 +223,24 @@ GEPA-style automated harness optimization is explicitly deferred past v1.
   fixtures (no live keys in CI).
 - E2E smoke in CI: generate a harness for a small sample repo with a cheap
   model; assert artifacts validate against schema.
-- Shell: minimal tests (dumb by design).
+- Shell: minimal tests (dumb by design), but the one boundary it does own —
+  the sidecar stdio protocol — is tested for real. `apps/desktop/src-tauri`'s
+  `EngineBridge` is exercised against genuine child processes (scripted mock
+  sidecar binaries under `src/bin/mock_*.rs`, not fakes/mocks-in-process):
+  request/response correlation under concurrency, malformed-line resilience,
+  notification routing, and child death mid-call all resolve to errors
+  rather than hangs. **No-orphan shutdown** is a headless-testable property,
+  not just an operator smoke: `tests/lifecycle.rs` spawns a bridge (including
+  against a mock that deliberately ignores stdin EOF and never exits on its
+  own), drives the same bounded shutdown path the real
+  `RunEvent::ExitRequested` handler calls, and asserts — via an external
+  `ps -p <pid>` check, not just internal bookkeeping — that the child is
+  actually gone from the OS process table afterward, within a bound.
+  `kill_on_drop(true)` is a backstop for abnormal termination, not the
+  primary mechanism (Tauri's own event loop exits the process via
+  `std::process::exit`, which skips Rust destructors, so an *explicit*
+  `shutdown()` call is what actually reaps the child on a normal quit — see
+  `apps/desktop/README.md`'s "Lifecycle" section).
 
 ## 10. Repo & Distribution
 

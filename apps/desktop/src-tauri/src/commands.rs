@@ -9,7 +9,10 @@
 //!   `State`; the actual routing is [`route_engine_call`].
 //! - `engine_events` — subscribes the caller to the bridge's notification
 //!   broadcast and forwards every message onto an `invoke`-supplied
-//!   `Channel<Value>` until the channel or the broadcast closes. The
+//!   `Channel<Value>` until the channel closes, the broadcast closes, or
+//!   the bridge's shutdown signal fires (see `EngineBridge::shutdown_signal`
+//!   — M7a Task 5: without it, a real Tauri window close leaks the pump
+//!   task, since `Channel::send` never starts erroring on its own). The
 //!   wrapper only extracts state + subscribes; the pump loop is
 //!   [`forward_notifications`].
 //!
@@ -30,7 +33,7 @@ use serde::Serialize;
 use serde_json::Value;
 use tauri::ipc::Channel;
 use tauri::State;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, watch};
 
 use crate::engine_bridge::{EngineBridge, RpcError};
 
@@ -95,33 +98,83 @@ pub async fn route_engine_call(bridge: &EngineBridge, method: &str, params: Valu
 /// either side closes.
 #[tauri::command]
 pub fn engine_events(state: State<'_, std::sync::Arc<EngineBridge>>, channel: Channel<Value>) {
-    forward_notifications(state.inner().subscribe(), channel);
+    let bridge = state.inner();
+    forward_notifications(bridge.subscribe(), bridge.shutdown_signal(), channel);
 }
 
 /// Spawns a background task that forwards every message received on `rx`
-/// onto `channel`, until `channel.send` starts erroring (the webview/IPC
-/// side went away) or the broadcast sender is dropped (the bridge shut
-/// down). A lagged receiver (slow subscriber missed some notifications)
-/// is not fatal — it just resumes forwarding from the next message.
+/// onto `channel`, until any of the following happens:
+///
+/// - `channel.send` starts erroring (the webview/IPC side went away);
+/// - the broadcast sender is dropped (`RecvError::Closed` — the bridge
+///   object itself was dropped without an explicit `shutdown()`, which in
+///   practice only happens if `EngineBridge::spawn` never ran or the whole
+///   app is being torn down some other way); or
+/// - `shutdown_rx` observes the bridge's shutdown signal (see
+///   `EngineBridge::shutdown_signal`'s doc comment).
+///
+/// The last of these is the one that actually matters in production: a
+/// real Tauri window close does **not** make `channel.send` start
+/// erroring — the IPC channel looks "open" right up until full process
+/// exit — so without `shutdown_rx`, every `engine_events` invocation would
+/// leak its pump task and its broadcast subscriber for the remaining
+/// lifetime of the process. `EngineBridge::shutdown()` (wired to
+/// `RunEvent::ExitRequested` in `lib.rs`) fires that signal, which is what
+/// makes every outstanding pump exit on app shutdown, no matter how many
+/// times `engine_events` was invoked.
+///
+/// A lagged receiver (slow subscriber missed some notifications) is not
+/// fatal — it just resumes forwarding from the next message.
+///
+/// Returns the spawned task's `JoinHandle` so tests can await it directly
+/// to prove the pump actually exits (rather than merely inferring it from
+/// side effects) — production call sites (`engine_events` above) discard
+/// it; the pump is intentionally fire-and-forget in the app itself.
 ///
 /// `pub` (not `pub(crate)`) for the same reason as [`route_engine_call`]:
 /// `tauri::ipc::Channel::new` takes a plain closure and needs no Tauri
 /// `App`/webview to construct, so `tests/commands.rs` calls this directly
 /// with a closure that captures received values for assertion.
-pub fn forward_notifications(mut rx: broadcast::Receiver<Value>, channel: Channel<Value>) {
+pub fn forward_notifications(
+    mut rx: broadcast::Receiver<Value>,
+    mut shutdown_rx: watch::Receiver<bool>,
+    channel: Channel<Value>,
+) -> tauri::async_runtime::JoinHandle<()> {
     tauri::async_runtime::spawn(async move {
+        // A fresh `watch::Receiver` (from `subscribe()`) only observes
+        // *future* transitions via `changed()`, not the value already
+        // current at subscribe time — so if the bridge had already shut
+        // down before this pump started (e.g. a straggling `engine_events`
+        // invoke racing app exit), `changed()` below would never resolve
+        // (the signal only ever flips once) and this task would hang
+        // forever instead of exiting immediately. Check the already-seen
+        // value up front to close that gap.
+        if *shutdown_rx.borrow() {
+            return;
+        }
+
         loop {
-            match rx.recv().await {
-                Ok(value) => {
-                    if channel.send(value).is_err() {
-                        break; // Webview/IPC side went away.
+            tokio::select! {
+                // `Ok(())`: the bridge signalled shutdown. `Err(_)`: the
+                // sender was dropped without ever signalling — only
+                // possible if the whole bridge was dropped without going
+                // through `shutdown()`, which also means there is nothing
+                // left to pump from. Either outcome means: stop.
+                _ = shutdown_rx.changed() => break,
+                msg = rx.recv() => {
+                    match msg {
+                        Ok(value) => {
+                            if channel.send(value).is_err() {
+                                break; // Webview/IPC side went away.
+                            }
+                        }
+                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(broadcast::error::RecvError::Closed) => break,
                     }
                 }
-                Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(broadcast::error::RecvError::Closed) => break,
             }
         }
-    });
+    })
 }
 
 #[cfg(test)]

@@ -66,7 +66,7 @@ use std::time::Duration;
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
-use tokio::sync::{broadcast, oneshot, Mutex as AsyncMutex};
+use tokio::sync::{broadcast, oneshot, watch, Mutex as AsyncMutex};
 use tokio::task::JoinHandle;
 
 /// Default bound `shutdown()` waits for the child to exit on its own
@@ -181,6 +181,10 @@ pub struct EngineBridge {
     shutdown_timeout: Duration,
     reader_task: AsyncMutex<Option<JoinHandle<()>>>,
     stderr_task: AsyncMutex<Option<JoinHandle<()>>>,
+    /// Signals `false` -> `true` exactly once, the moment `shutdown()` is
+    /// called. See [`shutdown_signal`](Self::shutdown_signal) for why this
+    /// exists (M7a Task 5: notification-pump teardown).
+    shutdown_signal_tx: watch::Sender<bool>,
 }
 
 impl EngineBridge {
@@ -212,6 +216,7 @@ impl EngineBridge {
 
         let pending: PendingMap = Arc::new(StdMutex::new(HashMap::new()));
         let (notify_tx, _initial_receiver) = broadcast::channel(NOTIFY_CHANNEL_CAPACITY);
+        let (shutdown_signal_tx, _initial_shutdown_receiver) = watch::channel(false);
 
         let reader_task = tokio::spawn(read_stdout(stdout, pending.clone(), notify_tx.clone()));
         let stderr_task = tokio::spawn(drain_stderr(stderr));
@@ -226,6 +231,7 @@ impl EngineBridge {
             shutdown_timeout,
             reader_task: AsyncMutex::new(Some(reader_task)),
             stderr_task: AsyncMutex::new(Some(stderr_task)),
+            shutdown_signal_tx,
         })
     }
 
@@ -299,6 +305,32 @@ impl EngineBridge {
         self.pending.lock().expect("pending mutex poisoned").len()
     }
 
+    /// A receiver that observes a `false` -> `true` transition the moment
+    /// `shutdown()` is called (and stays `true` afterward — `shutdown()`
+    /// only ever sends once, guarded by the same idempotency check as the
+    /// rest of the method). This exists for `forward_notifications`
+    /// (`commands.rs`)'s notification-pump task: a real Tauri window close
+    /// does NOT make `Channel::send()` start erroring (the IPC channel
+    /// looks "open" right up until full process exit), so without an
+    /// explicit signal like this, every `engine_events` invocation would
+    /// leak its pump task + broadcast subscriber for the rest of the
+    /// process's life. The pump `tokio::select!`s between this and
+    /// `rx.recv()` so it exits promptly once the bridge shuts down.
+    pub fn shutdown_signal(&self) -> watch::Receiver<bool> {
+        self.shutdown_signal_tx.subscribe()
+    }
+
+    /// The spawned child's OS process id, or `None` if it has already been
+    /// reaped (`tokio::process::Child::id()` returns `None` once `wait()`
+    /// has resolved). Test-support only, same spirit as `pending_len()`
+    /// above: lets `tests/lifecycle.rs` prove — via an external `ps -p
+    /// <pid>` check — that `shutdown()` actually removed the process from
+    /// the OS process table, not just that this bridge's own bookkeeping
+    /// says so.
+    pub async fn child_id(&self) -> Option<u32> {
+        self.child.lock().await.id()
+    }
+
     /// Closes stdin (EOF — the engine's cue to exit), waits up to the
     /// configured bound for the child to exit, and kills it if it overruns.
     /// Idempotent: a second call is a no-op. After this returns, any call()
@@ -308,6 +340,13 @@ impl EngineBridge {
         if self.closed.swap(true, Ordering::SeqCst) {
             return;
         }
+
+        // Signal every notification-pump task tied to this bridge to exit.
+        // Fired first (before the potentially slower stdin-close/kill/reap
+        // steps below) so pumps can drain and exit promptly rather than
+        // waiting on the child's own teardown. See `shutdown_signal`'s doc
+        // comment for why this explicit signal is necessary at all.
+        let _ = self.shutdown_signal_tx.send(true);
 
         // Bound the stdin-close step itself, not just the wait-for-exit
         // below. `self.stdin` is the same lock a concurrent `call()` holds

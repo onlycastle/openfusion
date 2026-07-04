@@ -189,6 +189,18 @@ for async events. **Concurrency ownership:** the client is responsible for
 bounding in-flight expensive calls (`engine.models.complete`, `engine.frontier.prompt`);
 the pipeline itself intentionally carries no cap.
 
+## Desktop app (M7)
+
+`apps/desktop` is a Tauri 2 shell (Rust + system webview) that runs the
+engine as a supervised sidecar process and speaks the same stdio JSON-RPC
+protocol described above to it — Rust owns the sidecar's lifecycle (spawn on
+launch, explicit bounded shutdown on app exit so no engine process is ever
+orphaned) and bridges it to the webview via `invoke`/`Channel`. The shell is
+deliberately dumb: all intelligence stays in the engine, unchanged. See
+`apps/desktop/README.md` for the architecture, how to build/stage the
+sidecar and run `tauri dev`, and the operator smoke checklist; packaging
+(signing, notarization, DMG) is M8 scope.
+
 ## Development
 
 Requires Node >= 22 and pnpm (via corepack).
