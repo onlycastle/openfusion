@@ -4,6 +4,7 @@ import { Nav } from "./components/Nav";
 import { engineClient, type EngineNotification } from "./engineClient";
 import { useHashRoute } from "./router";
 import { KeysScreen } from "./screens/KeysScreen";
+import { OrchestrateScreen } from "./screens/OrchestrateScreen";
 import { ProjectScreen } from "./screens/ProjectScreen";
 import { StubScreen } from "./screens/StubScreen";
 
@@ -33,7 +34,7 @@ export function App() {
         <main className="content">
           {route === "project" && <ProjectScreen />}
           {route === "keys" && <KeysScreen />}
-          {route === "orchestrate" && <StubScreen title="Orchestrate" />}
+          {route === "orchestrate" && <OrchestrateScreen />}
           {route === "evals" && <StubScreen title="Evals" />}
         </main>
       </div>

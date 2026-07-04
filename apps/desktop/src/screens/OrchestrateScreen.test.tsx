@@ -1,0 +1,272 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { act, render, screen, fireEvent, waitFor, cleanup } from "@testing-library/react";
+
+// `test.globals` is `false` (see vite.config.ts) so RTL's auto-registered
+// `afterEach(cleanup)` never fires — do it explicitly, same as
+// ProjectScreen.test.tsx/KeysScreen.test.tsx.
+afterEach(cleanup);
+
+// The Tauri dialog plugin's `open()` — mocked so tests drive the project
+// directory picker without a real native dialog (same pattern as
+// ProjectScreen.test.tsx).
+const { openMock } = vi.hoisted(() => ({ openMock: vi.fn() }));
+vi.mock("@tauri-apps/plugin-dialog", () => ({ open: openMock }));
+
+// `engineClient` (the singleton) is what OrchestrateScreen calls through
+// for `runOrchestrate`/`call`. `importOriginal` keeps `EngineError`/
+// `RunCancelledError` real so `instanceof` checks inside the component work
+// against the same classes these tests construct.
+const { runOrchestrateMock, callMock } = vi.hoisted(() => ({
+  runOrchestrateMock: vi.fn(),
+  callMock: vi.fn(),
+}));
+
+vi.mock("../engineClient", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../engineClient")>();
+  return {
+    ...actual,
+    engineClient: {
+      runOrchestrate: runOrchestrateMock,
+      call: callMock,
+    },
+  };
+});
+
+import { OrchestrateScreen } from "./OrchestrateScreen";
+import { EngineError, RunCancelledError, type OrchestrateResult } from "../engineClient";
+
+function orchestrateResultFixture(overrides: Partial<OrchestrateResult> = {}): OrchestrateResult {
+  return {
+    outcome: "worker-approved",
+    agent: "generalist",
+    taskClass: "default",
+    resolution: { providerId: "deepseek", model: "deepseek-v4-flash" },
+    attempts: [
+      {
+        n: 1,
+        kind: "worker",
+        summary: "fixed the null check",
+        verdict: { decision: "approve", reasons: ["looks correct"], severity: "none" },
+      },
+    ],
+    diff: "diff --git a/x.ts b/x.ts\n--- a/x.ts\n+++ b/x.ts\n@@ -1,1 +1,2 @@\n-old line\n+new line\n+another new line\n",
+    diffStat: "1 file changed, 2 insertions(+), 1 deletion(-)",
+    worktree: { path: "/tmp/wt", branch: "of-worker-1" },
+    cost: {
+      workerUsd: 0.01,
+      reviewUsd: 0.02,
+      escalateUsd: null,
+      frontierUsd: null,
+      totalUsd: 0.03,
+      note: "estimate-class",
+      pricingConfidence: "provider-reported",
+    },
+    ...overrides,
+  };
+}
+
+/** A controllable stand-in for `CancellableRun<OrchestrateResult>`: tests
+ * drive `resolve`/`reject` directly instead of waiting on a real engine
+ * call, and assert against the `cancel` spy. */
+function makeControllableRun() {
+  let resolveFn!: (result: OrchestrateResult) => void;
+  let rejectFn!: (err: unknown) => void;
+  const promise = new Promise<OrchestrateResult>((resolve, reject) => {
+    resolveFn = resolve;
+    rejectFn = reject;
+  });
+  const cancel = vi.fn().mockResolvedValue(undefined);
+  return { runId: "test-run-1", promise, cancel, resolve: resolveFn, reject: rejectFn };
+}
+
+beforeEach(() => {
+  openMock.mockReset();
+  runOrchestrateMock.mockReset();
+  callMock.mockReset();
+});
+
+async function chooseProjectAndFillTask(
+  task = "fix the null check bug",
+  path = "/Users/test/project",
+): Promise<{ path: string; task: string }> {
+  openMock.mockResolvedValueOnce(path);
+  render(<OrchestrateScreen />);
+  fireEvent.click(screen.getByRole("button", { name: /choose project/i }));
+  await waitFor(() => expect(screen.getByText(path)).toBeTruthy());
+  fireEvent.change(screen.getByLabelText(/task/i), { target: { value: task } });
+  return { path, task };
+}
+
+describe("OrchestrateScreen", () => {
+  it("Run calls runOrchestrate with {projectDir, task}, streams progress, and renders the routed model", async () => {
+    const { path, task } = await chooseProjectAndFillTask();
+    const controllable = makeControllableRun();
+    runOrchestrateMock.mockReturnValueOnce(controllable);
+
+    fireEvent.click(screen.getByRole("button", { name: /^run$/i }));
+
+    expect(runOrchestrateMock).toHaveBeenCalledWith({ projectDir: path, task }, expect.any(Function));
+    const onProgress = runOrchestrateMock.mock.calls[0]![1] as (event: unknown) => void;
+
+    act(() => onProgress({ stage: "load", detail: "loading project" }));
+    await waitFor(() => expect(screen.getByText(/loading project/)).toBeTruthy());
+
+    act(() => onProgress({ stage: "route", detail: "routed to deepseek-v4-flash via worker agent generalist" }));
+    await waitFor(() => expect(screen.getAllByText(/deepseek-v4-flash/).length).toBeGreaterThan(0));
+
+    act(() => onProgress({ stage: "worker:1", detail: "worker attempt 1 running" }));
+    await waitFor(() => expect(screen.getByText(/worker attempt 1 running/)).toBeTruthy());
+  });
+
+  it("renders the diff, verdict (decision+reasons+severity), outcome, and cost split on resolve", async () => {
+    await chooseProjectAndFillTask();
+    const controllable = makeControllableRun();
+    runOrchestrateMock.mockReturnValueOnce(controllable);
+    fireEvent.click(screen.getByRole("button", { name: /^run$/i }));
+
+    act(() => controllable.resolve(orchestrateResultFixture()));
+
+    await waitFor(() => expect(screen.getByText(/worker approved/i)).toBeTruthy());
+    expect(screen.getByText(/^approved$/i)).toBeTruthy();
+    expect(screen.getByText(/looks correct/)).toBeTruthy();
+    expect(screen.getByText(/severity: none/i)).toBeTruthy();
+    expect(screen.getByText("-old line")).toBeTruthy();
+    expect(screen.getByText("+new line")).toBeTruthy();
+    expect(screen.getByText("$0.0100")).toBeTruthy();
+    expect(screen.getByText("$0.0200")).toBeTruthy();
+    expect(screen.getByText("$0.0300")).toBeTruthy();
+    expect(screen.getByText(/estimate-class/i)).toBeTruthy();
+    expect(screen.getByText(/provider-reported/i)).toBeTruthy();
+  });
+
+  it("Cancel calls the run's cancel(), disables the button while cancelling (no second cancel call), then shows Cancelled — not Failed — on RunCancelledError", async () => {
+    await chooseProjectAndFillTask();
+    const controllable = makeControllableRun();
+    runOrchestrateMock.mockReturnValueOnce(controllable);
+    fireEvent.click(screen.getByRole("button", { name: /^run$/i }));
+
+    const cancelButton = await screen.findByRole("button", { name: /^cancel$/i });
+    fireEvent.click(cancelButton);
+    expect(controllable.cancel).toHaveBeenCalledTimes(1);
+
+    const cancellingButton = screen.getByRole("button", { name: /cancelling/i }) as HTMLButtonElement;
+    expect(cancellingButton.disabled).toBe(true);
+    fireEvent.click(cancellingButton); // second click must NOT start a second cancel
+    expect(controllable.cancel).toHaveBeenCalledTimes(1);
+
+    act(() => controllable.reject(new RunCancelledError(controllable.runId, undefined)));
+
+    await waitFor(() => expect(screen.getByText(/^cancelled$/i)).toBeTruthy());
+    expect(screen.queryByText(/^failed$/i)).toBeNull();
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
+  it("renders a friendly message (not a crash) for a genuine EngineError, distinct from Cancelled", async () => {
+    await chooseProjectAndFillTask();
+    const controllable = makeControllableRun();
+    runOrchestrateMock.mockReturnValueOnce(controllable);
+    fireEvent.click(screen.getByRole("button", { name: /^run$/i }));
+
+    act(() => controllable.reject(new EngineError(-32000, "no harness found for this project", undefined)));
+
+    await waitFor(() => expect(screen.getByRole("alert")).toBeTruthy());
+    const alertText = screen.getByRole("alert").textContent ?? "";
+    expect(alertText).toMatch(/no harness found/i);
+    expect(alertText).not.toMatch(/at Object|\.tsx:\d+|\bstack\b/i);
+    expect(screen.queryByText(/^cancelled$/i)).toBeNull();
+  });
+
+  it("Apply calls engine.orchestrate.apply with {projectDir, diff}, disables while applying, and shows Applied", async () => {
+    const { path } = await chooseProjectAndFillTask();
+    const controllable = makeControllableRun();
+    runOrchestrateMock.mockReturnValueOnce(controllable);
+    fireEvent.click(screen.getByRole("button", { name: /^run$/i }));
+    const fixture = orchestrateResultFixture();
+    act(() => controllable.resolve(fixture));
+    await waitFor(() => expect(screen.getByRole("button", { name: /apply diff/i })).toBeTruthy());
+
+    let resolveApply!: () => void;
+    callMock.mockReturnValueOnce(
+      new Promise<void>((resolve) => {
+        resolveApply = resolve;
+      }),
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: /apply diff/i }));
+    expect(callMock).toHaveBeenCalledWith("engine.orchestrate.apply", { projectDir: path, diff: fixture.diff });
+    expect((screen.getByRole("button", { name: /applying/i }) as HTMLButtonElement).disabled).toBe(true);
+
+    act(() => resolveApply());
+    await waitFor(() => expect(screen.getByText(/^applied\.?$/i)).toBeTruthy());
+  });
+
+  it("shows a friendly Apply-failed state on rejection", async () => {
+    await chooseProjectAndFillTask();
+    const controllable = makeControllableRun();
+    runOrchestrateMock.mockReturnValueOnce(controllable);
+    fireEvent.click(screen.getByRole("button", { name: /^run$/i }));
+    act(() => controllable.resolve(orchestrateResultFixture()));
+    await waitFor(() => expect(screen.getByRole("button", { name: /apply diff/i })).toBeTruthy());
+
+    callMock.mockRejectedValueOnce(new EngineError(-32000, "git apply failed: conflict", undefined));
+    fireEvent.click(screen.getByRole("button", { name: /apply diff/i }));
+
+    await waitFor(() => expect(screen.getByRole("alert")).toBeTruthy());
+    expect(screen.getByRole("alert").textContent).toMatch(/git apply failed/i);
+  });
+
+  it("does not show an Apply button for a failed outcome with an empty diff", async () => {
+    await chooseProjectAndFillTask();
+    const controllable = makeControllableRun();
+    runOrchestrateMock.mockReturnValueOnce(controllable);
+    fireEvent.click(screen.getByRole("button", { name: /^run$/i }));
+
+    act(() =>
+      controllable.resolve(
+        orchestrateResultFixture({
+          outcome: "failed",
+          diff: "",
+          diffStat: "",
+          attempts: [{ n: 1, kind: "worker", summary: "gave up", empty: true }],
+          cost: {
+            workerUsd: 0.01,
+            reviewUsd: null,
+            escalateUsd: null,
+            frontierUsd: null,
+            totalUsd: 0.01,
+            note: "estimate-class",
+          },
+        }),
+      ),
+    );
+
+    await waitFor(() => expect(screen.getByText(/^failed$/i)).toBeTruthy());
+    expect(screen.queryByRole("button", { name: /apply diff/i })).toBeNull();
+  });
+
+  it("never calls console.* while running/streaming/resolving/applying (content-logging invariant)", async () => {
+    const consoleSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    const consoleErrorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      await chooseProjectAndFillTask("a very specific secret-looking task string");
+      const controllable = makeControllableRun();
+      runOrchestrateMock.mockReturnValueOnce(controllable);
+      fireEvent.click(screen.getByRole("button", { name: /^run$/i }));
+
+      const onProgress = runOrchestrateMock.mock.calls[0]![1] as (event: unknown) => void;
+      act(() => onProgress({ stage: "route", detail: "routed to deepseek-v4-flash" }));
+      act(() => controllable.resolve(orchestrateResultFixture()));
+      await waitFor(() => expect(screen.getByText(/worker approved/i)).toBeTruthy());
+
+      callMock.mockResolvedValueOnce(undefined);
+      fireEvent.click(screen.getByRole("button", { name: /apply diff/i }));
+      await waitFor(() => expect(screen.getByText(/^applied\.?$/i)).toBeTruthy());
+
+      expect(consoleSpy).not.toHaveBeenCalled();
+      expect(consoleErrorSpy).not.toHaveBeenCalled();
+    } finally {
+      consoleSpy.mockRestore();
+      consoleErrorSpy.mockRestore();
+    }
+  });
+});
