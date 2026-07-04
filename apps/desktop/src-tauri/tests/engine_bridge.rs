@@ -22,6 +22,7 @@ fn mock_path(name: &str) -> std::path::PathBuf {
         "die_on_request" => env!("CARGO_BIN_EXE_mock_die_on_request"),
         "clean_exit_on_eof" => env!("CARGO_BIN_EXE_mock_clean_exit_on_eof"),
         "ignore_eof" => env!("CARGO_BIN_EXE_mock_ignore_eof"),
+        "stdin_black_hole" => env!("CARGO_BIN_EXE_mock_stdin_black_hole"),
         other => panic!("no mock binary registered for scenario '{other}'"),
     })
 }
@@ -128,6 +129,55 @@ async fn child_death_mid_call_resolves_to_error_not_a_hang() {
 }
 
 #[tokio::test]
+async fn cancelled_call_does_not_leak_its_pending_map_entry() {
+    let bridge = EngineBridge::spawn(mock_path("ignore_eof")).expect("spawn mock_ignore_eof");
+
+    // mock_ignore_eof reads and discards stdin lines forever without ever
+    // writing a response, so this call() can never resolve on its own.
+    // Wrapping it in a short timeout and letting that timeout fire drops
+    // the call() future mid-flight -- exactly the cancellation shape a
+    // Tauri command with a per-call deadline will produce.
+    let outcome = tokio::time::timeout(Duration::from_millis(100), bridge.call("never.responds", json!({}))).await;
+    assert!(outcome.is_err(), "the mock never responds; the timeout should fire, not the call");
+
+    assert_eq!(
+        bridge.pending_len(),
+        0,
+        "cancelling the call() future must remove its pending-map entry, not leak it"
+    );
+}
+
+#[tokio::test]
+async fn second_call_after_full_child_death_also_resolves_promptly_not_a_hang() {
+    let bridge = EngineBridge::spawn(mock_path("die_on_request")).expect("spawn mock_die_on_request");
+
+    // mock_die_on_request reads a request then exit(1)s without
+    // responding. The first call resolves to an error once stdout closes
+    // (covered by `child_death_mid_call_resolves_to_error_not_a_hang`
+    // above) -- this test's concern is what happens *after* the child is
+    // fully, unambiguously dead: does a second call still resolve
+    // promptly, or does it hang because e.g. stale state from the first
+    // call lingers?
+    let first = tokio::time::timeout(Duration::from_secs(5), bridge.call("first", json!({})))
+        .await
+        .expect("first call must resolve within the bound, not hang");
+    assert!(first.is_err(), "child dies without responding; the first call must error");
+
+    // Give the child's exit and the reader task's EOF-driven cleanup a
+    // moment to fully settle, so this genuinely exercises "child already
+    // fully dead" rather than racing the tail end of its exit.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let second = tokio::time::timeout(Duration::from_secs(5), bridge.call("second", json!({})))
+        .await
+        .expect("second call must resolve within the bound, not hang");
+    assert!(
+        second.is_err(),
+        "a second call after the child is fully dead must also error (broken-pipe write), not hang"
+    );
+}
+
+#[tokio::test]
 async fn shutdown_terminates_cleanly_when_child_exits_on_eof() {
     let bridge = EngineBridge::spawn_with_shutdown_timeout(mock_path("clean_exit_on_eof"), Duration::from_secs(2))
         .expect("spawn mock_clean_exit_on_eof");
@@ -164,6 +214,53 @@ async fn shutdown_kills_child_that_ignores_eof() {
         elapsed < Duration::from_secs(5),
         "shutdown() must kill an unresponsive child rather than waiting it out, took {elapsed:?}"
     );
+}
+
+#[tokio::test]
+async fn shutdown_bounds_stdin_close_against_a_stuck_concurrent_write() {
+    // mock_stdin_black_hole never reads a byte from stdin and never exits
+    // on its own. A large-enough payload makes write_all() fill the OS
+    // pipe buffer and then block waiting for the (never-happening) drain,
+    // holding the bridge's stdin lock for the whole test unless something
+    // intervenes.
+    let bridge = std::sync::Arc::new(
+        EngineBridge::spawn_with_shutdown_timeout(mock_path("stdin_black_hole"), SHORT_TIMEOUT)
+            .expect("spawn mock_stdin_black_hole"),
+    );
+
+    // Comfortably larger than any realistic OS pipe buffer (macOS/Linux
+    // both cap well under 1 MiB) so write_all() is guaranteed to block
+    // rather than have the whole request fit in the kernel buffer.
+    let big_payload = "x".repeat(4 * 1024 * 1024); // 4 MiB
+    let call_bridge = bridge.clone();
+    let stuck_call = tokio::spawn(async move { call_bridge.call("stuck.write", json!({"payload": big_payload})).await });
+
+    // Give write_all() a generous head start to actually reach the
+    // blocked-on-full-pipe state before shutdown() races against it.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let started = Instant::now();
+    // Outer safety bound so a regression here fails the test instead of
+    // hanging the whole suite forever.
+    let shutdown_outcome = tokio::time::timeout(Duration::from_secs(5), bridge.shutdown()).await;
+    let elapsed = started.elapsed();
+
+    assert!(
+        shutdown_outcome.is_ok(),
+        "shutdown() must return within a bound even when a concurrent call()'s write_all is stuck on a full pipe \
+         (it did not return within 5s)"
+    );
+    assert!(
+        elapsed < SHORT_TIMEOUT + Duration::from_secs(2),
+        "shutdown() took {elapsed:?}, expected well under {:?}",
+        SHORT_TIMEOUT + Duration::from_secs(2)
+    );
+
+    let outcome = tokio::time::timeout(Duration::from_secs(2), stuck_call)
+        .await
+        .expect("the stuck call must resolve, not hang, once shutdown() kills the child")
+        .expect("the call task itself must not panic");
+    assert!(outcome.is_err(), "the stuck call should resolve to an error once the child is killed, not succeed");
 }
 
 #[tokio::test]

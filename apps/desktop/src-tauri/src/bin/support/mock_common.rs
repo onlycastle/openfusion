@@ -158,6 +158,19 @@ pub fn run(scenario: &str) {
             }
         }
 
+        // Never reads a single byte from stdin (not even to drain it) and
+        // never exits on its own — used to test shutdown()'s stdin-close
+        // step against a concurrent call() whose write_all() is blocked
+        // because the OS pipe buffer filled up and nothing is reading it.
+        // (`ignore_eof` above still drains stdin in a loop, which would
+        // keep the pipe buffer empty and never reproduce that block.)
+        "stdin_black_hole" => {
+            let _ = &stdin; // never read from; keeps the pipe buffer full
+            loop {
+                std::thread::sleep(Duration::from_secs(3600));
+            }
+        }
+
         other => {
             eprintln!("mock sidecar: unknown scenario '{other}'");
             std::process::exit(2);

@@ -85,6 +85,38 @@ const ERR_UNKNOWN: i64 = -32005;
 
 type PendingMap = Arc<StdMutex<HashMap<u64, oneshot::Sender<Result<Value, RpcError>>>>>;
 
+/// RAII guard that removes a `call()`'s entry from the pending map when
+/// dropped. Created immediately after the entry is inserted and held for
+/// the rest of `call()`'s body (including across the `rx.await`), so
+/// *every* exit path removes the entry:
+///
+/// - Normal delivery: `route_message` already `remove`d the entry to
+///   resolve the oneshot, so the guard's drop-time `remove` is a harmless
+///   no-op (`HashMap::remove` on an absent key just returns `None`).
+/// - An early `Err` return (serialize/write failure, stdin already
+///   closed): the guard removes the entry when `call()`'s stack frame
+///   unwinds at the `return`.
+/// - Caller cancellation (e.g. the `call()` future is dropped because a
+///   wrapping `tokio::time::timeout` fired): nothing else would ever touch
+///   this entry again, so without this guard it would leak in the map
+///   (and leak the `oneshot::Sender` with it) until the child dies or the
+///   bridge shuts down. The guard's `Drop` fires as part of tearing down
+///   the cancelled future and removes it immediately.
+///
+/// There is no double-remove hazard: `route_message` and this guard can
+/// each only ever observe the entry once (removal is the hand-off point),
+/// and a `remove` of a key that's already gone is a no-op, not an error.
+struct PendingGuard {
+    id: u64,
+    pending: PendingMap,
+}
+
+impl Drop for PendingGuard {
+    fn drop(&mut self) {
+        self.pending.lock().expect("pending mutex poisoned").remove(&self.id);
+    }
+}
+
 /// A JSON-RPC 2.0 error: either relayed verbatim from the engine's
 /// `{"error": {code, message, data}}` response envelope, or synthesized by
 /// the bridge itself for transport-level failures (child died, bridge
@@ -213,14 +245,16 @@ impl EngineBridge {
             let mut pending = self.pending.lock().expect("pending mutex poisoned");
             pending.insert(id, tx);
         }
+        // Held for the rest of this function, including across `rx.await`.
+        // Its `Drop` is what guarantees the pending entry never outlives
+        // this call — on every exit path, not just the happy one. See the
+        // type's doc comment for why this is race-free.
+        let _pending_guard = PendingGuard { id, pending: self.pending.clone() };
 
         let request = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
         let mut line = match serde_json::to_vec(&request) {
             Ok(bytes) => bytes,
-            Err(err) => {
-                self.forget_pending(id);
-                return Err(RpcError::serialize(&err));
-            }
+            Err(err) => return Err(RpcError::serialize(&err)),
         };
         line.push(b'\n');
 
@@ -233,14 +267,8 @@ impl EngineBridge {
         };
         match write_outcome {
             Some(Ok(())) => {}
-            Some(Err(err)) => {
-                self.forget_pending(id);
-                return Err(RpcError::io(&err));
-            }
-            None => {
-                self.forget_pending(id);
-                return Err(RpcError::bridge_closed());
-            }
+            Some(Err(err)) => return Err(RpcError::io(&err)),
+            None => return Err(RpcError::bridge_closed()),
         }
 
         match rx.await {
@@ -253,15 +281,22 @@ impl EngineBridge {
         }
     }
 
-    fn forget_pending(&self, id: u64) {
-        self.pending.lock().expect("pending mutex poisoned").remove(&id);
-    }
-
     /// Subscribes to engine notifications (JSON-RPC messages with no
     /// `id` — e.g. `orchestrate.progress`/`evals.progress`). Task 4 forwards
     /// these to the webview.
     pub fn subscribe(&self) -> broadcast::Receiver<Value> {
         self.notify_tx.subscribe()
+    }
+
+    /// Number of in-flight `call()`s currently registered in the pending
+    /// map. Test-support only: it exists so the integration-test suite in
+    /// `tests/engine_bridge.rs` can assert the pending map doesn't leak
+    /// entries when a `call()` future is cancelled before a response
+    /// arrives (e.g. a `tokio::time::timeout` that fires). Not part of the
+    /// crate's functional API and carries no request/response content —
+    /// just a count.
+    pub fn pending_len(&self) -> usize {
+        self.pending.lock().expect("pending mutex poisoned").len()
     }
 
     /// Closes stdin (EOF — the engine's cue to exit), waits up to the
@@ -274,18 +309,40 @@ impl EngineBridge {
             return;
         }
 
-        {
+        // Bound the stdin-close step itself, not just the wait-for-exit
+        // below. `self.stdin` is the same lock a concurrent `call()` holds
+        // for the full duration of its `write_all().await` — if that write
+        // is blocked (a payload larger than the OS pipe buffer and a child
+        // that isn't reading, which is a realistic shape for this bridge:
+        // prompts/model output can be large), acquiring the lock here with
+        // no timeout would queue shutdown() behind it indefinitely,
+        // defeating the whole "bounded, kill-on-overrun" contract. Timing
+        // out here instead falls through straight to killing the child:
+        // the kill doesn't need stdin, and it's exactly what unblocks the
+        // stuck write (the child's read end closes, so the pending
+        // `write_all` gets a broken-pipe error instead of hanging forever).
+        let stdin_close_timed_out = tokio::time::timeout(self.shutdown_timeout, async {
             let mut guard = self.stdin.lock().await;
             *guard = None; // drop ChildStdin -> EOF on the child's stdin
-        }
+        })
+        .await
+        .is_err();
 
         {
             let mut child = self.child.lock().await;
-            match tokio::time::timeout(self.shutdown_timeout, child.wait()).await {
-                Ok(_) => {}
-                Err(_elapsed) => {
-                    let _ = child.start_kill();
-                    let _ = child.wait().await;
+            if stdin_close_timed_out {
+                // The graceful EOF cue never went out (a stuck concurrent
+                // write is still holding the stdin lock), so there's
+                // nothing to wait for — go straight to kill.
+                let _ = child.start_kill();
+                let _ = child.wait().await;
+            } else {
+                match tokio::time::timeout(self.shutdown_timeout, child.wait()).await {
+                    Ok(_) => {}
+                    Err(_elapsed) => {
+                        let _ = child.start_kill();
+                        let _ = child.wait().await;
+                    }
                 }
             }
         }
