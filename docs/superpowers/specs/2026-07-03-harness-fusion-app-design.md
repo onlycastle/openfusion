@@ -272,6 +272,17 @@ GEPA-style automated harness optimization is explicitly deferred past v1.
   notarytool (requires Apple Developer account, $99/yr — the only mandatory
   paid dependency); DMG artifacts on GitHub Releases; auto-update; Homebrew
   cask as second channel.
+- **Realized (M8): a signed, notarized `.dmg` is buildable today** via the
+  operator runbook at `apps/desktop/BUILDING.md` — code-signs the sidecar's
+  native addon (the one thing Tauri's bundler never signs itself),
+  notarizes + staples both the `.app` and the `.dmg`, and documents the
+  clean-Mac verification smokes. This is a **manual, operator-run** build
+  requiring the operator's own Developer ID Application certificate and
+  notarization credentials (App Store Connect API key or Apple ID +
+  app-specific password) — neither this repo nor CI holds or can supply
+  them, so no signed artifact has been produced in CI or in development.
+  The CI/CD-automated form described above (tauri-action, GitHub Releases,
+  auto-update, Homebrew cask) remains future work — see §11.
 - Naming: "openfusion" collides with an existing well-known GitHub project
   (FusionFall server emulator). Working name stays; public name chosen at
   repo-publication time.
@@ -281,7 +292,11 @@ GEPA-style automated harness optimization is explicitly deferred past v1.
 Windows/Linux; Gemini/goose engine adapters (interface ready, adapters
 later); GEPA-style harness auto-optimization; team/cloud sync; local-model
 presets beyond generic OpenAI-compatible; harness marketplace/sharing; any
-built-in editor.
+built-in editor. **CI-automated signing/release** is also cut from v1: M8
+delivers a manual operator-run signed-DMG build (`apps/desktop/BUILDING.md`)
+only — tauri-action CI builds, GitHub Releases artifacts, auto-update, and
+a Homebrew cask (§10) all remain future work, deferred until the project is
+ready to hold Apple signing credentials in CI.
 
 ## 12. Key Risks
 

@@ -353,14 +353,32 @@ commented out pending empirical verification against a signed build.
   exactly as expected, and launching that `.app` directly showed the engine
   sidecar spawning from the packaged path and exiting cleanly (no orphan) on
   quit — see `.superpowers/sdd/m8-task-2-report.md` for the full account.
-- **Nested code signing**, including the manual sidecar pre-sign fallback
-  for the known Tauri bundler bug (#11992: sidecar signing during bundling
-  can produce an invalid signature) — still open, M8 Task 3.
+- **Nested code signing — DONE (M8 Task 3).** `scripts/presign-sidecar-assets.mjs`
+  runs automatically as `tauri.conf.json`'s `beforeBundleCommand`: it finds
+  every Mach-O under the staged, triple-less `binaries/openfusion-engine.assets/`
+  (in practice, `better_sqlite3.node`) and code-signs it with
+  `--options runtime --timestamp` before Tauri copies `bundle.resources`
+  into the `.app` — closing the one gap Tauri itself doesn't cover (it only
+  auto-signs the externalBin sidecar binary, never `bundle.resources`
+  content). A documented manual fallback covers the known Tauri bundler bug
+  (#11992: sidecar signing during bundling can occasionally produce an
+  invalid signature).
 - **Notarization** (`xcrun notarytool`) and **stapling the `.dmg`** itself
-  (not just the `.app`) — still open, M8 Task 3/4.
+  (not just the `.app`) — DONE (M8 Task 3/4). `tauri build` notarizes +
+  staples the `.app` inline when credentials are present in env;
+  `scripts/notarize-staple-dmg.mjs` staples (or, with `--notarize`, submits
+  + staples) the `.dmg` container afterward, since Tauri never notarizes the
+  `.dmg` itself.
 - Verifying empirically whether `allow-jit`/`allow-unsigned-executable-memory`
   are actually needed for a WKWebView-based (not Electron-based) app — still
-  open, needs a signed+notarized build.
+  open, needs a signed+notarized build (the JIT empirical check).
+
+**The full operator runbook — prerequisites, exact env vars, the build
+sequence, verification, and troubleshooting — lives in
+[`BUILDING.md`](./BUILDING.md).** Producing an actual signed, notarized
+`.dmg` requires the operator's own Apple Developer credentials, which
+neither this repo nor CI holds; nothing here claims a signed artifact has
+actually been produced.
 
 See `docs/research/2026-07-04-m7-tauri-verification.md` and
 `docs/research/2026-07-04-m8-signing-verification.md` for the full

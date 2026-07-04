@@ -245,7 +245,78 @@ CSP violation logs confirms the policy is live.
 
 See `apps/desktop/README.md` for the architecture, how to build/stage the
 sidecar and run `tauri dev`, the four cockpit screens in detail, and the
-operator smoke checklist; packaging (signing, notarization, DMG) is M8 scope.
+day-to-day (unsigned) operator smoke checklist. Packaging a distributable,
+signed and notarized `.dmg` is M8 scope — see the next section.
+
+## Distribution: building a signed DMG (M8)
+
+OpenFusion is signed-DMG-buildable: `apps/desktop/BUILDING.md` is the
+complete operator runbook for producing a `.dmg` that installs on a clean
+Mac with no Gatekeeper right-click dance. That document covers prerequisites
+(an Apple Developer account, a Developer ID Application certificate,
+notarization credentials), the exact environment variables, the build
+sequence (`build:sidecar` → `stage-sidecar` → `tauri build`, which
+auto-signs the sidecar's native addon via a `beforeBundleCommand` and
+notarizes the `.app` inline → `notarize-staple-dmg.mjs` to staple the
+`.dmg` itself), verification steps, the JIT-entitlement empirical check,
+and notarization troubleshooting.
+
+**This step requires the operator's own Apple Developer credentials** —
+nothing in this repository holds or can supply a signing certificate or
+notarization credentials, so a signed artifact has never been produced in
+this development environment or in CI. The signing pipeline itself
+(sidecar asset resolution, packaged-path dispatch, the presign/notarize
+scripts) is fully built and tested; running it against a real certificate
+is the one remaining, credential-gated step before a public release.
+
+### Before you trust / ship this: the consolidated operator smoke checklist
+
+Everything below requires a display, live credentials, or both — none of it
+runs in CI. Work through it in order before trusting a build enough to ship:
+
+**1. The five engine operator smokes** (each env-gated, skipped in CI;
+run from the repo root):
+
+| # | Milestone | Command | Proves |
+|---|---|---|---|
+| 1 | M3 — frontier session | `OPENFUSION_CLAUDE_SMOKE=1 pnpm --filter @openfusion/engine test -- frontier-claude-smoke` | A real embedded `claude` session answers a repo question via the wiki MCP tools (needs `claude` logged in). |
+| 2 | M4 — harness generation | `OPENFUSION_CLAUDE_SMOKE=1 pnpm --filter @openfusion/engine test -- harness-generate-smoke` | A real frontier session generates a valid, committable `.openfusion/` harness for this repo (needs `claude` logged in). |
+| 3 | M5a — worker run | `OPENFUSION_WORKER_SMOKE=1 pnpm --filter @openfusion/engine test -- worker-run-smoke` | A real open model writes a file inside an isolated git worktree (needs a real open-model provider key). |
+| 4 | M5b — orchestrate | `OPENFUSION_ORCHESTRATE_SMOKE=1 pnpm --filter @openfusion/engine test -- orchestrate-smoke` | The full route → worker → frontier-review loop end to end, both backends real (needs an open-model key + `claude` logged in). |
+| 5 | M6 — evals | `OPENFUSION_EVALS_SMOKE=1 pnpm --filter @openfusion/engine test -- evals-run-smoke` | **The first real savings number**: a baseline-vs-harness report card over golden tasks mined from this repo's own commits (needs an open-model key + `claude` logged in). |
+
+**2. The desktop cockpit batch** (see `apps/desktop/README.md`'s "OPERATOR
+SMOKES" section for full detail):
+
+- `tauri dev` (or a built app) launches: window titled "OpenFusion",
+  1024×720, no console errors.
+- Project screen: build the wiki for a real repo, live progress renders.
+- Keys screen: enter a BYOK provider key, relaunch the app, confirm it
+  persisted (Keychain-backed, not re-entered).
+- Orchestrate screen: route → worker diff → frontier review → apply,
+  **and** mid-run Cancel renders "Cancelled" (not "Failed").
+- Evals screen: a real eval run renders an honest verdict, a savings % with
+  its `pricingConfidence` caveat (or "not computable"), and per-task rows.
+- CSP: DevTools console shows **no** CSP violation messages while the app
+  runs normally.
+- Quit the app; confirm no orphaned engine process
+  (`ps aux | grep openfusion-engine`).
+
+**3. The signed-DMG verification** (`apps/desktop/BUILDING.md` §5, after
+running the build sequence there):
+
+- `spctl -a -vvv -t install <App>.app` → accepted, notarized.
+- `codesign -dvvv --entitlements - <App>.app` → hardened runtime on,
+  entitlements match `Entitlements.plist`.
+- `stapler validate <App>.dmg` → validates.
+- Install on a **clean Mac / fresh user account** → launches directly, no
+  right-click-to-open dance.
+- A real orchestration + a real eval run inside that signed, notarized
+  build (not just a dev build).
+- No console CSP violations; no orphaned engine process on quit.
+- **JIT empirical check:** if (and only if) the app crashes on launch post-
+  notarization, uncomment `allow-jit`/`allow-unsigned-executable-memory` in
+  `Entitlements.plist` and rebuild from scratch.
 
 ## Development
 
