@@ -202,8 +202,10 @@ deliberately dumb: all intelligence stays in the engine, unchanged.
 
 The shell exposes four cockpit screens:
 
-1. **Project** — discover and index a repo (live progress on `wiki.build`),
-   view the eval report card (pass/fail/inconclusive, savings %, per-task results).
+1. **Project** — discover and index a repo: open a project directory and
+   build its wiki (`wiki.build`) with live progress. The eval report card
+   (pass/fail/inconclusive, savings %, per-task results) lives on its own
+   Evals screen, below — not here.
 2. **Keys** — configure frontier engine (Claude Code/Codex) and open-model
    providers (BYOK: Moonshot, Z.ai, DeepSeek, generic OpenAI-compatible);
    all secrets stored in macOS Keychain.

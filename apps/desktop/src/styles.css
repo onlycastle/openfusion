@@ -286,6 +286,25 @@ textarea {
   font-size: 1.05rem;
 }
 
+/* A savings figure sitting on a "fail" (ETH-hazard) verdict — the number
+   itself is real, but the verdict above already supersedes it as a claim, so
+   it's visually de-emphasized (muted color, struck through) rather than
+   reading like a normal win. Shared by the main Savings line (SavingsDisplay)
+   and the Clean savings line in the clean-subset table — both qualify the
+   same way on a fail verdict. */
+.savings-figure-disregarded {
+  color: var(--muted);
+  text-decoration: line-through;
+  font-weight: 400;
+}
+
+.disregarded-note {
+  color: var(--muted);
+  text-decoration: none;
+  font-weight: 400;
+  font-style: italic;
+}
+
 .caveat-badge {
   display: inline-block;
   padding: 0.15rem 0.6rem;

@@ -216,6 +216,50 @@ describe("EvalsScreen", () => {
     expect(savingsLine.textContent).not.toMatch(/disregarded/i);
   });
 
+  it("qualifies the Clean savings line on a FAIL verdict so it can never skim-read as a win", async () => {
+    await setUpRunnableForm();
+    const controllable = makeControllableRun();
+    runEvalsMock.mockReturnValueOnce(controllable);
+    fireEvent.click(screen.getByRole("button", { name: /run evals/i }));
+
+    act(
+      () =>
+        controllable.resolve(
+          reportFixture({
+            verdict: "fail",
+            qualityHeld: false,
+            cleanHarnessPassed: 2,
+            cleanBaselinePassed: 6,
+            // Positive despite the fail verdict -- fail is decided by quality
+            // regardless of cost, so this is the exact skim-reads-as-win gap
+            // SavingsDisplay's own qualifier already closes for the main
+            // savings line.
+            cleanSavingsPct: 0.3,
+            harness: { passed: 2, costUsd: 0.1, escalations: 0 },
+          }),
+        ),
+    );
+
+    await waitFor(() => expect(screen.getByRole("alert")).toBeTruthy());
+    const cleanSavingsDt = screen.getByText(/^clean savings$/i);
+    const cleanSavingsDd = cleanSavingsDt.nextElementSibling as HTMLElement;
+    expect(cleanSavingsDd.textContent).toMatch(/disregarded/i);
+  });
+
+  it("does NOT qualify the Clean savings line on a PASS verdict", async () => {
+    await setUpRunnableForm();
+    const controllable = makeControllableRun();
+    runEvalsMock.mockReturnValueOnce(controllable);
+    fireEvent.click(screen.getByRole("button", { name: /run evals/i }));
+
+    act(() => controllable.resolve(reportFixture({ verdict: "pass" })));
+
+    await waitFor(() => expect(screen.getByText(/^PASS —/)).toBeTruthy());
+    const cleanSavingsDt = screen.getByText(/^clean savings$/i);
+    const cleanSavingsDd = cleanSavingsDt.nextElementSibling as HTMLElement;
+    expect(cleanSavingsDd.textContent).not.toMatch(/disregarded/i);
+  });
+
   it("renders an INCONCLUSIVE verdict using the engine's own report.note as the reason (material measurement-failure gate)", async () => {
     await setUpRunnableForm();
     const controllable = makeControllableRun();
@@ -346,7 +390,7 @@ describe("EvalsScreen", () => {
     expect(screen.queryByText(/savings estimate/i)).toBeNull();
   });
 
-  it("renders 'savings not computable (unpriced models)' — NOT a fake number — when savingsPct is null", async () => {
+  it("renders a generic 'savings not computable' — NOT a fake number — when savingsPct is null (null occurs for more than just unpriced models)", async () => {
     await setUpRunnableForm();
     const controllable = makeControllableRun();
     runEvalsMock.mockReturnValueOnce(controllable);
@@ -364,7 +408,8 @@ describe("EvalsScreen", () => {
         ),
     );
 
-    await waitFor(() => expect(screen.getByText(/savings: not computable \(unpriced models\)/i)).toBeTruthy());
+    await waitFor(() => expect(screen.getByText(/savings: not computable/i)).toBeTruthy());
+    expect(screen.queryByText(/unpriced models/i)).toBeNull();
     expect(screen.queryByText(/NaN/)).toBeNull();
   });
 

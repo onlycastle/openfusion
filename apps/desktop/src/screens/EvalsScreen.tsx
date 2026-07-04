@@ -25,8 +25,15 @@ function formatUsd(value: number | null): string {
   return `$${value.toFixed(4)}`;
 }
 
+/** `null` shows up for more than one reason — an unpriced model (the most
+ * common case), but also an empty clean subset, a zero clean-baseline cost
+ * total, or subscription-auth calls that meter zero cost — so the message
+ * stays a generic "not computable" rather than naming "(unpriced models)"
+ * specifically and misattributing the other cases. Never a fake number
+ * (a `0` or `NaN` here would silently misread as "no savings" or crash the
+ * format call). */
 function formatPct(value: number | null): string {
-  if (value === null) return "not computable (unpriced models)";
+  if (value === null) return "not computable";
   return `${(value * 100).toFixed(1)}%`;
 }
 
@@ -381,8 +388,18 @@ export function EvalsScreen() {
             <dd>{report.cleanBaselinePassed}</dd>
             <dt>Clean harness passed</dt>
             <dd>{report.cleanHarnessPassed}</dd>
+            {/* Same skim-reads-as-win gap SavingsDisplay's own qualifier closes for the
+                main savings line, above: fail is decided by quality on the clean subset
+                regardless of cost (evals/run.ts's `!qualityHeldClean` branch, checked
+                before any cost comparison), so cleanSavingsPct can still read positive on
+                a fail verdict. Qualify it here too rather than leaving it bare. */}
             <dt>Clean savings</dt>
-            <dd>{formatPct(report.cleanSavingsPct)}</dd>
+            <dd className={report.verdict === "fail" ? "savings-figure-disregarded" : undefined}>
+              {formatPct(report.cleanSavingsPct)}
+              {report.verdict === "fail" && (
+                <span className="disregarded-note"> — disregarded; see verdict above</span>
+              )}
+            </dd>
             <dt>Measurement failures</dt>
             <dd>{report.measurementFailureCount}</dd>
           </dl>
