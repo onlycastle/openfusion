@@ -1,9 +1,13 @@
 // M7a shell backbone: a bare Tauri 2 builder with the shell plugin
-// registered so `Command::sidecar` is available to the bridge landing in
-// Task 3. No engine bridge / custom commands here yet — this crate's only
-// job right now is to compile and open a single default window. See
+// registered. Task 3 adds `engine_bridge` (spawns the engine sidecar via
+// tokio::process and speaks JSON-RPC 2.0 over its stdio — see that
+// module's docs for the process-mechanism decision); it is not yet wired
+// into a Tauri command/managed state (that's Task 4), but is exposed here
+// so both the app and its tests can use it. See
 // docs/research/2026-07-04-m7-tauri-verification.md for the full
 // architecture this scaffold is built toward.
+pub mod engine_bridge;
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
