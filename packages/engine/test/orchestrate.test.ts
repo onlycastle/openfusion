@@ -65,7 +65,10 @@ const TRIVIAL_PAGE: WikiPage = {
 // engine.harness.generate output. The agent pins an explicit providerId
 // ("p1") so routeTask resolution is deterministic regardless of which
 // worker model gets configured/mocked per test.
-async function writeTestHarness(projectDir: string, opts: { failuresBeforeFrontier?: number } = {}): Promise<void> {
+async function writeTestHarness(
+  projectDir: string,
+  opts: { failuresBeforeFrontier?: number; pages?: WikiPage[] } = {},
+): Promise<void> {
   const headSha = git(projectDir, "rev-parse", "HEAD");
   const agent: AgentDef = {
     name: "codegen-worker",
@@ -92,7 +95,7 @@ async function writeTestHarness(projectDir: string, opts: { failuresBeforeFronti
       verification: { structural: "pass", evals: "pending" },
       artifacts: [],
     },
-    pages: [TRIVIAL_PAGE],
+    pages: opts.pages ?? [TRIVIAL_PAGE],
     agents: [agent],
     routing,
   };
@@ -506,6 +509,26 @@ function captureWorkerTasks(e: Engine): string[] {
   return tasks;
 }
 
+// M6 Task 2: same monkeypatch style as captureWorkerTasks above, but
+// captures the FULL engine.worker.run params (task AND wikiDigest) for each
+// dispatch — lets a test assert the harness's wiki page digests reach
+// engine.worker.run via its own `wikiDigest` param, distinctly from the
+// `task` string (which orchestrate.ts's buildWorkerTask still composes from
+// only agent.prompt + task + retry feedback — the digest travels alongside
+// it, not folded into it; see orchestrate.ts's own doc comment on why).
+function captureWorkerRunCalls(e: Engine): Array<{ task: string; wikiDigest?: string }> {
+  const calls: Array<{ task: string; wikiDigest?: string }> = [];
+  const originalDispatch = e.dispatcher.dispatch.bind(e.dispatcher);
+  e.dispatcher.dispatch = (async (message: unknown) => {
+    const req = message as { method?: string; params?: { task?: string; wikiDigest?: string } };
+    if (req.method === "engine.worker.run" && typeof req.params?.task === "string") {
+      calls.push({ task: req.params.task, wikiDigest: req.params.wikiDigest });
+    }
+    return originalDispatch(message);
+  }) as typeof e.dispatcher.dispatch;
+  return calls;
+}
+
 describe("engine.orchestrate — retry feedback", () => {
   it("attempt 1's task is unchanged; attempt 2's task appends the prior verdict's rejection reasons", async () => {
     dir = makeRepo();
@@ -744,6 +767,129 @@ describe("engine.orchestrate — empty worker diff", () => {
     // escalation ran next and its own (surviving) worktree remains.
     const manager = await engine.worker.getManager(dir);
     expect(await manager.list()).toHaveLength(1);
+  });
+});
+
+// M6 Task 2: without this, M6 would measure the harness WITHOUT its
+// headline value (distilled context for cheap models) — a worker attempt
+// that never sees a single wiki digest is functionally identical to one
+// with no harness at all. These tests pin that engine.orchestrate actually
+// forwards the loaded harness's own wiki page digests to engine.worker.run
+// (via its `wikiDigest` param — see orchestrate.ts's own doc comment on why
+// that param, not buildWorkerTask's task string, carries them), bounded so
+// a harness with many pages can't blow a cheap worker model's context.
+describe("engine.orchestrate — wiki digests in worker prompts (M6 Task 2)", () => {
+  const SENTINEL_DIGEST = "SENTINEL_DIGEST_7f3ac1: this project uses a custom widget architecture.";
+
+  it("forwards the harness's wiki page digest to engine.worker.run's wikiDigest param", async () => {
+    dir = makeRepo();
+    await writeTestHarness(dir, {
+      pages: [{ slug: "architecture", title: "Architecture", digest: SENTINEL_DIGEST, body: "# Architecture\n" }],
+    });
+    engine = createEngine();
+    engine.models.registry.configure({ id: "p1", kind: "deepseek", apiKey: TEST_API_KEY });
+    engine.models.registry.setTestModel("p1", makeWorkerMock("hello.txt", "hi", "done"));
+    engine.frontier.registerAdapter(
+      makeFakeFrontierAdapter({ reviewVerdicts: [{ decision: "approve", reasons: [], severity: "none" }] }),
+    );
+    const capturedRuns = captureWorkerRunCalls(engine);
+
+    const res = await call(engine, "engine.orchestrate", { projectDir: dir, task: "add hello.txt" });
+    expect(res.error).toBeUndefined();
+
+    expect(capturedRuns).toHaveLength(1);
+    expect(capturedRuns[0]!.wikiDigest).toContain(SENTINEL_DIGEST);
+    expect(capturedRuns[0]!.wikiDigest).toContain("## Project knowledge (from the harness wiki)");
+    expect(capturedRuns[0]!.wikiDigest).toContain("Architecture");
+    // The digest travels via its own param, not folded into the task text.
+    expect(capturedRuns[0]!.task).not.toContain(SENTINEL_DIGEST);
+  });
+
+  it("bounds the combined digest context and notes how many pages were truncated", async () => {
+    dir = makeRepo();
+    // 8 pages x 1200 chars (the schema's own per-digest max) = 9600 total,
+    // comfortably over the 8000-char cap -- forces truncation after the
+    // 6th page (6 x 1200 = 7200 <= 8000; a 7th would push to 8400).
+    const pages: WikiPage[] = Array.from({ length: 8 }, (_, i) => ({
+      slug: `page-${i + 1}`,
+      title: `Page ${i + 1}`,
+      digest: "X".repeat(1200),
+      body: `# Page ${i + 1}\n`,
+    }));
+    await writeTestHarness(dir, { pages });
+    engine = createEngine();
+    engine.models.registry.configure({ id: "p1", kind: "deepseek", apiKey: TEST_API_KEY });
+    engine.models.registry.setTestModel("p1", makeWorkerMock("hello.txt", "hi", "done"));
+    engine.frontier.registerAdapter(
+      makeFakeFrontierAdapter({ reviewVerdicts: [{ decision: "approve", reasons: [], severity: "none" }] }),
+    );
+    const capturedRuns = captureWorkerRunCalls(engine);
+
+    const res = await call(engine, "engine.orchestrate", { projectDir: dir, task: "add hello.txt" });
+    expect(res.error).toBeUndefined();
+
+    const wikiDigest = capturedRuns[0]!.wikiDigest!;
+    expect(wikiDigest).toContain("Page 1");
+    expect(wikiDigest).toContain("Page 6");
+    // Pages 7/8 didn't fit under the cap -- named as omitted, not silently
+    // dropped, and never included wholesale.
+    expect(wikiDigest).not.toContain("Page 7");
+    expect(wikiDigest).not.toContain("Page 8");
+    expect(wikiDigest.toLowerCase()).toContain("omitted");
+    expect(wikiDigest).toContain("2 more wiki page digest(s)");
+    expect(wikiDigest).toContain("8000 characters");
+  });
+});
+
+describe("engine.orchestrate — taskClass + review/escalate cost split (M6 Task 2)", () => {
+  it("result.taskClass matches the class routeTask actually picked", async () => {
+    dir = makeRepo();
+    await writeTestHarness(dir);
+    engine = createEngine();
+    engine.models.registry.configure({ id: "p1", kind: "deepseek", apiKey: TEST_API_KEY });
+    engine.models.registry.setTestModel("p1", makeWorkerMock("hello.txt", "hi", "done"));
+    engine.frontier.registerAdapter(
+      makeFakeFrontierAdapter({ reviewVerdicts: [{ decision: "approve", reasons: [], severity: "none" }] }),
+    );
+
+    const res = await call(engine, "engine.orchestrate", {
+      projectDir: dir,
+      task: "add hello.txt with a greeting",
+    });
+    expect(res.error).toBeUndefined();
+    // writeTestHarness's only routing.taskClasses entry is "codegen", and
+    // this task text matches no other keyword rule (no test/doc/refactor/
+    // fix mention) so classifyTask falls through to "codegen".
+    expect(res.result.taskClass).toBe("codegen");
+  });
+
+  it("cost.reviewUsd and cost.escalateUsd are populated separately and sum to frontierUsd", async () => {
+    dir = makeRepo();
+    // failuresBeforeFrontier: 1 -> exactly one worker attempt before
+    // escalation, so this run exercises BOTH a review call (rejecting that
+    // one attempt) and an escalation call, letting reviewUsd and
+    // escalateUsd each land a single, distinctly-priced cost.
+    await writeTestHarness(dir, { failuresBeforeFrontier: 1 });
+    engine = createEngine();
+    engine.models.registry.configure({ id: "p1", kind: "deepseek", apiKey: TEST_API_KEY });
+    engine.models.registry.setTestModel("p1", makeWorkerMock("attempt1.txt", "first try", "Attempt 1 summary"));
+    engine.frontier.registerAdapter(
+      makeFakeFrontierAdapter({
+        reviewVerdicts: [{ decision: "request-changes", reasons: ["nope"], severity: "minor" }],
+        reviewCostUsd: 0.05,
+        escalationCostUsd: 0.5,
+      }),
+    );
+
+    const res = await call(engine, "engine.orchestrate", { projectDir: dir, task: "improve the widget" });
+    expect(res.error).toBeUndefined();
+    const result = res.result;
+
+    expect(result.outcome).toBe("escalated");
+    expect(result.cost.reviewUsd).toBeCloseTo(0.05, 10);
+    expect(result.cost.escalateUsd).toBeCloseTo(0.5, 10);
+    expect(result.cost.frontierUsd).toBeCloseTo(result.cost.reviewUsd + result.cost.escalateUsd, 10);
+    expect(result.cost.totalUsd).toBeCloseTo(result.cost.workerUsd + result.cost.frontierUsd, 10);
   });
 });
 
