@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -10,7 +10,7 @@ import type { FrontierAdapter, FrontierEvent, FrontierPromptHandle, FrontierSess
 import type { AgentDef, HarnessBundle, Routing, WikiPage } from "../src/harness/schema.js";
 import { harnessStatus, writeHarness } from "../src/harness/store.js";
 import type { CostMeter } from "../src/models/meter.js";
-import { synthEvalTask, type EvalTask } from "../src/evals/tasks.js";
+import { goldenTaskFromCommit, synthEvalTask, type EvalTask } from "../src/evals/tasks.js";
 import { runEvals } from "../src/evals/run.js";
 
 let dir: string;
@@ -89,24 +89,18 @@ async function writeFrontierOnlyHarness(projectDir: string): Promise<void> {
   await writeHarness(projectDir, bundle);
 }
 
-// Builds the "real project being evaluated" fixture: a git repo whose HEAD
-// ALREADY contains the exact same stub source.js/test.js content
-// synthEvalTask()'s own setup() would write into any separately-created
-// eval scratch dir. This is deliberate, not incidental: engine.orchestrate's
-// worker/escalation worktree is checked out from THIS repo's HEAD (see
-// run.ts's header comment on the baseline-vs-harness wiring), so seeding
-// identical stub content here is what makes the diff it produces a clean
-// "modify existing file" patch (context-matchable) rather than a "new file"
-// patch that would collide when applied onto the harness eval dir's own
-// pre-existing stub. In production this same property holds naturally for
-// golden tasks mined from a project's OWN history (the file being fixed
-// already exists at HEAD); this fixture recreates that property for a
-// synthetic task by construction.
+// Builds the "real project being evaluated" fixture: a plain git repo
+// carrying a generated harness bundle. That bundle (routing/wiki/agents/
+// manifest) is now ALL the harness side of runEvals ever reads off the real
+// project (Task 4 Fix 1 — base identity): engine.orchestrate works each
+// task against its OWN base-state scratch directory (harnessDir), with the
+// real project's harness bundle copied in via writeHarness, never against
+// the real project's own source tree. So, unlike before this fix, this
+// fixture's own source-tree content (if any) is now irrelevant to whether
+// the harness pipeline's diff applies cleanly -- there is no more
+// same-content-as-HEAD trick required here.
 async function makeHarnessFixture(): Promise<string> {
   const base = makeRepo();
-  await synthEvalTask().setup(base);
-  git(base, "add", "-A");
-  git(base, "commit", "-qm", "seed stub matching every eval task's own setup()");
   await writeFrontierOnlyHarness(base);
   return base;
 }
@@ -212,7 +206,7 @@ describe("runEvals — sample-size gate", () => {
 });
 
 describe("runEvals — ETH hazard", () => {
-  it("harness FAILS a task the baseline PASSES -> verdict 'fail' (quality degraded, not a savings win)", async () => {
+  it("harness FAILS a task the baseline PASSES -> verdict 'fail' (a GENUINE quality failure, not a measurement artifact)", async () => {
     dir = await makeHarnessFixture();
     engine = createEngine();
     engine.frontier.registerAdapter(
@@ -231,12 +225,230 @@ describe("runEvals — ETH hazard", () => {
     expect(report.baseline.passed).toBe(2);
     expect(report.harness.passed).toBe(0);
     expect(report.qualityHeld).toBe(false);
+    // RE-VERIFY (Task 4 Fix 2 requirement): this "fail" must be earned by a
+    // GENUINE quality failure -- the harness actually produced a tested,
+    // applied, oracle-scored (wrong) fix on every task -- never a
+    // measurement artifact (apply-failed/error) masquerading as one. If
+    // this pipeline regressed back to the old base-identity bug, these
+    // outcomes would instead be "apply-failed" (or the diff would never
+    // even apply), which is exactly the false-hazard failure mode Task 4
+    // fixes.
+    expect(report.perTask.every((t) => t.harnessOutcome === "escalated")).toBe(true);
+    expect(report.perTask.every((t) => t.baselineOutcome === "completed")).toBe(true);
     // Even though the harness is dramatically cheaper, quality dropping
     // below baseline is an automatic "fail" -- savingsPct is never allowed
     // to paper over an ETH hazard.
     expect(report.verdict).toBe("fail");
     expect(harnessStatus(dir).evals).toBe("fail");
   });
+});
+
+describe("runEvals — base identity (Task 4 Fix 1)", () => {
+  it("engine.orchestrate works the harness side from harnessDir, never from the real project directory", async () => {
+    dir = await makeHarnessFixture();
+    engine = createEngine();
+    const capturedEscalateProjectDirs: string[] = [];
+    engine.frontier.registerAdapter({
+      kind: "claude-code",
+      async createSession({ projectDir, resultLabel }): Promise<FrontierSession> {
+        if (resultLabel === "frontier-escalate") capturedEscalateProjectDirs.push(projectDir);
+        return {
+          id: randomUUID(),
+          projectDir,
+          prompt(_text: string, _promptOpts?: { timeoutMs?: number }): FrontierPromptHandle {
+            async function* gen(): AsyncGenerator<FrontierEvent> {
+              writeFileSync(path.join(projectDir, "source.js"), CORRECT_SOURCE);
+              yield { type: "tool_use", name: "Write", summary: "wrote source.js" };
+              yield { type: "text", text: "done" };
+              yield {
+                type: "result",
+                resultText: "done",
+                costUsd: 0.1,
+                usage: { inputTokens: 1, outputTokens: 1, cacheReadTokens: 0 },
+                numTurns: 1,
+                durationMs: 1,
+                engineSessionId: null,
+              };
+            }
+            return { events: gen(), abort: () => {} };
+          },
+          async close(): Promise<void> {},
+        };
+      },
+    });
+
+    await runEvals(engine, { projectDir: dir, tasks: [synthEvalTask({ id: "t1" })] });
+
+    expect(capturedEscalateProjectDirs).toHaveLength(1);
+    const escalateProjectDir = capturedEscalateProjectDirs[0]!;
+    const realProjectDirResolved = realpathSync(path.resolve(dir));
+    // The escalation session's cwd is a worktree UNDER the harness eval
+    // scratch dir (this pipeline's own "of-eval-harness-" mkdtemp prefix —
+    // see run.ts), never under the real project directory.
+    expect(escalateProjectDir).toContain("of-eval-harness-");
+    expect(escalateProjectDir.startsWith(realProjectDirResolved)).toBe(false);
+  });
+
+  it("solves a golden task from its OWN base state even when the real project's HEAD already contains the fix", async () => {
+    dir = makeRepo();
+    // Commit A: a buggy add() with its own pre-existing (currently failing)
+    // test.
+    writeFileSync(
+      path.join(dir, "source.js"),
+      ["function add(a, b) {", "  return a - b; // bug: should be a + b", "}", "", "module.exports = { add };", ""].join(
+        "\n",
+      ),
+    );
+    writeFileSync(
+      path.join(dir, "test.js"),
+      [
+        "const assert = require('node:assert');",
+        "const { add } = require('./source');",
+        "assert.strictEqual(add(2, 3), 5);",
+        "console.log('ok');",
+        "",
+      ].join("\n"),
+    );
+    git(dir, "add", "-A");
+    git(dir, "commit", "-qm", "A: add buggy add() with its test");
+
+    // Commit B: the real fix.
+    writeFileSync(
+      path.join(dir, "source.js"),
+      ["function add(a, b) {", "  return a + b;", "}", "", "module.exports = { add };", ""].join("\n"),
+    );
+    git(dir, "add", "-A");
+    git(dir, "commit", "-qm", "B: fix add() to return the correct sum");
+    const commitB = git(dir, "rev-parse", "HEAD");
+
+    // CRITICAL, deliberately NOT reset: the real project's HEAD is left at
+    // commit B -- the fix ALREADY present. Under the pre-Fix-1 pipeline
+    // (engine.orchestrate run against realProjectDir at its CURRENT HEAD),
+    // the worker/escalation worktree would be checked out from this
+    // already-fixed state, so a frontier "implementing" the same change
+    // again produces NOTHING (an empty diff) -- scored against harnessDir,
+    // which is still at the commit's PARENT (bug present, per
+    // goldenTaskFromCommit's own setup()) -- a guaranteed oracle failure
+    // that has nothing to do with harness quality. This is the exact flaw
+    // Task 4 Fix 1 exists to close: it must no longer happen.
+    await writeFrontierOnlyHarness(dir);
+
+    engine = createEngine();
+    engine.frontier.registerAdapter(
+      makeFakeEvalsFrontierAdapter({ baselineCorrect: true, harnessCorrect: true, meter: engine.models.meter }),
+    );
+
+    const task = await goldenTaskFromCommit(dir, commitB, ["node", "test.js"]);
+    const report = await runEvals(engine, { projectDir: dir, tasks: [task] });
+
+    expect(report.baseline.passed).toBe(1);
+    // THE FIX: even though realProjectDir's HEAD already has the fix, the
+    // harness is still scored on a genuine fix produced from the task's OWN
+    // (pre-fix) base state -- not a structural, guaranteed failure.
+    expect(report.harness.passed).toBe(1);
+    expect(report.perTask[0]!.harnessOutcome).toBe("escalated");
+  });
+});
+
+describe("runEvals — measurement failures are not quality evidence (Task 4 Fix 2)", () => {
+  it("harness-side infra errors on every task -> verdict 'inconclusive' (never 'fail'); manifest not flipped", async () => {
+    dir = await makeHarnessFixture();
+    engine = createEngine();
+    engine.frontier.registerAdapter({
+      kind: "claude-code",
+      async createSession({ projectDir, resultLabel }): Promise<FrontierSession> {
+        if (resultLabel === "frontier-escalate") {
+          // Simulates a transient infra failure (e.g. an adapter/session
+          // error) on the harness side -- NOT the harness genuinely
+          // attempting and failing the task.
+          throw new Error("simulated infra failure: escalation session could not be created");
+        }
+        return {
+          id: randomUUID(),
+          projectDir,
+          prompt(_text: string, _promptOpts?: { timeoutMs?: number }): FrontierPromptHandle {
+            async function* gen(): AsyncGenerator<FrontierEvent> {
+              writeFileSync(path.join(projectDir, "source.js"), CORRECT_SOURCE);
+              yield { type: "tool_use", name: "Write", summary: "wrote source.js" };
+              yield { type: "text", text: "done" };
+              const event: FrontierEvent = {
+                type: "result",
+                resultText: "done",
+                costUsd: 0.5,
+                usage: { inputTokens: 10, outputTokens: 5, cacheReadTokens: 0 },
+                numTurns: 1,
+                durationMs: 1,
+                engineSessionId: null,
+              };
+              engine.models.meter.record({
+                providerId: "claude-code",
+                kind: "frontier-claude",
+                model: "fake-frontier-model",
+                usage: event.usage,
+                costUsd: event.costUsd,
+                at: Date.now(),
+                source: "frontier-review",
+                pricingConfidence: "verified",
+              });
+              yield event;
+            }
+            return { events: gen(), abort: () => {} };
+          },
+          async close(): Promise<void> {},
+        };
+      },
+    });
+
+    const tasks: EvalTask[] = [synthEvalTask({ id: "t1" }), synthEvalTask({ id: "t2" })];
+    const report = await runEvals(engine, { projectDir: dir, tasks });
+
+    expect(report.baseline.passed).toBe(2);
+    expect(report.harness.passed).toBe(0);
+    // The raw comparison still shows a gap -- that's expected. The FIX is
+    // in what verdict that gap is allowed to produce.
+    expect(report.qualityHeld).toBe(false);
+    expect(report.perTask.every((t) => t.harnessOutcome === "error")).toBe(true);
+    expect(report.perTask.every((t) => t.baselineOutcome === "completed")).toBe(true);
+    // THE FIX: a measurement failure (the harness never even got to
+    // genuinely attempt-and-be-scored) must never be reported as an
+    // ETH-hazard "fail".
+    expect(report.verdict).toBe("inconclusive");
+    expect(report.note).toContain("2 of 2 task(s) hit a measurement failure");
+    expect(report.note).toContain("2 error");
+    expect(harnessStatus(dir).evals).toBe("pending");
+  });
+});
+
+describe("runEvals — 0-vs-0 baseline (Task 4 Fix 3)", () => {
+  it("baseline solves 0 tasks -> verdict 'inconclusive' even with held quality and positive savings; never 'pass'", async () => {
+    dir = await makeHarnessFixture();
+    engine = createEngine();
+    engine.frontier.registerAdapter(
+      makeFakeEvalsFrontierAdapter({
+        baselineCorrect: false,
+        harnessCorrect: false,
+        baselineCostUsd: 0.5,
+        harnessCostUsd: 0.05,
+        meter: engine.models.meter,
+      }),
+    );
+
+    const tasks: EvalTask[] = Array.from({ length: 5 }, (_, i) => synthEvalTask({ id: `t${i + 1}` }));
+    const report = await runEvals(engine, { projectDir: dir, tasks });
+
+    expect(report.baseline.passed).toBe(0);
+    expect(report.harness.passed).toBe(0);
+    // 0 >= 0 holds trivially -- exactly the false-pass shape Fix 3 targets.
+    expect(report.qualityHeld).toBe(true);
+    expect(report.savingsPct).not.toBeNull();
+    expect(report.savingsPct!).toBeGreaterThan(0);
+    expect(report.perTask.every((t) => t.baselineOutcome === "completed")).toBe(true);
+    // THE FIX: 0 baseline passes means there is nothing to hold quality
+    // against -- never a "pass", however good the savings arithmetic looks.
+    expect(report.verdict).toBe("inconclusive");
+    expect(report.note).toContain("baseline solved 0");
+    expect(harnessStatus(dir).evals).toBe("pending");
+  }, 30_000);
 });
 
 describe("runEvals — unpriced costs", () => {
@@ -428,9 +640,7 @@ describe("engine.evals.run (RPC wire layer) — golden task descriptors", () => 
     git(dir, "add", "-A");
     git(dir, "commit", "-qm", "A: add buggy add() with its test");
 
-    // Commit B: the real fix. Kept as a resolvable commit object (its SHA is
-    // all goldenTaskFromCommit needs) -- not required to stay reachable from
-    // any ref once HEAD is reset below.
+    // Commit B: the real fix.
     writeFileSync(
       path.join(dir, "source.js"),
       ["function add(a, b) {", "  return a + b;", "}", "", "module.exports = { add };", ""].join("\n"),
@@ -439,13 +649,13 @@ describe("engine.evals.run (RPC wire layer) — golden task descriptors", () => 
     git(dir, "commit", "-qm", "B: fix add() to return the correct sum");
     const commitB = git(dir, "rev-parse", "HEAD");
 
-    // Reset the REAL project back to commit A: engine.orchestrate's own
-    // worktree (checked out from THIS repo's HEAD) now starts from the SAME
-    // bug state goldenTaskFromCommit's setup() will also produce for the
-    // eval scratch dirs -- see run.ts's header comment on why that identity
-    // is what lets the produced diff apply cleanly.
-    git(dir, "reset", "--hard", "HEAD~1");
-
+    // Deliberately NOT reset back to commit A: the real project's HEAD is
+    // left at commit B, the fix ALREADY present -- exactly the shape that
+    // used to break this pipeline (Task 4 Fix 1's base-identity bug; see
+    // this suite's dedicated "base identity" describe block above, and
+    // run.ts's header comment). Post-fix, engine.orchestrate works this
+    // task against its OWN base-state scratch directory regardless of what
+    // state the real project's HEAD happens to be at.
     await writeFrontierOnlyHarness(dir);
 
     engine = createEngine();
@@ -463,6 +673,7 @@ describe("engine.evals.run (RPC wire layer) — golden task descriptors", () => 
     expect(report.taskCount).toBe(1);
     expect(report.baseline.passed).toBe(1);
     expect(report.harness.passed).toBe(1);
+    expect(report.perTask[0]!.harnessOutcome).toBe("escalated");
     // 1 task never clears the sample-size gate, regardless of quality.
     expect(report.verdict).toBe("inconclusive");
     expect(harnessStatus(dir).evals).toBe("pending");

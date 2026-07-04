@@ -143,12 +143,15 @@ describe("engine.evals.run (real smoke)", () => {
       let engine: Engine | undefined;
       try {
         execFileSync("git", ["clone", repoRoot, dir], { stdio: "ignore" });
-        // The REAL project's HEAD is checked out at the commit's PARENT --
-        // matching the golden task's own pre-change state -- so
-        // engine.orchestrate's worktree (checked out from THIS HEAD) starts
-        // from the same content the eval scratch dirs will also start from.
-        // See run.ts's header comment on why that identity is what lets the
-        // produced diff apply cleanly onto the harness eval dir.
+        // Post Task-4-Fix-1, engine.orchestrate no longer works the harness
+        // side against the real project's HEAD at all (see run.ts's header
+        // comment on base identity) -- it works each task against its own
+        // base-state scratch directory, with only this project's harness
+        // bundle (.openfusion/) copied in. Checking out the commit's PARENT
+        // here is therefore no longer load-bearing for correctness; it's
+        // kept anyway so `dir` (the "real project") reflects a plausible,
+        // pre-change checkout rather than an arbitrary HEAD, matching how an
+        // operator would typically point this smoke test at a real project.
         git(dir, "checkout", "-q", `${SMOKE_COMMIT}^`);
 
         await writeTrivialHarness(dir);

@@ -21,41 +21,109 @@
 //   in place).
 //
 //   HARNESS: engine.orchestrate (../orchestrate/orchestrate.ts) is invoked
-//   with `projectDir: <the REAL project being evaluated>` — NOT harnessDir —
-//   because orchestrate needs the real project's `.openfusion/` harness
-//   bundle for routing/wiki, and because runEscalation/engine.worker.run
-//   always operate through THAT project's own WorktreeManager (a fresh
-//   `git worktree add ... HEAD` checkout of the real project, sharing its
-//   object store). There is no parameter on engine.orchestrate to redirect
-//   its internal worktree at an arbitrary external directory or base
-//   commit, so orchestrate's own worktree is unavoidably a scratch space
-//   inside the REAL project, disconnected from harnessDir's task.setup()
-//   state. The pipeline therefore: (1) runs the full orchestrate loop
-//   against the real project to get back a `diff`, (2) applies that diff
-//   onto harnessDir via engine.orchestrate.apply (git apply --3way — the
-//   exact mechanism a human reviewer would use), (3) scores harnessDir with
-//   runOracle, and (4) cleans up orchestrate's OWN worktree in the real
-//   project (engine.worker.cleanup) since it was only ever scratch space for
-//   producing the diff — the artifact this pipeline actually cares about is
-//   the diff APPLIED to harnessDir, not the worktree it came from.
+//   with `projectDir: harnessDir` — the SAME base-state scratch directory
+//   the oracle scores, NOT the real project being evaluated. This is the
+//   Task 4 fix for a CRITICAL measurement-validity flaw in the original v1
+//   wiring (kept here, in detail, so it is never reintroduced):
 //
-//   KNOWN v1 LIMITATION: step (2) can fail. `git apply` matches by textual
-//   context (or, with --3way, by the preimage blob's presence in the
-//   target's OWN object store) — it has no notion that harnessDir and the
-//   real project's worktree are "the same task, different directories". If
-//   the worker/frontier creates a file at a path that does not already
-//   exist in the real project (so the diff is a "new file" patch) AND that
-//   same path already exists in harnessDir (because task.setup() put a
-//   pre-change stub there — which it must, for the oracle to have anything
-//   to fail against), the apply fails with "already exists". This is most
-//   likely for synthetic fixture tasks; for golden tasks mined from the
-//   real project's OWN history (where the file being fixed typically already
-//   exists at HEAD), the diff is ordinarily a "modify" patch that applies by
-//   context regardless of the two directories' disconnected object stores.
-//   A failed apply is scored as a failed task (`harnessOutcome:
-//   "apply-failed"`), not a crashed run — a patch that doesn't compose with
-//   the target environment is itself a legitimate (if blunt) failure
-//   signal, matching SWE-bench's own convention.
+//     THE FLAW: the original wiring ran orchestrate against
+//     `projectDir: realProjectDir` (the actual project under evaluation, at
+//     its CURRENT HEAD), reasoning that orchestrate needs the real
+//     project's `.openfusion/` harness bundle for routing/wiki and that
+//     worker/escalation worktrees are naturally scoped to a real project's
+//     own WorktreeManager. That reasoning is correct about WHY
+//     realProjectDir seemed necessary, but wrong about what it costs: for a
+//     golden task mined from realProjectDir's OWN history
+//     (goldenTaskFromCommit), the eval scratch dirs are seeded at the
+//     target commit's PARENT state (the bug/gap present) — but
+//     realProjectDir's HEAD, by construction, is usually a DESCENDANT of
+//     that commit (the fix is already merged into history). Pointing
+//     orchestrate at realProjectDir therefore asks the harness to
+//     "implement a change" that is already implemented at the substrate it
+//     was handed — best case, the worker/frontier makes no edits at all
+//     (an empty diff, since the code already does what's asked), which then
+//     gets applied to (or, doing nothing, leaves untouched) a harnessDir
+//     that is STILL at the pre-fix parent state — a GUARANTEED oracle
+//     failure that has nothing to do with the harness's actual competence.
+//     Every real multi-task run (HEAD != every task's own commit parent)
+//     would structurally measure ~0% harness pass rate, misreported as a
+//     genuine ETH-hazard "fail" and flipping the manifest's evals verdict
+//     to "fail" on a measurement artifact, not a quality signal.
+//
+//     THE FIX: harnessDir itself becomes a fresh, disconnected, throwaway
+//     git project AT THE TASK'S OWN BASE STATE, with the harness bundle
+//     copied in — so orchestrate works the exact same task, from the exact
+//     same starting point, that the baseline and the oracle also work from.
+//     Concretely, per task (see the main loop below):
+//       1. `task.setup(harnessDir)` — identical to the baseline's own setup
+//          call; materializes the pre-change state.
+//       2. `initEvalGitRepo(harnessDir)` — ensures harnessDir is a git repo
+//          with (at least) one commit (a no-op for golden tasks, whose own
+//          setup() already does this as part of its history-strip
+//          mechanism; see tasks.ts). This is what makes harnessDir a valid
+//          `projectDir` for engine.orchestrate at all: requireGitRepo and
+//          WorktreeManager (`git worktree add ... HEAD`) both need a real
+//          commit to anchor to.
+//       3. `writeHarness(harnessDir, harnessBundle)` — writes the ALREADY
+//          LOADED-AND-VALIDATED harness bundle (routing.yaml, wiki/*.md,
+//          agents/*.yaml, manifest.json — read once, near the top of
+//          runEvals, off the REAL project) into harnessDir's own
+//          `.openfusion/`. Deliberately done AFTER step 2's commit (not
+//          folded into it), so the copied bundle stays UNTRACKED in
+//          harnessDir's git history — it doesn't need to be committed:
+//          orchestrate's own loadHarness/attachedWikiMcpUrl calls read
+//          `.openfusion/` straight off `params.projectDir`'s filesystem
+//          (harnessDir's top-level checkout), never through git, and the
+//          worker/escalation child worktrees engine.worker.getManager
+//          creates never need `.openfusion` present in THEIR OWN directory
+//          either (the wiki digest travels as a plain string param —
+//          buildWikiDigestContext in orchestrate.ts — computed once from
+//          the bundle object, not re-read from disk per attempt). Reusing
+//          writeHarness (the same tested primitive engine.harness.generate
+//          itself writes through) instead of a raw recursive directory copy
+//          also means this can never accidentally drag in
+//          `.openfusion/cache/` (the wiki symbol-index sqlite db, tied to
+//          the real project's own content/paths) or
+//          `.openfusion/worktrees/` (any OTHER live worker worktrees the
+//          real project happens to have lying around) into the isolated
+//          eval directory — only the four artifact kinds writeHarness ever
+//          writes (manifest/wiki/agents/routing) ever land there.
+//       4. `orchestrate(engine, { projectDir: harnessDir, task: task.prompt })`
+//          — now runs the FULL harness loop (route -> worker attempts ->
+//          review -> escalate) entirely inside harnessDir's own worktree
+//          hierarchy (`harnessDir/.openfusion/worktrees/<id>`), producing a
+//          diff relative to harnessDir's OWN base commit.
+//       5. The returned diff is applied back onto harnessDir itself (still
+//          `engine.orchestrate.apply`, `git apply --3way`) — and now
+//          applies TRIVIALLY: the diff's preimage context IS harnessDir's
+//          own tracked content (same repo, same base commit — no more
+//          disconnected-object-store apply risk described in the old KNOWN
+//          v1 LIMITATION note this comment used to carry). runOracle then
+//          scores harnessDir, exactly like the baseline.
+//     The APPROXIMATION this fix accepts (documented, not hidden): the
+//     copied wiki digests were generated against the real project's CURRENT
+//     state, not the task's own (older, for a golden task) base state —
+//     they describe a past version of the same project approximately, not
+//     exactly. That is a much smaller and more honest approximation than
+//     the flaw it replaces (which wasn't "approximately right", it was
+//     structurally guaranteed wrong whenever HEAD had moved on).
+//     SECURITY NOTE: harnessDir's `.git` history is its OWN (from
+//     task.setup(), per tasks.ts's own history-strip mechanism for golden
+//     tasks, or a from-scratch init for synthetic ones) — copying the
+//     harness bundle via writeHarness never touches git, adds no remote, no
+//     reflog entry, and no fetchable pointer back to the real project. See
+//     the TMP-placement note below for the rest of this pipeline's own
+//     isolation posture.
+//
+//   Because harnessDir now IS the substrate orchestrate works against,
+//   there is no separate "orchestrate's own scratch worktree, living in the
+//   REAL project, that must be cleaned up afterward" concern this pipeline
+//   used to carry: every worktree engine.worker.getManager creates for a
+//   harness-side run lives INSIDE harnessDir, which this loop's own
+//   `finally` already removes wholesale (`rm(harnessDir, {recursive:true,
+//   force:true})`) once the task is scored — success or failure. No
+//   dedicated cleanup call against a persistent, user-facing project
+//   directory is needed anymore.
 //
 // --- TMP placement (CRITICAL security constraint, inherited from Task 3) --
 //
@@ -76,6 +144,23 @@
 // scratch directories are pure eval machinery (never a user-facing
 // deliverable the way orchestrate's own worktrees are) and are always
 // removed after scoring, success or failure.
+//
+// --- Measurement failures vs. quality failures (the second Task 4 fix) ---
+//
+// A harness-side outcome of "apply-failed" or "error" (HarnessTaskOutcome's
+// own doc comment below) means the PIPELINE failed to produce or apply a
+// scoreable result — NOT that the harness produced and was scored on a bad
+// fix. Before this fix, both were folded into `harnessPassed: false`
+// indistinguishably from a genuine bad fix, so an infra hiccup (a transient
+// adapter error) or an apply mismatch could flip the manifest's evals
+// verdict to "fail" — a FALSE ETH hazard. The verdict computation at the
+// bottom of runEvals now separates the two: it only reports "fail" when the
+// harness GENUINELY produced a tested fix that scored worse than the
+// baseline; a quality gap that is fully or partially explained by
+// measurement failures (on EITHER side — a baseline infra failure is
+// exactly as much of a measurement failure as a harness one) is reported as
+// "inconclusive" instead, with a note naming the outcome counts. See the
+// verdict computation's own comments for the exact rule.
 import { randomUUID } from "node:crypto";
 import { execFile } from "node:child_process";
 import { mkdtemp, rm } from "node:fs/promises";
@@ -87,7 +172,7 @@ import type { Engine } from "../engine.js";
 import type { FrontierSession } from "../engines/types.js";
 import type { PricingConfidence } from "../models/meter.js";
 import { validateHarness } from "../harness/schema.js";
-import { HarnessValidationError, loadHarness, setEvalsVerdict } from "../harness/store.js";
+import { HarnessValidationError, loadHarness, setEvalsVerdict, writeHarness } from "../harness/store.js";
 import { orchestrate, type OrchestrateResult } from "../orchestrate/orchestrate.js";
 import { RpcMethodError } from "../rpc/errors.js";
 import { requireGitRepo } from "../rpc/guards.js";
@@ -113,6 +198,18 @@ const DEFAULT_BASELINE_TIMEOUT_MS = 600_000;
 // so a quick CI/demo run can never be mistaken for a real measurement.
 const MIN_TASK_COUNT_FOR_VERDICT = 5;
 
+// Task 4 Fix 2: the fraction of ALL tasks (not just the ones on the "wrong"
+// side of a raw quality gap) that hit a measurement failure before the
+// pipeline stops trusting that run's OWN "fail" conclusion, even if the raw
+// gap happens to survive excluding those tasks. Chosen as a conservative,
+// clearly-documented threshold rather than a tuned constant: at 20%+
+// measurement-failure tasks, a materially large slice of the run's own data
+// is not a genuine quality read at all, so an ETH-hazard "fail" — the most
+// consequential verdict this pipeline can produce — should not be asserted
+// off a run that unreliable, regardless of how the arithmetic on the
+// remaining "clean" tasks happens to come out.
+const MATERIAL_MEASUREMENT_FAILURE_FRACTION = 0.2;
+
 export interface EvalsRunParams {
   projectDir: string;
   // Full, already-constructed EvalTask objects (setup() closures and all) —
@@ -127,15 +224,28 @@ export interface EvalsRunParams {
 
 // The harness side's per-task result, one step wider than
 // OrchestrateResult["outcome"] to name the two ways scoring can fail WITHOUT
-// engine.orchestrate itself having failed: "apply-failed" (see this module's
-// header comment on the known v1 limitation) and "error" (engine.orchestrate
-// itself threw — an infra hiccup on ONE task must not abort the whole
-// report card; see runHarnessTask below).
+// engine.orchestrate itself having failed: "apply-failed" (a diff was
+// produced but didn't apply onto harnessDir — see engine.orchestrate.apply)
+// and "error" (engine.orchestrate itself threw — an infra hiccup on ONE task
+// must not abort the whole report card; see runHarnessTask below). BOTH are
+// MEASUREMENT failures, never quality evidence — see this module's header
+// comment and the verdict computation in runEvals.
 export type HarnessTaskOutcome = OrchestrateResult["outcome"] | "apply-failed" | "error";
+
+// The baseline side's per-task outcome — symmetric with HarnessTaskOutcome
+// (Task 4 Fix 3): "error" means the direct frontier turn itself failed
+// (missing adapter, a session/turn that threw) BEFORE ever producing a real
+// attempt at the task — a baseline measurement failure, exactly as much as
+// a harness "error"/"apply-failed" is. "completed" means the frontier turn
+// ran to completion; `baselinePassed` (the oracle's own verdict on whatever
+// state the directory ended up in) is the quality signal for that case,
+// independent of this field.
+export type BaselineTaskOutcome = "completed" | "error";
 
 export interface PerTaskResult {
   id: string;
   baselinePassed: boolean;
+  baselineOutcome: BaselineTaskOutcome;
   harnessPassed: boolean;
   harnessOutcome: HarnessTaskOutcome;
   baselineUsd: number | null;
@@ -151,6 +261,9 @@ export interface EvalsReportCard {
   // see the computation below).
   savingsPct: number | null;
   // harness.passed >= baseline.passed (M6 v1 tolerance: harness not worse).
+  // Raw pass-count comparison ONLY — see the verdict computation for how
+  // measurement failures (Fix 2) and a zero-baseline run (Fix 3) keep this
+  // raw number from being over-read as "fail"/"pass" on its own.
   qualityHeld: boolean;
   verdict: "pass" | "fail" | "inconclusive";
   // Worst PricingConfidence across every cost record this run produced
@@ -181,7 +294,7 @@ function progress(engine: Engine, stage: string, taskId?: string): void {
 // callEngineMethod helper exactly (duplicated locally since that one isn't
 // exported; same "reuse the handler that already owns worktree/apply
 // correctness" rationale it documents applies here for
-// engine.orchestrate.apply / engine.worker.cleanup).
+// engine.orchestrate.apply).
 async function callEngineMethod<T>(engine: Engine, method: string, params: unknown): Promise<T> {
   const response = await engine.dispatcher.dispatch({
     jsonrpc: "2.0",
@@ -242,7 +355,7 @@ async function runBaselineTask(
   engine: Engine,
   dir: string,
   task: EvalTask,
-): Promise<{ passed: boolean; costUsd: number | null }> {
+): Promise<{ passed: boolean; costUsd: number | null; outcome: BaselineTaskOutcome }> {
   let costUsd: number | null = null;
   try {
     const adapter = engine.frontier.getAdapter(FRONTIER_KIND);
@@ -284,65 +397,40 @@ async function runBaselineTask(
   } catch (err) {
     // A per-task baseline infra failure (missing adapter, a session/turn
     // that throws) must not abort the WHOLE report card — mirrors
-    // runHarnessTask's identical posture for engine.orchestrate below.
-    // runOracle is deliberately NOT inside this catch: a runOracle failure
-    // is a SETUP error (see tasks.ts's own doc comment — a bad testCommand,
-    // not a failed eval) and should propagate out of runEvals entirely, not
-    // be silently folded into "baseline failed".
+    // runHarnessTask's identical posture for engine.orchestrate below. This
+    // is a MEASUREMENT failure (Fix 3, BaselineTaskOutcome's own doc
+    // comment) — the verdict computation must not fold it into the quality
+    // comparison the same way a genuine baseline attempt that ran to
+    // completion and simply got the task wrong would be. runOracle is
+    // deliberately NOT inside this catch: a runOracle failure is a SETUP
+    // error (see tasks.ts's own doc comment — a bad testCommand, not a
+    // failed eval) and should propagate out of runEvals entirely, not be
+    // silently folded into "baseline failed".
     const message = err instanceof Error ? err.message : String(err);
     engine.log(`evals.run: baseline run failed for task ${task.id}: ${message}`);
     const oracle = await runOracle(dir, task.testCommand);
-    return { passed: oracle.passed, costUsd: null };
+    return { passed: oracle.passed, costUsd: null, outcome: "error" };
   }
   const oracle = await runOracle(dir, task.testCommand);
-  return { passed: oracle.passed, costUsd };
+  return { passed: oracle.passed, costUsd, outcome: "completed" };
 }
 
-// Lifts the worktree breadcrumb a failed engine.orchestrate call carries in
-// its thrown RpcMethodError's `data` — mirrors orchestrate.ts's OWN
-// liftWorktreeFromError exactly (duplicated locally for the same reason as
-// callEngineMethod/drainFrontierTurn above: that one isn't exported, and the
-// shape it reads is orchestrate.ts's own internal contract, not a shared
-// type worth exporting for one caller).
-function liftWorktreeFromError(err: unknown): { path: string; branch: string } | undefined {
-  if (
-    err instanceof RpcMethodError &&
-    err.data !== undefined &&
-    typeof err.data === "object" &&
-    err.data !== null &&
-    "worktree" in err.data
-  ) {
-    const worktree = (err.data as { worktree: { path: string; branch: string } | null }).worktree;
-    return worktree ?? undefined;
-  }
-  return undefined;
-}
-
-// Best-effort removal of the orchestrate-produced worktree left behind in
-// the REAL project (see this module's header comment: it is scratch space
-// for producing the diff, not a user-facing deliverable — the diff itself
-// is already captured in `result.diff` and independently applied to
-// harnessDir). Swallows its own failure: a stray worktree the operator can
-// later sweep with engine.worker.gc must never abort the eval run or mask
-// its real outcome.
-async function cleanupOrchestrateWorktree(engine: Engine, projectDir: string, worktreePath: string): Promise<void> {
-  try {
-    await callEngineMethod(engine, "engine.worker.cleanup", { projectDir, worktreePath });
-  } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    engine.log(`evals.run: failed to clean up orchestrate worktree ${worktreePath}: ${message}`);
-  }
-}
-
-// Turns harnessDir into a plain git repo containing task.setup()'s output as
-// a single commit — required for engine.orchestrate.apply (git apply
-// --3way), whose own requireGitRepo guard rejects a non-git target. A
-// goldenTaskFromCommit-produced task's own setup() ALREADY does this (its
-// own from-scratch "baseline" commit, tasks.ts's documented history-strip
-// mechanism) — re-running `git init`/`commit` unconditionally on top of that
-// would find nothing new to commit and fail, so this checks first and is a
-// no-op for that case. A synthEvalTask-produced task's setup() does NOT
-// touch git at all, so this is what makes ITS output a valid apply target.
+// Turns `dir` into a plain git repo containing whatever task.setup() put
+// there as a single commit — required for `dir` to be a valid
+// engine.orchestrate `projectDir` (requireGitRepo, and
+// engine.worker.getManager's WorktreeManager, both need at least one commit
+// to anchor `git worktree add ... HEAD` to) and for engine.orchestrate.apply
+// (`git apply --3way`, whose own requireGitRepo guard rejects a non-git
+// target). A goldenTaskFromCommit-produced task's own setup() ALREADY does
+// this (its own from-scratch "baseline" commit, tasks.ts's documented
+// history-strip mechanism) — re-running `git init`/`commit` unconditionally
+// on top of that would find nothing new to commit and fail, so this checks
+// first and is a no-op for that case. A synthEvalTask-produced task's
+// setup() does NOT touch git at all, so this is what makes ITS output a
+// valid engine.orchestrate/apply target. Deliberately called BEFORE the
+// harness bundle is written into `dir` (see writeHarness call in the main
+// loop below) so that bundle stays untracked in this commit either way —
+// nothing downstream needs it committed (see this module's header comment).
 async function initEvalGitRepo(dir: string): Promise<void> {
   try {
     await execFileAsync("git", ["-C", dir, "rev-parse", "--is-inside-work-tree"]);
@@ -359,46 +447,46 @@ async function initEvalGitRepo(dir: string): Promise<void> {
   await execFileAsync("git", ["-C", dir, "commit", "-q", "-m", "eval baseline"]);
 }
 
-// HARNESS primitive: the full orchestrate loop, run against the REAL
-// project, its diff applied onto harnessDir and scored there — see this
-// module's header comment for the full wiring rationale and its known v1
-// apply-failure limitation.
+// HARNESS primitive: the full orchestrate loop, run against harnessDir
+// ITSELF (the same base-state scratch directory runOracle scores) — see
+// this module's header comment for the full base-identity rationale and
+// Fix 1's history. `harnessDir` must already be a valid engine.orchestrate
+// `projectDir` by the time this is called: a committed git repo (
+// initEvalGitRepo) with the harness bundle written into it (writeHarness) —
+// both are the caller's (runEvals's) responsibility, done once per task
+// before this function runs.
 async function runHarnessTask(
   engine: Engine,
-  realProjectDir: string,
   harnessDir: string,
   task: EvalTask,
 ): Promise<{ passed: boolean; costUsd: number | null; outcome: HarnessTaskOutcome }> {
   let result: OrchestrateResult;
   try {
-    result = await orchestrate(engine, { projectDir: realProjectDir, task: task.prompt });
+    result = await orchestrate(engine, { projectDir: harnessDir, task: task.prompt });
   } catch (err) {
     // A per-task infra failure (e.g. the frontier adapter throwing) must not
     // abort the WHOLE report card — score this task as not passed and keep
-    // going. See HarnessTaskOutcome's own doc comment. orchestrate.ts's own
-    // failure path deliberately leaves its worktree on disk (never
-    // auto-removed on ITS failure path) and carries the path in the thrown
-    // error's `data` (mirrors orchestrate.ts's own liftWorktreeFromError) —
-    // lifted here so a per-task throw doesn't leak that worktree in the
-    // REAL project across repeated eval runs the way a successful result's
-    // worktree is already cleaned up below.
+    // going. See HarnessTaskOutcome's own doc comment: this is a MEASUREMENT
+    // failure, not quality evidence — the verdict computation in runEvals
+    // must not treat it the same as a genuinely-produced-but-worse fix.
+    // Unlike the pre-Fix-1 pipeline, there is no separate "orchestrate's own
+    // worktree, living in the real project" to lift a path for and clean up
+    // here: any worktree engine.orchestrate created lives INSIDE harnessDir,
+    // which runEvals's own per-task `finally` already removes wholesale
+    // regardless of how this task scored.
     const message = err instanceof Error ? err.message : String(err);
     engine.log(`evals.run: engine.orchestrate failed for task ${task.id}: ${message}`);
-    const worktree = liftWorktreeFromError(err);
-    if (worktree !== undefined) {
-      await cleanupOrchestrateWorktree(engine, realProjectDir, worktree.path);
-    }
     return { passed: false, costUsd: null, outcome: "error" };
-  }
-
-  if (result.worktree !== null) {
-    await cleanupOrchestrateWorktree(engine, realProjectDir, result.worktree.path);
   }
 
   if (result.diff.trim().length === 0) {
     // Nothing to apply — harnessDir stays at task.setup()'s pre-change
     // state, so the oracle is expected to fail. This is a legitimate
-    // (not mis-scored) failure: the harness produced no change at all.
+    // (not mis-scored) failure: the harness produced no change at all, and
+    // OrchestrateResult's own "failed" outcome is exactly this case (see
+    // orchestrate.ts) — genuine quality evidence, not a measurement
+    // failure: the harness had every opportunity (worker attempts + review
+    // + escalation) and still produced nothing.
     const oracle = await runOracle(harnessDir, task.testCommand);
     return { passed: oracle.passed, costUsd: result.cost.totalUsd, outcome: result.outcome };
   }
@@ -406,8 +494,14 @@ async function runHarnessTask(
   try {
     await callEngineMethod(engine, "engine.orchestrate.apply", { projectDir: harnessDir, diff: result.diff });
   } catch (err) {
-    // KNOWN v1 LIMITATION — see this module's header comment. A failed
-    // apply is scored as a failed task, not a crashed run.
+    // A failed apply is a MEASUREMENT failure (HarnessTaskOutcome's own doc
+    // comment) — see the verdict computation in runEvals for how this is
+    // kept separate from a genuine quality failure. With Fix 1 in place this
+    // should be rare (the diff's preimage context IS harnessDir's own
+    // tracked content — same repo, same base commit), but a worker/frontier
+    // can still, in principle, produce a diff that doesn't apply cleanly
+    // (e.g. conflicting concurrent edits within one attempt's own worktree
+    // lifecycle) — scored as a measurement failure, not a crashed run.
     const message = err instanceof Error ? err.message : String(err);
     engine.log(`evals.run: applying the harness diff failed for task ${task.id}: ${message}`);
     return { passed: false, costUsd: result.cost.totalUsd, outcome: "apply-failed" };
@@ -421,6 +515,7 @@ function buildNote(opts: {
   taskCount: number;
   pricingConfidence: PricingConfidence;
   sampleNote?: string;
+  extraNotes?: string[];
 }): string {
   const parts: string[] = [];
   parts.push(
@@ -430,6 +525,9 @@ function buildNote(opts: {
   );
   parts.push("Cost figures are estimate-class (see engine.orchestrate's own cost.note) -- directional, not exact.");
   parts.push(`Pricing confidence: ${opts.pricingConfidence} (the worst confidence across every cost record this run produced).`);
+  for (const note of opts.extraNotes ?? []) {
+    parts.push(note);
+  }
   parts.push(
     "Eval integrity assumes a NON-ADVERSARIAL worker: a worker that deliberately reaches outside its scratch " +
       "directory (e.g. git-fetching the real project directory, or a raw filesystem read) could defeat this " +
@@ -487,9 +585,15 @@ export async function runEvals(engine: Engine, params: EvalsRunParams): Promise<
       const baseline = await runBaselineTask(engine, baselineDir, task);
 
       progress(engine, "harness", task.id);
+      // Fix 1 (base identity — see this module's header comment): harnessDir
+      // gets the SAME task.setup() base state the baseline used, THEN a
+      // committed git repo, THEN the real project's harness bundle copied
+      // in (untracked) — only after all three is it a valid substrate for
+      // engine.orchestrate to work the task against.
       await task.setup(harnessDir);
       await initEvalGitRepo(harnessDir);
-      const harnessResult = await runHarnessTask(engine, params.projectDir, harnessDir, task);
+      await writeHarness(harnessDir, harnessBundle);
+      const harnessResult = await runHarnessTask(engine, harnessDir, task);
 
       progress(engine, "scored", task.id);
 
@@ -502,6 +606,7 @@ export async function runEvals(engine: Engine, params: EvalsRunParams): Promise<
       perTask.push({
         id: task.id,
         baselinePassed: baseline.passed,
+        baselineOutcome: baseline.outcome,
         harnessPassed: harnessResult.passed,
         harnessOutcome: harnessResult.outcome,
         baselineUsd: baseline.costUsd,
@@ -509,7 +614,9 @@ export async function runEvals(engine: Engine, params: EvalsRunParams): Promise<
       });
     } finally {
       // Eval scratch is transient (unlike orchestrate's own user-facing
-      // worktrees) — always auto-remove, success or failure.
+      // worktrees) — always auto-remove, success or failure. This also
+      // removes any worktree engine.orchestrate created for the harness
+      // side, since (post Fix 1) those always live INSIDE harnessDir.
       await rm(baselineDir, { recursive: true, force: true });
       await rm(harnessDir, { recursive: true, force: true });
     }
@@ -525,12 +632,79 @@ export async function runEvals(engine: Engine, params: EvalsRunParams): Promise<
       : null;
   const qualityHeld = harnessPassed >= baselinePassed;
 
+  // Fix 2 (measurement failures vs. quality failures — see this module's
+  // header comment): a task counts as a MEASUREMENT failure if EITHER side
+  // failed to produce a genuine, oracle-scoreable attempt at the task —
+  // harness "apply-failed"/"error", or baseline "error" (Fix 3's own
+  // baseline/harness symmetry). These are tallied and named in the report's
+  // note regardless of verdict, for transparency.
+  const isHarnessMeasurementFailure = (outcome: HarnessTaskOutcome): boolean =>
+    outcome === "apply-failed" || outcome === "error";
+  const measurementFailureIds = new Set(
+    perTask
+      .filter((t) => isHarnessMeasurementFailure(t.harnessOutcome) || t.baselineOutcome === "error")
+      .map((t) => t.id),
+  );
+  const harnessApplyFailedCount = perTask.filter((t) => t.harnessOutcome === "apply-failed").length;
+  const harnessErrorCount = perTask.filter((t) => t.harnessOutcome === "error").length;
+  const baselineErrorCount = perTask.filter((t) => t.baselineOutcome === "error").length;
+  const measurementFailureCount = measurementFailureIds.size;
+
+  const extraNotes: string[] = [];
+  if (measurementFailureCount > 0) {
+    extraNotes.push(
+      `${measurementFailureCount} of ${taskCount} task(s) hit a measurement failure rather than a genuine, ` +
+        `oracle-scoreable quality result (harness: ${harnessApplyFailedCount} apply-failed, ${harnessErrorCount} ` +
+        `error; baseline: ${baselineErrorCount} error) -- excluded from the quality-gap attribution below.`,
+    );
+  }
+
   let verdict: EvalsReportCard["verdict"];
   if (!qualityHeld) {
-    // ETH HAZARD (spec §12.1): the harness degrades quality relative to the
-    // baseline — the exact thing evals exist to catch. Never reported as a
-    // savings win, regardless of cost.
-    verdict = "fail";
+    // A raw quality gap (harnessPassed < baselinePassed) is the ETH-hazard
+    // shape — but Fix 2 requires the gap be attributable to the harness
+    // GENUINELY producing a worse fix, not to measurement failures on
+    // either side. Recompute the same comparison over only the "clean"
+    // tasks (neither side measurement-failed): if the gap doesn't survive
+    // that exclusion (including the vacuous "no clean tasks at all" case,
+    // where 0 >= 0 trivially holds), or if measurement failures are a
+    // material fraction of the WHOLE run (even when the gap technically
+    // does survive on the remaining clean tasks — a run that unreliable
+    // shouldn't ground the pipeline's most consequential verdict), this is
+    // reported as "inconclusive", never "fail".
+    if (measurementFailureCount > 0) {
+      const cleanTasks = perTask.filter((t) => !measurementFailureIds.has(t.id));
+      const cleanBaselinePassed = cleanTasks.filter((t) => t.baselinePassed).length;
+      const cleanHarnessPassed = cleanTasks.filter((t) => t.harnessPassed).length;
+      const qualityHeldOnCleanTasks = cleanHarnessPassed >= cleanBaselinePassed;
+      const measurementFailureFractionIsMaterial =
+        measurementFailureCount / taskCount >= MATERIAL_MEASUREMENT_FAILURE_FRACTION;
+
+      if (qualityHeldOnCleanTasks || measurementFailureFractionIsMaterial) {
+        verdict = "inconclusive";
+        extraNotes.push(
+          "The raw quality gap above is not attributable to the harness genuinely producing a worse fix once " +
+            "measurement failures are excluded -- reported as inconclusive rather than an ETH-hazard fail.",
+        );
+      } else {
+        // ETH HAZARD (spec §12.1): even excluding every measurement
+        // failure, the harness still genuinely produced tested fixes that
+        // scored worse than the baseline. Never reported as a savings win,
+        // regardless of cost.
+        verdict = "fail";
+      }
+    } else {
+      // No measurement failures at all -- a clean, fully-attributable
+      // quality gap. ETH HAZARD (spec §12.1).
+      verdict = "fail";
+    }
+  } else if (baselinePassed === 0) {
+    // Fix 3: harnessPassed >= baselinePassed is trivially true at 0 >= 0 --
+    // "savings at held quality" is meaningless when the baseline solved
+    // NOTHING to hold quality against. Never a "pass" on a 0-vs-0 (or
+    // N-vs-0) count, however good the savings arithmetic looks.
+    verdict = "inconclusive";
+    extraNotes.push("The baseline solved 0 of the tasks in this run -- there is nothing to measure quality against.");
   } else if (taskCount < MIN_TASK_COUNT_FOR_VERDICT || savingsPct === null) {
     // Too few tasks (a demo, not a claim) or an unpriced cost figure (the
     // savings arithmetic itself is meaningless) — either way, not enough to
@@ -563,6 +737,6 @@ export async function runEvals(engine: Engine, params: EvalsRunParams): Promise<
     verdict,
     pricingConfidence,
     perTask,
-    note: buildNote({ taskCount, pricingConfidence, sampleNote: params.sampleNote }),
+    note: buildNote({ taskCount, pricingConfidence, sampleNote: params.sampleNote, extraNotes }),
   };
 }
