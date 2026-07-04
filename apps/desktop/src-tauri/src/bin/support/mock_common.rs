@@ -171,6 +171,44 @@ pub fn run(scenario: &str) {
             }
         }
 
+        // Deliberately does NOT read from stdin for a while (long enough
+        // that a multi-MiB write blocks on a full OS pipe buffer), then
+        // drains + echoes every complete line forever until EOF. Used by
+        // the mid-write-cancellation framing-integrity test: the delay
+        // gives a cancelled write a real window to leave a partial line on
+        // the wire *before* anything starts reading, so the test can prove
+        // whether a subsequent request's framing survives intact. A
+        // malformed/garbled line (e.g. two requests concatenated because a
+        // partial write ran into a full one) fails to parse and gets no
+        // response at all — that silence is the observable signature of
+        // framing corruption; a well-framed line always gets an echoed
+        // response.
+        "delayed_drain_echo" => {
+            std::thread::sleep(Duration::from_millis(300));
+            while let Some(line) = read_line(&stdin) {
+                if let Some((id, params)) = parse_request(&line) {
+                    write_result(&mut stdout, id, &params);
+                }
+                // Malformed lines are silently skipped -- no response is
+                // exactly the point (see doc comment above).
+            }
+        }
+
+        // Reads + echoes each request like `clean_exit_on_eof`, but sleeps
+        // briefly before responding to *each* one. Used to test per-call
+        // timeouts: a short enough caller-side timeout fires while waiting
+        // on the response (not mid-write -- these payloads are tiny), and a
+        // later call on the same bridge must still complete normally,
+        // proving the stream stayed intact across the timed-out call.
+        "slow_response_echo" => {
+            while let Some(line) = read_line(&stdin) {
+                if let Some((id, params)) = parse_request(&line) {
+                    std::thread::sleep(Duration::from_millis(250));
+                    write_result(&mut stdout, id, &params);
+                }
+            }
+        }
+
         other => {
             eprintln!("mock sidecar: unknown scenario '{other}'");
             std::process::exit(2);
