@@ -38,9 +38,13 @@ export default defineConfig(async () => ({
     // Component tests render into a DOM (App shell, screens); jsdom gives
     // them one without a real browser/webview.
     environment: "jsdom",
+    // `scripts/**` are plain Node ESM build/CI scripts (no DOM involved) --
+    // `environmentMatchGlobs` overrides them to the real `node` environment
+    // rather than jsdom.
+    environmentMatchGlobs: [["scripts/**", "node"]],
     // No `vitest/globals` — every test file imports `describe`/`it`/`expect`
     // explicitly, so tsconfig.json needs no ambient-globals type addition.
     globals: false,
-    include: ["src/**/*.test.{ts,tsx}"],
+    include: ["src/**/*.test.{ts,tsx}", "scripts/**/*.test.mjs"],
   },
 }));

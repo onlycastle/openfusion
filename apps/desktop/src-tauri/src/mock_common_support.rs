@@ -1,11 +1,23 @@
 //! Shared scenario logic for the test-only mock sidecars under
 //! `src/bin/mock_*.rs`.
 //!
-//! This file is NOT itself a Cargo bin target — it lives in `bin/support/`
-//! (a subdirectory without a `main.rs`), which Cargo's auto-discovery does
-//! not pick up. Each `src/bin/mock_<scenario>.rs` pulls it in via
-//! `#[path = "support/mock_common.rs"] mod mock_common;` and calls
+//! This file is NOT itself a Cargo bin target — it's a plain top-level
+//! `src/` file (not `src/main.rs`/`src/lib.rs`), so Cargo's auto-discovery
+//! ignores it entirely. Each `src/bin/mock_<scenario>.rs` pulls it in via
+//! `#[path = "../mock_common_support.rs"] mod mock_common;` and calls
 //! `mock_common::run("<scenario>")`.
+//!
+//! DELIBERATELY NOT placed at `src/bin/support/mock_common.rs` (a
+//! subdirectory of `src/bin/` without a `main.rs`): `tauri build`'s bundler
+//! independently sweeps `src/bin/` looking for extra binaries to copy into
+//! `Contents/MacOS`, and empirically (see
+//! docs/research/2026-07-04-m8-signing-verification.md) that sweep gets
+//! confused once every `.rs` file directly in `src/bin/` has an explicit
+//! `[[bin]]` override — it treats the one remaining unmatched directory
+//! entry (`support/`) as a phantom binary and fails the whole bundle with
+//! "Failed to copy binary from `.../target/.../support`: does not exist".
+//! Keeping shared, non-target code out of `src/bin/` entirely sidesteps
+//! that bundler behavior instead of relying on undocumented internals.
 //!
 //! Why one binary per scenario instead of one binary + argv: the real
 //! `EngineBridge::spawn(binary_path)` takes no argv (mirrors the real
