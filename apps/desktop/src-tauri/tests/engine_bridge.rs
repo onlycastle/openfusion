@@ -325,7 +325,15 @@ async fn call_with_timeout_fires_and_leaves_the_stream_usable_for_the_next_call(
 
 #[tokio::test]
 async fn shutdown_terminates_cleanly_when_child_exits_on_eof() {
-    let bridge = EngineBridge::spawn_with_shutdown_timeout(mock_path("clean_exit_on_eof"), Duration::from_secs(2))
+    // The CONFIGURED shutdown timeout here is deliberately generous (30s --
+    // previously 2s, which flaked once under parallel-suite load) so this
+    // test's pass/fail hinges on whether the clean-EOF-exit path was taken
+    // at all, decoupled from wall-clock noise. The `elapsed < 5s` assertion
+    // below is the real check: a well-behaved child exits on EOF near-
+    // instantly, so even a heavily loaded CI box has ample margin under 5s
+    // -- while 30s is only ever approached by the (separate) kill-fallback
+    // test below, never by this one.
+    let bridge = EngineBridge::spawn_with_shutdown_timeout(mock_path("clean_exit_on_eof"), Duration::from_secs(30))
         .expect("spawn mock_clean_exit_on_eof");
 
     let started = Instant::now();
@@ -333,8 +341,9 @@ async fn shutdown_terminates_cleanly_when_child_exits_on_eof() {
     let elapsed = started.elapsed();
 
     assert!(
-        elapsed < Duration::from_secs(2),
-        "a well-behaved child should exit on EOF well before the shutdown timeout, took {elapsed:?}"
+        elapsed < Duration::from_secs(5),
+        "a well-behaved child should exit on EOF well under the (generous, 30s) shutdown timeout -- \
+         this bound proves the clean-exit path was taken, not the kill fallback, took {elapsed:?}"
     );
 
     // A call after shutdown must error, not hang.

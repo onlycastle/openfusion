@@ -77,6 +77,14 @@
 //! backend-specific enumeration API, so it works identically against the
 //! fake in tests and the real Keychain in production.
 //!
+//! **The `persist` flag is authoritative per `set` call, not additive**:
+//! `set(id, value, persist: false)` for an id CURRENTLY in this index
+//! actively removes it (deletes the backend entry, drops it from the
+//! index) rather than merely leaving the old persisted value stranded
+//! behind a fresher in-memory one. This matters concretely for key
+//! rotation — see [`SecretStore::set`]'s own doc comment for the failure
+//! this closes.
+//!
 //! ## No-value-logging invariant
 //!
 //! Every diagnostic line in this module (`eprintln!`) carries ids or error
@@ -201,11 +209,25 @@ impl SecretStore {
         self.persisted_ids.lock().expect("secret store persisted-ids mutex poisoned")
     }
 
-    /// Store `value` under `id` in the session memory map. If `persist` is
-    /// set, ALSO write-through to the Keychain backend and record `id` in
-    /// the opted-in-persisted-ids index (so a future
-    /// `load_persisted_secrets` — e.g. after an app restart — knows to
-    /// reload it). `persist: false` never touches `backend` at all.
+    /// Store `value` under `id` in the session memory map (always). The
+    /// `persist` flag is AUTHORITATIVE for this call, not merely additive:
+    ///
+    /// - `persist: true` — ALSO write-through to the Keychain backend and
+    ///   record `id` in the opted-in-persisted-ids index (so a future
+    ///   `load_persisted_secrets` — e.g. after an app restart — knows to
+    ///   reload it).
+    /// - `persist: false` — if `id` was never previously persisted,
+    ///   `backend` is untouched (unchanged from before). If `id` WAS
+    ///   previously persisted (present in the opted-in index), this call
+    ///   actively DE-PERSISTS it: the stale Keychain entry is deleted and
+    ///   `id` is removed from the index. Without this, a memory-only
+    ///   re-set of a previously-persisted id (e.g. rotating a key with the
+    ///   persist toggle left at its default OFF) would silently leave the
+    ///   OLD value sitting in the Keychain, which `load_persisted_secrets`
+    ///   would then restore on the next app launch — feeding a rotated-out
+    ///   key back into engine calls with no visible indication to the user.
+    ///   See `set_persist_false_after_previous_persist_deletes_stale_backend_value_and_deindexes`
+    ///   below.
     ///
     /// **Rejects the reserved sentinel id** (`PERSISTED_INDEX_ID`) to prevent
     /// caller-inflicted corruption of the backend's opted-in index.
@@ -217,6 +239,17 @@ impl SecretStore {
         if persist {
             self.backend.set(id, value)?;
             self.add_to_persisted_index(id)?;
+        } else {
+            // Authoritative de-persist: only when `id` was ALREADY opted
+            // into persistence does a persist=false re-set touch the
+            // backend at all -- a never-persisted id must still see zero
+            // backend calls (see
+            // set_persist_false_never_touches_backend_for_never_persisted_id).
+            let was_persisted = self.persisted_ids_lock().contains(id);
+            if was_persisted {
+                self.backend.delete(id)?;
+                self.remove_from_persisted_index(id)?;
+            }
         }
         Ok(())
     }
@@ -387,14 +420,16 @@ pub fn load_persisted_secrets(state: State<'_, Arc<SecretStore>>) {
 #[cfg(test)]
 /// In-memory stand-in for the platform Keychain: a `Mutex<HashMap>` behind
 /// the same [`KeyringBackend`] trait `SecretStore` uses. `set_call_ids`
-/// records every id `set` was called with (ids only — even in test spy
-/// state, values are never retained anywhere they don't need to be) so
-/// tests can assert on *whether* the backend was written to without
+/// records every id `set` was called with, and `delete_call_ids` records
+/// every id `delete` was called with (ids only — even in test spy state,
+/// values are never retained anywhere they don't need to be) so tests can
+/// assert on *whether* the backend was written to or deleted from without
 /// depending on internal storage layout.
 #[derive(Default)]
 pub struct FakeKeyringBackend {
     store: Mutex<HashMap<String, String>>,
     pub set_call_ids: Mutex<Vec<String>>,
+    pub delete_call_ids: Mutex<Vec<String>>,
 }
 
 #[cfg(test)]
@@ -417,6 +452,7 @@ impl KeyringBackend for FakeKeyringBackend {
     }
 
     fn delete(&self, id: &str) -> Result<(), String> {
+        self.delete_call_ids.lock().expect("fake backend delete_call_ids mutex poisoned").push(id.to_string());
         self.store.lock().expect("fake backend store mutex poisoned").remove(id);
         Ok(())
     }
@@ -468,6 +504,83 @@ mod tests {
         let index_json = backend.get(PERSISTED_INDEX_ID).expect("index get should not error").expect("index should exist");
         let index: Vec<String> = serde_json::from_str(&index_json).expect("index should be a JSON string array");
         assert_eq!(index, vec!["anthropic".to_string()]);
+    }
+
+    #[test]
+    fn set_persist_false_after_previous_persist_deletes_stale_backend_value_and_deindexes() {
+        // The BYOK rotation footgun this test guards against: a user
+        // persists `openai` = A, then later rotates the key and re-adds
+        // `openai` = B with the persist toggle at its DEFAULT (OFF). This
+        // session must use B (memory), but the fix under test here is that
+        // the STALE A must not be left sitting in the backend/index, where
+        // a future `load_persisted` would silently resurrect it.
+        let (backend, store) = fake_store();
+
+        store.set("openai", "sk-A-original", true).expect("initial persisted set should succeed");
+        assert_eq!(
+            backend.get("openai").expect("backend get should not error"),
+            Some("sk-A-original".to_string()),
+            "sanity: A must be persisted to the backend before rotation"
+        );
+        assert!(store.list_ids().contains(&"openai".to_string()), "sanity: openai must be in the opted-in index before rotation");
+
+        // Rotate: re-set with persist=false (the toggle's default).
+        store.set("openai", "sk-B-rotated", false).expect("rotation set should succeed");
+
+        // This session must use B.
+        assert_eq!(store.get("openai"), Some("sk-B-rotated".to_string()), "memory must hold the newly-rotated value B");
+
+        // The stale A must be GONE from the backend, not merely shadowed by
+        // the in-memory map.
+        assert_eq!(
+            backend.get("openai").expect("backend get should not error"),
+            None,
+            "de-persisting on rotation must delete the stale backend value, not leave A sitting in the Keychain"
+        );
+
+        // `openai` must no longer be in the opted-in-persisted index.
+        let index_ids: Vec<String> = match backend.get(PERSISTED_INDEX_ID).expect("index get should not error") {
+            Some(json) => serde_json::from_str(&json).expect("index should be valid JSON"),
+            None => Vec::new(),
+        };
+        assert!(
+            !index_ids.contains(&"openai".to_string()),
+            "openai must be removed from the opted-in-persisted index after de-persisting, got {index_ids:?}"
+        );
+
+        // Simulated restart: a brand-new SecretStore against the SAME
+        // backend must NOT resurrect A -- openai is no longer in the index,
+        // so load_persisted has nothing to reload for it.
+        let restarted = SecretStore::new(backend.clone());
+        restarted.load_persisted();
+        assert_eq!(
+            restarted.get("openai"),
+            None,
+            "a restart must not resurrect the rotated-out stale value A -- the id was de-persisted, so nothing reloads for it"
+        );
+    }
+
+    #[test]
+    fn set_persist_false_never_touches_backend_for_never_persisted_id() {
+        // Companion to the rotation test above: the de-persist delete path
+        // must fire ONLY when the id was previously in the persisted index.
+        // A plain memory-only set for an id that was never persisted must
+        // still leave the backend completely untouched -- zero sets AND
+        // zero deletes for that id.
+        let (backend, store) = fake_store();
+
+        store.set("never-persisted", "sk-memory-only", false).expect("set should succeed");
+        assert_eq!(store.get("never-persisted"), Some("sk-memory-only".to_string()));
+
+        assert!(
+            !backend.set_call_ids.lock().expect("mutex").contains(&"never-persisted".to_string()),
+            "persist=false on a never-persisted id must never call backend.set"
+        );
+        assert!(
+            !backend.delete_call_ids.lock().expect("mutex").contains(&"never-persisted".to_string()),
+            "persist=false on a never-persisted id must never call backend.delete either -- the de-persist \
+             delete only fires when the id WAS previously in the opted-in index"
+        );
     }
 
     #[test]

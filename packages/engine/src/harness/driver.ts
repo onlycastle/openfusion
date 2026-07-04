@@ -78,6 +78,20 @@ export interface PromptForJsonOpts {
   // attempt throws RunCancelledError immediately — it is NEVER treated as
   // "produced malformed JSON, retry with validation feedback"; the
   // validation-retry path below is unreachable once this fires.
+  //
+  // IMPORTANT -- pair this with `timeoutMs`: this signal only reaches the
+  // real Claude adapter (engines/claude.ts) as a call to `handle.abort()`,
+  // which is just `abortController.abort()` -- a COOPERATIVE signal the
+  // underlying SDK query/subprocess is expected to notice and unwind from
+  // on its own. The adapter only force-kills the subprocess (`q.close()`)
+  // from the combined-signal handler it builds around
+  // `AbortSignal.timeout(opts.timeoutMs)`, and that handler is wired up
+  // ONLY `if (opts?.timeoutMs !== undefined)`. So an `abortSignal` passed
+  // here WITHOUT a `timeoutMs` degrades to a best-effort cooperative abort
+  // that a genuinely wedged subprocess can simply ignore forever -- no
+  // forced kill will ever fire. Any caller using `abortSignal` for
+  // prompt-level cancellation MUST also pass `timeoutMs` to get the actual
+  // kill guarantee.
   abortSignal?: AbortSignal;
 }
 

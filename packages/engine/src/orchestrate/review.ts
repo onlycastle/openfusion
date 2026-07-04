@@ -43,6 +43,16 @@ export interface ReviewDiffOpts {
   // per-attempt (see driver.ts's own doc comment). Absent -> undefined ->
   // every downstream `abortSignal?.` check is a no-op, so an un-cancellable
   // review call behaves exactly as before this task.
+  //
+  // IMPORTANT -- pair this with `timeoutMs` (this opts type's own field
+  // above): per driver.ts's PromptForJsonOpts.abortSignal doc comment, the
+  // forced-subprocess-kill-on-abort guarantee only holds when a timeoutMs
+  // is ALSO armed -- the real Claude adapter (engines/claude.ts) only wires
+  // an abort into its combined, force-killing signal when a timeout is
+  // set; an abortSignal without a timeoutMs degrades to a cooperative
+  // abort a wedged subprocess could simply ignore. Any caller passing
+  // abortSignal here for review-call cancellation MUST also pass
+  // timeoutMs to get an actual kill guarantee, not just a polite request.
   abortSignal?: AbortSignal;
 }
 
