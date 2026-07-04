@@ -27,6 +27,15 @@
 // explicitly), or `--notarize` is requested without a resolvable Apple
 // credential set in env. NEVER logs credential values -- only which
 // credential MODE (api-key / apple-id / keychain-profile) it resolved.
+//
+// This includes on FAILURE: `notarytool submit`'s argv carries the raw
+// APPLE_PASSWORD value in Apple-ID credential mode, and a naive `catch (err)
+// { print(err.message) }` would leak it, since `execFileSync`'s own thrown
+// Error embeds the full command line. Every signing-tool call in this file
+// goes through `runSigningTool`, which throws a sanitized `SigningToolError`
+// (tool label + exit code only -- `stdio: "inherit"` already streamed the
+// tool's own output live) instead; the top-level catch additionally runs
+// `formatTopLevelError`/`redactSecrets` as a defense-in-depth backstop.
 import { execFileSync } from "node:child_process";
 import { existsSync, readdirSync } from "node:fs";
 import path from "node:path";
@@ -109,6 +118,106 @@ export function buildNotarytoolSubmitArgs(dmgPath, creds) {
   return ["notarytool", "submit", dmgPath, "--wait", ...creds.args];
 }
 
+// --- sanitized exec wrapper (CRITICAL secret-leak fix) ----------------------
+//
+// `execFileSync`'s OWN thrown Error embeds the FULL command line -- every
+// argv value -- in `.message` (verified: `Command failed: <cmd> <args...>`).
+// For notarytool's Apple-ID credential mode, `buildNotarytoolSubmitArgs`
+// puts the raw APPLE_PASSWORD value directly into that argv (`--password
+// <value>`), so printing a caught error's `.message` anywhere leaks the
+// password to stderr (CI logs, scrollback) on ANY notarytool failure --
+// wrong password, network blip, rate-limit, wrong team id, all of them.
+//
+// `stdio: "inherit"` already streams notarytool's/stapler's own
+// stdout/stderr straight to the console before either can throw, so nothing
+// diagnostic is lost by refusing to touch `err.message`/`err.cmd` here --
+// only the sensitive argv echo is suppressed. Every signing-tool invocation
+// in this file MUST go through `runSigningTool`; never call `execFileSync`
+// directly and catch/print its own error.
+
+export class SigningToolError extends Error {
+  /**
+   * @param {string} toolLabel human label for error messages, e.g.
+   *   "xcrun notarytool submit" -- must NEVER itself be built from argv or
+   *   credential values.
+   * @param {number | undefined} exitCode
+   */
+  constructor(toolLabel, exitCode) {
+    super(`${toolLabel} failed (exit code ${exitCode ?? "unknown"}). See output above for details.`);
+    this.name = "SigningToolError";
+    this.exitCode = exitCode;
+  }
+}
+
+/**
+ * Runs `command args` with stdio inherited. On a non-zero exit, throws a
+ * `SigningToolError` instead of letting `execFileSync`'s own Error escape --
+ * that error's `.message` embeds the full argv, which for notarytool's
+ * Apple-ID mode includes the raw app-specific password. NEVER reference
+ * `err.message` here.
+ * @param {string} toolLabel
+ * @param {string} command
+ * @param {string[]} args
+ */
+export function runSigningTool(toolLabel, command, args) {
+  try {
+    execFileSync(command, args, { stdio: "inherit" });
+  } catch (err) {
+    const exitCode = err && typeof err === "object" && "status" in err ? err.status : undefined;
+    throw new SigningToolError(toolLabel, exitCode);
+  }
+}
+
+// --- top-level error formatting (defense in depth) --------------------------
+//
+// A `SigningToolError` is already sanitized, but this formatter is a
+// backstop for any OTHER thrown error (a bug, a future exec call that
+// bypassed `runSigningTool`, an unexpected throw from a dependency) -- it
+// never assumes a message is safe to print verbatim; it actively strips any
+// occurrence of the resolvable Apple credential env values first.
+const SECRET_ENV_KEYS = [
+  "APPLE_PASSWORD",
+  "APPLE_API_KEY",
+  "APPLE_API_ISSUER",
+  "APPLE_API_KEY_PATH",
+  "APPLE_TEAM_ID",
+  "APPLE_ID",
+  "APPLE_KEYCHAIN_PROFILE",
+];
+
+/**
+ * Replaces every occurrence of each `env[key]` value found in `message`
+ * with a fixed redaction marker. Pure string substitution -- safe to run
+ * unconditionally on any error message before it reaches stderr.
+ * @param {string} message
+ * @param {NodeJS.ProcessEnv} env
+ * @returns {string}
+ */
+export function redactSecrets(message, env) {
+  let out = message;
+  for (const key of SECRET_ENV_KEYS) {
+    const value = env[key];
+    if (value) {
+      out = out.split(value).join("[REDACTED]");
+    }
+  }
+  return out;
+}
+
+/**
+ * Formats a caught error for the top-level stderr print. Never returns
+ * `err.message` unredacted: `SigningToolError` messages are already
+ * sanitized (never built from argv), and everything else is passed through
+ * `redactSecrets` as a defensive backstop.
+ * @param {unknown} err
+ * @param {NodeJS.ProcessEnv} [env]
+ * @returns {string}
+ */
+export function formatTopLevelError(err, env = process.env) {
+  const raw = err instanceof Error ? err.message : String(err);
+  return redactSecrets(raw, env);
+}
+
 // --- main --------------------------------------------------------------------
 
 function log(message) {
@@ -174,12 +283,12 @@ export function main(argv = process.argv.slice(2)) {
       );
     }
     log(`submitting ${path.basename(dmgPath)} for notarization (credential mode: ${creds.mode})...`);
-    execFileSync("xcrun", buildNotarytoolSubmitArgs(dmgPath, creds), { stdio: "inherit" });
+    runSigningTool("xcrun notarytool submit", "xcrun", buildNotarytoolSubmitArgs(dmgPath, creds));
     log("notarization submission accepted.");
   }
 
   log(`stapling ${path.basename(dmgPath)}...`);
-  execFileSync("xcrun", ["stapler", "staple", dmgPath], { stdio: "inherit" });
+  runSigningTool("xcrun stapler staple", "xcrun", ["stapler", "staple", dmgPath]);
   log("staple complete.");
 }
 
@@ -188,7 +297,7 @@ if (isMain) {
   try {
     main();
   } catch (err) {
-    process.stderr.write(`[notarize-staple-dmg] ${err instanceof Error ? err.message : String(err)}\n`);
+    process.stderr.write(`[notarize-staple-dmg] ${formatTopLevelError(err)}\n`);
     process.exitCode = 1;
   }
 }

@@ -3,12 +3,21 @@
 // fixtures written to a temp dir) and the sign/skip/fail gate. The actual
 // `codesign --sign ...` invocation is an OPERATOR step (needs a real Apple
 // Developer ID cert) and is intentionally NOT exercised here.
+import { execFileSync } from "node:child_process";
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
-import { decideSigningAction, findFilesRecursive, isMachOBuffer, isMachOFile } from "./presign-sidecar-assets.mjs";
+import {
+  decideSigningAction,
+  findFilesRecursive,
+  formatTopLevelError,
+  isMachOBuffer,
+  isMachOFile,
+  runSigningTool,
+  SigningToolError,
+} from "./presign-sidecar-assets.mjs";
 
 describe("isMachOBuffer", () => {
   it("recognizes 64-bit Mach-O (MH_MAGIC_64)", () => {
@@ -108,5 +117,67 @@ describe("decideSigningAction", () => {
     const secretLookingIdentity = "Developer ID Application: SUPER SECRET TEAM (ABCDE12345)";
     const decision = decideSigningAction({ identity: secretLookingIdentity, tauriEnvDebug: undefined });
     expect(decision.reason).not.toContain(secretLookingIdentity);
+  });
+});
+
+// --- Fix 2: same execFileSync-echoes-full-argv pattern as notarize-staple- --
+// dmg.mjs's Fix 1. The module doc comment claims "NEVER logs the identity
+// value" -- that was FALSE before this fix, since a `codesign` failure's
+// caught `err.message` embeds the full argv (including `--sign <identity>`)
+// and the old top-level catch printed it verbatim.
+describe("execFileSync's own thrown error (the underlying leak this script must never surface)", () => {
+  it("embeds the full argv -- including a secret-looking identity value -- in `.message`", () => {
+    let caught;
+    try {
+      execFileSync(process.execPath, ["-e", "process.exit(3)", "Developer ID Application: SUPER SECRET TEAM"], {
+        stdio: "ignore",
+      });
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeDefined();
+    expect(caught.message).toContain("SUPER SECRET TEAM");
+  });
+});
+
+describe("runSigningTool (the no-leak regression test -- load-bearing)", () => {
+  it("never lets the codesign identity value in argv reach the thrown error's message", () => {
+    let caught;
+    try {
+      runSigningTool("codesign", process.execPath, [
+        "-e",
+        "process.exit(3)",
+        "Developer ID Application: SUPER SECRET TEAM",
+      ]);
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeInstanceOf(SigningToolError);
+    expect(caught.message).not.toContain("SUPER SECRET TEAM");
+    expect(caught.message).toContain("codesign");
+    expect(caught.message).toContain("exit code 3");
+  });
+
+  it("does not throw when the underlying command succeeds", () => {
+    expect(() => runSigningTool("codesign", process.execPath, ["-e", "process.exit(0)"])).not.toThrow();
+  });
+});
+
+describe("formatTopLevelError (defense in depth for the top-level catch)", () => {
+  it("redacts APPLE_SIGNING_IDENTITY if it ever appears in an error message", () => {
+    const identity = "Developer ID Application: SUPER SECRET TEAM (ABCDE12345)";
+    const err = new Error(`codesign failed near ${identity}`);
+    const formatted = formatTopLevelError(err, { APPLE_SIGNING_IDENTITY: identity });
+    expect(formatted).not.toContain(identity);
+    expect(formatted).toContain("[REDACTED]");
+  });
+
+  it("never leaks a SigningToolError's message either (already sanitized upstream)", () => {
+    const identity = "Developer ID Application: SUPER SECRET TEAM (ABCDE12345)";
+    const err = new SigningToolError("codesign", 1);
+    const formatted = formatTopLevelError(err, { APPLE_SIGNING_IDENTITY: identity });
+    expect(formatted).not.toContain(identity);
+    expect(formatted).toContain("codesign");
+    expect(formatted).toContain("exit code 1");
   });
 });

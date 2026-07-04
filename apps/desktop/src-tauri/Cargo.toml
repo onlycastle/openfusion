@@ -20,7 +20,7 @@ name = "openfusion-desktop"
 path = "src/main.rs"
 
 # --- test-only mock sidecar binaries (src/bin/mock_*.rs) -------------------
-# These are cargo-test fixtures (see src/bin/support/mock_common.rs's doc
+# These are cargo-test fixtures (see src/mock_common_support.rs's doc
 # comment): tests/engine_bridge.rs, tests/commands.rs, and tests/lifecycle.rs
 # spawn them via `env!("CARGO_BIN_EXE_mock_<name>")`. Left as plain
 # auto-discovered `src/bin/*.rs` targets, `cargo build --release` / `tauri

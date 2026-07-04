@@ -36,7 +36,13 @@
 //     better to stop the build now with a clear message).
 //
 // NEVER logs the identity value or any cert/key material -- only whether
-// signing ran, was skipped, or is required.
+// signing ran, was skipped, or is required. This also covers FAILURE: a
+// `codesign` non-zero exit's caught `err.message` (from `execFileSync`)
+// embeds the full argv, including `--sign <identity>` -- every codesign
+// call here goes through `runSigningTool`, which throws a sanitized
+// `SigningToolError` (tool label + exit code only) instead of letting that
+// through, and the top-level catch runs `formatTopLevelError`/
+// `redactSecrets` as a defense-in-depth backstop.
 import { execFileSync } from "node:child_process";
 import { closeSync, openSync, readdirSync, readSync, statSync } from "node:fs";
 import path from "node:path";
@@ -140,6 +146,84 @@ export function decideSigningAction({ identity, tauriEnvDebug }) {
   };
 }
 
+// --- sanitized exec wrapper (same fix as notarize-staple-dmg.mjs's Fix 1) --
+//
+// `execFileSync`'s OWN thrown Error embeds the FULL command line -- every
+// argv value, including `--sign <identity>` -- in `.message`. A Developer ID
+// common name isn't a classic secret, but this file's own doc comment
+// promises "NEVER logs the identity value" -- a naive `catch (err) {
+// print(err.message) }` on a codesign failure broke that promise. `stdio:
+// "inherit"` already streams codesign's own stdout/stderr live, so nothing
+// diagnostic is lost by refusing to touch `err.message` here. Every
+// signing-tool invocation in this file goes through `runSigningTool`.
+
+export class SigningToolError extends Error {
+  /**
+   * @param {string} toolLabel human label for error messages, e.g.
+   *   "codesign (better_sqlite3.node)" -- must NEVER itself be built from
+   *   argv or identity values.
+   * @param {number | undefined} exitCode
+   */
+  constructor(toolLabel, exitCode) {
+    super(`${toolLabel} failed (exit code ${exitCode ?? "unknown"}). See output above for details.`);
+    this.name = "SigningToolError";
+    this.exitCode = exitCode;
+  }
+}
+
+/**
+ * Runs `command args` with stdio inherited. On a non-zero exit, throws a
+ * `SigningToolError` instead of letting `execFileSync`'s own Error escape --
+ * that error's `.message` embeds the full argv, which includes the codesign
+ * identity. NEVER reference `err.message` here.
+ * @param {string} toolLabel
+ * @param {string} command
+ * @param {string[]} args
+ */
+export function runSigningTool(toolLabel, command, args) {
+  try {
+    execFileSync(command, args, { stdio: "inherit" });
+  } catch (err) {
+    const exitCode = err && typeof err === "object" && "status" in err ? err.status : undefined;
+    throw new SigningToolError(toolLabel, exitCode);
+  }
+}
+
+// --- top-level error formatting (defense in depth) --------------------------
+//
+// Backstop for any error OTHER than a (already-sanitized) SigningToolError:
+// strips a resolvable APPLE_SIGNING_IDENTITY value out of the message before
+// it's ever printed, rather than assuming any given message is safe.
+const SECRET_ENV_KEYS = ["APPLE_SIGNING_IDENTITY"];
+
+/**
+ * @param {string} message
+ * @param {NodeJS.ProcessEnv} env
+ * @returns {string}
+ */
+export function redactSecrets(message, env) {
+  let out = message;
+  for (const key of SECRET_ENV_KEYS) {
+    const value = env[key];
+    if (value) {
+      out = out.split(value).join("[REDACTED]");
+    }
+  }
+  return out;
+}
+
+/**
+ * Formats a caught error for the top-level stderr print. Never returns
+ * `err.message` unredacted.
+ * @param {unknown} err
+ * @param {NodeJS.ProcessEnv} [env]
+ * @returns {string}
+ */
+export function formatTopLevelError(err, env = process.env) {
+  const raw = err instanceof Error ? err.message : String(err);
+  return redactSecrets(raw, env);
+}
+
 // --- main -------------------------------------------------------------------
 
 function resolveAssetsDir() {
@@ -192,18 +276,24 @@ export function main() {
 
   log(`signing ${machOFiles.length} Mach-O file(s) under ${path.relative(process.cwd(), assetsDir)}...`);
   for (const file of machOFiles) {
+    const relFile = path.relative(assetsDir, file);
     // --force makes this idempotent (re-signing an already-signed file is a
     // no-op failure mode otherwise); --options runtime opts into the
     // hardened runtime, a hard notarization prerequisite; --timestamp adds
     // the secure timestamp notarization also requires. The identity itself
     // is passed straight from the env var to codesign's argv -- never
-    // interpolated into a shell string, and never printed.
-    execFileSync(
-      "codesign",
-      ["--sign", process.env.APPLE_SIGNING_IDENTITY, "--options", "runtime", "--timestamp", "--force", file],
-      { stdio: "inherit" },
-    );
-    log(`signed ${path.relative(assetsDir, file)}`);
+    // interpolated into a shell string, and never printed (a failure is
+    // reported via `runSigningTool`, which never echoes argv/`err.message`).
+    runSigningTool(`codesign (${relFile})`, "codesign", [
+      "--sign",
+      process.env.APPLE_SIGNING_IDENTITY,
+      "--options",
+      "runtime",
+      "--timestamp",
+      "--force",
+      file,
+    ]);
+    log(`signed ${relFile}`);
   }
   log("done.");
 }
@@ -213,7 +303,7 @@ if (isMain) {
   try {
     main();
   } catch (err) {
-    process.stderr.write(`[presign-sidecar-assets] ${err instanceof Error ? err.message : String(err)}\n`);
+    process.stderr.write(`[presign-sidecar-assets] ${formatTopLevelError(err)}\n`);
     process.exitCode = 1;
   }
 }

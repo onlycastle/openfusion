@@ -159,6 +159,17 @@ scans the staged directory for the one entry at `.setup()` time (a separate,
 runtime-only check — the `tauri-build` validation above happens earlier, at
 compile time).
 
+**Running the Rust tests:** use `pnpm --filter @openfusion/desktop test:rust`
+(equivalently, `cargo test --manifest-path src-tauri/Cargo.toml --features
+test-mocks` from the repo root) — a bare `cargo test` fails to compile,
+because the `src/bin/mock_*.rs` fixture binaries the integration tests spawn
+are gated behind the `test-mocks` feature (see `Cargo.toml`'s `[[bin]]`
+comments) so they never ship inside a notarized release bundle. `pnpm
+--filter @openfusion/desktop test` runs only the Vite/vitest script tests —
+it does not run the Rust suite; `test:rust` is the canonical, separate
+command for that. (Note: this is not yet wired into CI — `.github/workflows/ci.yml`
+has no cargo-test step, a pre-existing gap.)
+
 ## The Cockpit: Four Screens
 
 The desktop app exposes a "cockpit" UI with four screens:

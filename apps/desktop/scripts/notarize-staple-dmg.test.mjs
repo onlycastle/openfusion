@@ -4,6 +4,7 @@
 // `xcrun stapler` invocations are an OPERATOR step (needs real Apple
 // Developer credentials + network access) and are intentionally NOT
 // exercised here.
+import { execFileSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -13,7 +14,10 @@ import {
   buildNotarytoolSubmitArgs,
   dmgSearchDirs,
   findDmgCandidates,
+  formatTopLevelError,
   resolveNotarizeCredentials,
+  runSigningTool,
+  SigningToolError,
 } from "./notarize-staple-dmg.mjs";
 
 describe("findDmgCandidates", () => {
@@ -118,5 +122,70 @@ describe("buildNotarytoolSubmitArgs", () => {
       args: ["--keychain-profile", "openfusion-notary"],
     });
     expect(args).toEqual(["notarytool", "submit", "/path/OpenFusion.dmg", "--wait", "--keychain-profile", "openfusion-notary"]);
+  });
+});
+
+// --- CRITICAL: the secret-leak fix (Fix 1) ----------------------------------
+//
+// `execFileSync`'s OWN thrown Error embeds the full argv (all command-line
+// values, including a `--password <value>` in notarytool's Apple-ID
+// credential mode) in `.message`. The old top-level `catch (err) {
+// process.stderr.write(err.message) }` therefore printed the raw
+// APPLE_PASSWORD to stderr on ANY notarytool failure. The tests below prove
+// (a) that underlying Node behavior is real (the threat model), and (b) our
+// own `runSigningTool` wrapper + `formatTopLevelError` backstop never let a
+// secret positional argv value reach anything this script writes out.
+describe("execFileSync's own thrown error (the underlying leak this script must never surface)", () => {
+  it("embeds the full argv -- including a secret positional value -- in `.message`", () => {
+    let caught;
+    try {
+      execFileSync(process.execPath, ["-e", "process.exit(3)", "SUPERSECRETPW"], { stdio: "ignore" });
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeDefined();
+    expect(caught.message).toContain("SUPERSECRETPW");
+  });
+});
+
+describe("runSigningTool (the no-leak regression test -- load-bearing)", () => {
+  it("never lets a secret argv value reach the thrown error's message", () => {
+    let caught;
+    try {
+      runSigningTool("test-tool", process.execPath, ["-e", "process.exit(3)", "SUPERSECRETPW"]);
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeInstanceOf(SigningToolError);
+    expect(caught.message).not.toContain("SUPERSECRETPW");
+    expect(caught.message).toContain("test-tool");
+    expect(caught.message).toContain("exit code 3");
+    expect(caught.exitCode).toBe(3);
+  });
+
+  it("does not throw when the underlying command succeeds", () => {
+    expect(() => runSigningTool("test-tool", process.execPath, ["-e", "process.exit(0)"])).not.toThrow();
+  });
+});
+
+describe("formatTopLevelError / redactSecrets (defense in depth for the top-level catch)", () => {
+  it("redacts a known secret env value if it ever appears in an error message", () => {
+    const err = new Error("something failed near SUPERSECRETPW in the pipeline");
+    const formatted = formatTopLevelError(err, { APPLE_PASSWORD: "SUPERSECRETPW" });
+    expect(formatted).not.toContain("SUPERSECRETPW");
+    expect(formatted).toContain("[REDACTED]");
+  });
+
+  it("passes an error message through untouched when no secret env values are set", () => {
+    const err = new Error("no .dmg found");
+    expect(formatTopLevelError(err, {})).toBe("no .dmg found");
+  });
+
+  it("never leaks a SigningToolError's message either (already sanitized upstream)", () => {
+    const err = new SigningToolError("xcrun notarytool submit", 1);
+    const formatted = formatTopLevelError(err, { APPLE_PASSWORD: "SUPERSECRETPW" });
+    expect(formatted).not.toContain("SUPERSECRETPW");
+    expect(formatted).toContain("notarytool submit");
+    expect(formatted).toContain("exit code 1");
   });
 });
