@@ -164,6 +164,8 @@ These require a display/window and are not run in CI or this development
 environment — checked manually before considering a change to this shell
 done:
 
+**Note on CSP in development vs. production:** `tauri dev` uses a relaxed `devCsp` (allowing `style-src 'unsafe-inline'` for Vite HMR and `ws://localhost:*` for the dev server) — styling issues in `tauri dev` may be dev-only artifacts. The definitive CSP verification is against a production `tauri build`, which uses the strict `csp` policy.
+
 1. **`tauri dev` launches.** A window titled "OpenFusion" appears, sized
    1024×720, no console errors on load.
 2. **The full chain renders `engine.models.list`.** The window's "engine
