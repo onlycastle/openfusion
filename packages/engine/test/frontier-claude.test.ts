@@ -415,6 +415,76 @@ describe("createClaudeAdapter", () => {
     expect(captured[0]?.abortController?.signal.aborted).toBe(true);
   });
 
+  // M6 Task 1 (eval-batch safety gate): `prompt`'s `opts.timeoutMs` used to
+  // be silently ignored (dropped in M3 for single-timeout-authority — see
+  // claude.ts's own doc comment on `prompt`). M5b started threading a
+  // PER-ATTEMPT timeoutMs straight into this call from two paths that never
+  // go through the RPC layer at all (harness/driver.ts's promptForJson and
+  // orchestrate.ts's escalation turn), so against the REAL adapter it was a
+  // no-op: a wedged real review/escalate/generate turn could hang an eval
+  // batch of orchestrate loops forever. This proves the fake's underlying
+  // query NEVER completes on its own (its `next()` returns a promise that
+  // never settles, standing in for a truly wedged CLI subprocess) and the
+  // returned handle still rejects, within a bound, once timeoutMs elapses —
+  // proving the adapter doesn't merely wait on the query to cooperate.
+  it("prompt's timeoutMs aborts the query and rejects within a bound, even if the underlying query never completes on its own", async () => {
+    let capturedAbortController: AbortController | undefined;
+    const closeSpy = { count: 0 };
+    const hangingQuery = {
+      next(): Promise<IteratorResult<SDKMessage, void>> {
+        // Never settles.
+        return new Promise<IteratorResult<SDKMessage, void>>(() => {});
+      },
+      async return(): Promise<IteratorResult<SDKMessage, void>> {
+        return { value: undefined, done: true };
+      },
+      async throw(err: unknown): Promise<IteratorResult<SDKMessage, void>> {
+        throw err;
+      },
+      [Symbol.asyncIterator]() {
+        return this;
+      },
+      close(): void {
+        closeSpy.count += 1;
+      },
+    };
+    const queryFn = ((params: { prompt: string; options?: Options }) => {
+      capturedAbortController = params.options?.abortController;
+      return hangingQuery as unknown as Query;
+    }) as typeof import("@anthropic-ai/claude-agent-sdk").query;
+
+    const adapter = createClaudeAdapter({ queryFn });
+    const session = await adapter.createSession({ projectDir: "/repo", wikiMcpUrl: null, log: noopLog });
+
+    const start = Date.now();
+    const handle = session.prompt("hi", { timeoutMs: 200 });
+    await expect(drain(handle)).rejects.toThrow(/timed out/i);
+    const elapsed = Date.now() - start;
+
+    // Generous bound (per the task brief's own flake-avoidance guidance) —
+    // 200ms timeout, asserted well under 3s.
+    expect(elapsed).toBeLessThan(3_000);
+    // The query's own abortController must have fired (graceful
+    // cancellation, matching handle.abort()'s existing mechanism)...
+    expect(capturedAbortController?.signal.aborted).toBe(true);
+    // ...AND the Query itself must have been forcefully closed (kills the
+    // CLI subprocess) so a real wedged process can't survive the deadline.
+    expect(closeSpy.count).toBe(1);
+  }, 5_000);
+
+  // Preserves the M3 single-timeout-authority default: omitting timeoutMs
+  // (or passing an opts object without it — every M4-era caller's shape)
+  // must never arm a timer at all. A normal, fast-completing prompt behaves
+  // exactly as it did before this task.
+  it("omitting timeoutMs never arms a timeout — a normal prompt completes exactly as before", async () => {
+    const { queryFn } = makeQueryFn([[RESULT_MSG]]);
+    const adapter = createClaudeAdapter({ queryFn });
+    const session = await adapter.createSession({ projectDir: "/repo", wikiMcpUrl: null, log: noopLog });
+
+    const events = await drain(session.prompt("hi", {}));
+    expect(events.map((e) => e.type)).toEqual(["result"]);
+  });
+
   it("close() terminates the active query and drops resume state", async () => {
     const { queryFn, captured, queries } = makeQueryFn([[RESULT_MSG], [RESULT_MSG]]);
     const adapter = createClaudeAdapter({ queryFn });

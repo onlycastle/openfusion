@@ -303,6 +303,14 @@ async function runEscalation(engine: Engine, params: OrchestrateParams, agent: A
       toolPolicy: { writeScope: [worktree.path] },
       resultLabel: "frontier-escalate",
     });
+    // M6 Task 1 (eval-batch safety gate): this session is created DIRECTLY
+    // off the registered adapter, bypassing engine.frontier.start entirely —
+    // it never gets a sessionId and never touches FrontierService's own
+    // #sessions bookkeeping, so Engine.close() had no way to reach (and
+    // force-kill) a wedged escalation turn before this fix. track()
+    // registers it for close()-time reachability; the returned untrack fn is
+    // called in the same `finally` below where the session is closed.
+    const untrackSession = engine.frontier.track(session);
     try {
       const turn = await runFrontierTurn(
         session,
@@ -330,6 +338,7 @@ async function runEscalation(engine: Engine, params: OrchestrateParams, agent: A
         // isolation; a throwing adapter close() must never mask this
         // escalation's real outcome.
       });
+      untrackSession();
     }
   } catch (err) {
     // Mirrors worker/methods.ts's own failure posture: leave the worktree in
@@ -480,6 +489,15 @@ export async function orchestrate(engine: Engine, params: OrchestrateParams): Pr
           log: engine.log,
           resultLabel: "frontier-review",
         });
+        // M6 Task 1 (eval-batch safety gate): this session is created
+        // DIRECTLY off the registered adapter, bypassing
+        // engine.frontier.start entirely — it never gets a sessionId and
+        // never touches FrontierService's own #sessions bookkeeping, so
+        // Engine.close() had no way to reach (and force-kill) a wedged
+        // review turn before this fix. track() registers it for
+        // close()-time reachability; the returned untrack fn is called in
+        // the same `finally` below where the session is closed.
+        const untrackReviewSession = engine.frontier.track(reviewSession);
         let verdict: ReviewVerdict;
         try {
           const reviewResult = await reviewDiff(
@@ -493,6 +511,7 @@ export async function orchestrate(engine: Engine, params: OrchestrateParams): Pr
           await reviewSession.close().catch(() => {
             // Best-effort — see runEscalation's identical close() comment.
           });
+          untrackReviewSession();
         }
 
         attempts.push({ n, kind: "worker", summary: workerResult.summary, verdict });

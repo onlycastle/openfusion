@@ -250,6 +250,24 @@ describe("engine.harness.generate — happy path (scripted fake adapter)", () =>
     expect(closeSpy.count).toBe(1);
   }, 30_000);
 
+  // M6 Task 1 (eval-batch safety gate): generateHarness opens its session
+  // directly off the registered adapter (bypassing engine.frontier.start),
+  // so it must call engine.frontier.track()/untrack() itself for
+  // Engine.close() to be able to reach it. Asserted here via
+  // trackedCount(): zero before the run, back to zero after — proving both
+  // that the session got tracked (real coverage would need close() to be
+  // provably reachable) AND that it was untracked again (no leak).
+  it("tracks the generation session for close()-reachability and untracks it once generation finishes (no leak)", async () => {
+    dir = makeRepo();
+    engine = createEngine();
+    engine.frontier.registerAdapter(makeScriptedAdapter({ scripts: happyScripts() }));
+
+    expect(engine.frontier.trackedCount()).toBe(0);
+    const res = await call("engine.harness.generate", { projectDir: dir });
+    expect(res.error).toBeUndefined();
+    expect(engine.frontier.trackedCount()).toBe(0);
+  }, 30_000);
+
   it("starts a READ-ONLY session (no toolPolicy) even though the project directory would be writable", async () => {
     dir = makeRepo();
     engine = createEngine();

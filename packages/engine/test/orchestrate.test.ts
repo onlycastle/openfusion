@@ -243,6 +243,19 @@ interface FakeFrontierOptions {
   escalationPrompts?: string[];
   reviewSessionStarts?: { count: number };
   closedSessions?: { count: number };
+  // M6 Task 1 (eval-batch safety gate): when true, a REVIEW session's
+  // prompt() blocks forever (never yields, never completes) until THIS
+  // session's own close() is called — standing in for a wedged real review
+  // turn. There is no RPC-level "active handle" for a direct session like
+  // this (orchestrate.ts drives it in-process, never through
+  // engine.frontier.prompt), so close() is the ONLY teardown mechanism that
+  // can ever reach it — exactly what FrontierService.track()/close() must
+  // now guarantee.
+  blockReviewUntilClose?: boolean;
+  // Counts close() calls made specifically on a REVIEW session (not
+  // escalation) — used to prove engine.close() actually reached the
+  // in-flight review session created outside engine.frontier.start.
+  reviewCloseSpy?: { count: number };
   // Mirrors engines/methods.ts's REAL onResult wiring (resultLabel
   // "frontier-escalate" -> source "frontier-escalate", else
   // "frontier-review") so tests can assert engine.models.usage's bySource
@@ -280,11 +293,28 @@ function makeFakeFrontierAdapter(opts: FakeFrontierOptions = {}): FrontierAdapte
       if (!isEscalation && opts.reviewSessionStarts !== undefined) {
         opts.reviewSessionStarts.count += 1;
       }
+      // M6 Task 1: resolved by THIS session's own close() below — the only
+      // teardown mechanism reachable for a review session opened outside
+      // engine.frontier.start (see blockReviewUntilClose's own doc comment
+      // on FakeFrontierOptions).
+      let resolveClosed: () => void = () => {};
+      const closed = new Promise<void>((resolve) => {
+        resolveClosed = resolve;
+      });
 
       return {
         id: randomUUID(),
         projectDir,
         prompt(text: string): FrontierPromptHandle {
+          if (!isEscalation && opts.blockReviewUntilClose === true) {
+            async function* gen(): AsyncGenerator<FrontierEvent> {
+              await closed;
+              // Ends without ever yielding a result event — mirrors a
+              // wedged review turn that never got to finish; the session
+              // was force-closed instead.
+            }
+            return { events: gen(), abort: () => {} };
+          }
           if (isEscalation) {
             opts.escalationPrompts?.push(text);
             async function* gen(): AsyncGenerator<FrontierEvent> {
@@ -334,6 +364,8 @@ function makeFakeFrontierAdapter(opts: FakeFrontierOptions = {}): FrontierAdapte
         },
         async close(): Promise<void> {
           if (opts.closedSessions !== undefined) opts.closedSessions.count += 1;
+          if (!isEscalation && opts.reviewCloseSpy !== undefined) opts.reviewCloseSpy.count += 1;
+          resolveClosed();
         },
       };
     },
@@ -832,6 +864,66 @@ describe("engine.orchestrate — failure semantics", () => {
     expect(worktrees).toHaveLength(1);
     expect(path.resolve(worktrees[0]!.path)).toBe(path.resolve(worktreePath));
   });
+});
+
+// M6 Task 1 (eval-batch safety gate): the review session orchestrate.ts
+// opens for the frontier-review gate is created DIRECTLY off the registered
+// adapter (adapter.createSession), bypassing engine.frontier.start entirely
+// — so it never lands in FrontierService's addressable #sessions map, and
+// before this fix Engine.close() had no way to reach it at all. A wedged
+// real review turn would therefore survive engine.close() outright, letting
+// an eval batch of N real orchestrate loops hang on one stuck review. Fixed
+// by FrontierService.track()/untrack (engines/methods.ts) — orchestrate.ts
+// tracks its review (and escalation) session on create and untracks it in
+// the same `finally` where it closes the session.
+describe("engine.orchestrate — in-flight review + engine.close() (Task 1 Change B)", () => {
+  it("engine.close() resolves within a bounded time and closes the in-flight review session", async () => {
+    dir = makeRepo();
+    await writeTestHarness(dir);
+    engine = createEngine();
+    engine.models.registry.configure({ id: "p1", kind: "deepseek", apiKey: TEST_API_KEY });
+    engine.models.registry.setTestModel("p1", makeWorkerMock("hello.txt", "HELLO FROM WORKER", "Created hello.txt"));
+    const reviewSessionStarts = { count: 0 };
+    const reviewCloseSpy = { count: 0 };
+    engine.frontier.registerAdapter(
+      makeFakeFrontierAdapter({
+        blockReviewUntilClose: true,
+        reviewSessionStarts,
+        reviewCloseSpy,
+      }),
+    );
+
+    const orchestratePromise = call(engine, "engine.orchestrate", {
+      projectDir: dir,
+      task: "add hello.txt with a greeting",
+    });
+
+    // Wait for the worker attempt to finish and the review session to
+    // actually start (its prompt() is now blocked awaiting close()) before
+    // racing engine.close() against it — polled rather than a flat sleep so
+    // this isn't sensitive to how long the real worktree/worker machinery
+    // takes under load.
+    const deadline = Date.now() + 10_000;
+    while (reviewSessionStarts.count < 1) {
+      if (Date.now() > deadline) throw new Error("review session never started");
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+
+    const start = Date.now();
+    await engine.close();
+    const elapsed = Date.now() - start;
+
+    // Generous bound per the task brief's own flake-avoidance guidance.
+    expect(elapsed).toBeLessThan(3_000);
+    expect(reviewCloseSpy.count).toBe(1);
+
+    const res = await orchestratePromise;
+    // The blocked review session never produced a result event once
+    // close() ended its (still-open) generator — reviewDiff/promptForJson
+    // sees the turn end without schema-valid JSON, which orchestrate.ts
+    // surfaces as a SERVER_ERROR, not a hang.
+    expect(res.error).toBeDefined();
+  }, 15_000);
 });
 
 describe("engine.orchestrate.apply", () => {
