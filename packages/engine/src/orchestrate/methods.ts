@@ -26,8 +26,15 @@ const execFileAsync = promisify(execFile);
 const WORKER_TIMEOUT_MIN_MS = 1_000;
 const WORKER_TIMEOUT_MAX_MS = 1_800_000;
 // Bounds mirror engines/methods.ts's own frontier prompt timeout ceiling
-// (100ms..1h) — reviewTimeoutMs is reused for both the review turn's and the
-// escalation turn's own per-attempt timeoutMs (see orchestrate.ts).
+// (100ms..1h) — an EXPLICIT reviewTimeoutMs is reused for both the review
+// turn's and the escalation turn's own per-attempt timeoutMs (see
+// orchestrate.ts). Both workerTimeoutMs and reviewTimeoutMs stay OPTIONAL
+// here — a caller may omit either — because M6 Task 1 review round 1 (Fix
+// 1) moved the actual DEFAULTING into orchestrate.ts itself
+// (DEFAULT_REVIEW_TIMEOUT_MS / DEFAULT_ESCALATE_TIMEOUT_MS, applied via
+// `params.reviewTimeoutMs ?? DEFAULT_...`): this schema's bounds only ever
+// constrain an EXPLICIT value's range, never fill in an omitted one, so an
+// omitted param is never left unbounded once it reaches orchestrate().
 const REVIEW_TIMEOUT_MIN_MS = 100;
 const REVIEW_TIMEOUT_MAX_MS = 3_600_000;
 

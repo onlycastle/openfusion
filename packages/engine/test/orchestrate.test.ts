@@ -65,7 +65,10 @@ const TRIVIAL_PAGE: WikiPage = {
 // engine.harness.generate output. The agent pins an explicit providerId
 // ("p1") so routeTask resolution is deterministic regardless of which
 // worker model gets configured/mocked per test.
-async function writeTestHarness(projectDir: string, opts: { failuresBeforeFrontier?: number } = {}): Promise<void> {
+async function writeTestHarness(
+  projectDir: string,
+  opts: { failuresBeforeFrontier?: number; pages?: WikiPage[] } = {},
+): Promise<void> {
   const headSha = git(projectDir, "rev-parse", "HEAD");
   const agent: AgentDef = {
     name: "codegen-worker",
@@ -92,7 +95,7 @@ async function writeTestHarness(projectDir: string, opts: { failuresBeforeFronti
       verification: { structural: "pass", evals: "pending" },
       artifacts: [],
     },
-    pages: [TRIVIAL_PAGE],
+    pages: opts.pages ?? [TRIVIAL_PAGE],
     agents: [agent],
     routing,
   };
@@ -243,6 +246,27 @@ interface FakeFrontierOptions {
   escalationPrompts?: string[];
   reviewSessionStarts?: { count: number };
   closedSessions?: { count: number };
+  // M6 Task 1 review round 1 (Fix 1 test): captures the `opts` each REVIEW
+  // session's prompt() call received, one entry per call — lets a test
+  // assert orchestrate.ts always threads a BOUNDED timeoutMs into the
+  // review turn, even when the RPC caller omitted reviewTimeoutMs entirely
+  // (the default must reach here, not `undefined`).
+  reviewPromptOpts?: Array<{ timeoutMs?: number }>;
+  // Same, for the ESCALATION session's prompt() call.
+  escalationPromptOpts?: Array<{ timeoutMs?: number }>;
+  // M6 Task 1 (eval-batch safety gate): when true, a REVIEW session's
+  // prompt() blocks forever (never yields, never completes) until THIS
+  // session's own close() is called — standing in for a wedged real review
+  // turn. There is no RPC-level "active handle" for a direct session like
+  // this (orchestrate.ts drives it in-process, never through
+  // engine.frontier.prompt), so close() is the ONLY teardown mechanism that
+  // can ever reach it — exactly what FrontierService.track()/close() must
+  // now guarantee.
+  blockReviewUntilClose?: boolean;
+  // Counts close() calls made specifically on a REVIEW session (not
+  // escalation) — used to prove engine.close() actually reached the
+  // in-flight review session created outside engine.frontier.start.
+  reviewCloseSpy?: { count: number };
   // Mirrors engines/methods.ts's REAL onResult wiring (resultLabel
   // "frontier-escalate" -> source "frontier-escalate", else
   // "frontier-review") so tests can assert engine.models.usage's bySource
@@ -265,6 +289,9 @@ function makeFakeFrontierAdapter(opts: FakeFrontierOptions = {}): FrontierAdapte
       costUsd: event.costUsd,
       at: Date.now(),
       source: resultLabel === "frontier-escalate" ? "frontier-escalate" : "frontier-review",
+      // Mirrors engines/methods.ts's real onResult wiring: frontier cost is
+      // the provider's own reported figure, not a PRICING-table estimate.
+      pricingConfidence: event.costUsd !== null ? "verified" : "unpriced",
     });
   }
 
@@ -277,13 +304,31 @@ function makeFakeFrontierAdapter(opts: FakeFrontierOptions = {}): FrontierAdapte
       if (!isEscalation && opts.reviewSessionStarts !== undefined) {
         opts.reviewSessionStarts.count += 1;
       }
+      // M6 Task 1: resolved by THIS session's own close() below — the only
+      // teardown mechanism reachable for a review session opened outside
+      // engine.frontier.start (see blockReviewUntilClose's own doc comment
+      // on FakeFrontierOptions).
+      let resolveClosed: () => void = () => {};
+      const closed = new Promise<void>((resolve) => {
+        resolveClosed = resolve;
+      });
 
       return {
         id: randomUUID(),
         projectDir,
-        prompt(text: string): FrontierPromptHandle {
+        prompt(text: string, promptOpts?: { timeoutMs?: number }): FrontierPromptHandle {
+          if (!isEscalation && opts.blockReviewUntilClose === true) {
+            async function* gen(): AsyncGenerator<FrontierEvent> {
+              await closed;
+              // Ends without ever yielding a result event — mirrors a
+              // wedged review turn that never got to finish; the session
+              // was force-closed instead.
+            }
+            return { events: gen(), abort: () => {} };
+          }
           if (isEscalation) {
             opts.escalationPrompts?.push(text);
+            opts.escalationPromptOpts?.push(promptOpts ?? {});
             async function* gen(): AsyncGenerator<FrontierEvent> {
               if (opts.escalationWritesFile !== false) {
                 // Writes RELATIVE TO the `projectDir` this session was
@@ -312,6 +357,7 @@ function makeFakeFrontierAdapter(opts: FakeFrontierOptions = {}): FrontierAdapte
             return { events: gen(), abort: () => {} };
           }
 
+          opts.reviewPromptOpts?.push(promptOpts ?? {});
           const verdict = verdicts[Math.min(reviewIdx, verdicts.length - 1)] ?? {
             decision: "approve",
             reasons: [],
@@ -331,6 +377,8 @@ function makeFakeFrontierAdapter(opts: FakeFrontierOptions = {}): FrontierAdapte
         },
         async close(): Promise<void> {
           if (opts.closedSessions !== undefined) opts.closedSessions.count += 1;
+          if (!isEscalation && opts.reviewCloseSpy !== undefined) opts.reviewCloseSpy.count += 1;
+          resolveClosed();
         },
       };
     },
@@ -459,6 +507,26 @@ function captureWorkerTasks(e: Engine): string[] {
     return originalDispatch(message);
   }) as typeof e.dispatcher.dispatch;
   return tasks;
+}
+
+// M6 Task 2: same monkeypatch style as captureWorkerTasks above, but
+// captures the FULL engine.worker.run params (task AND wikiDigest) for each
+// dispatch — lets a test assert the harness's wiki page digests reach
+// engine.worker.run via its own `wikiDigest` param, distinctly from the
+// `task` string (which orchestrate.ts's buildWorkerTask still composes from
+// only agent.prompt + task + retry feedback — the digest travels alongside
+// it, not folded into it; see orchestrate.ts's own doc comment on why).
+function captureWorkerRunCalls(e: Engine): Array<{ task: string; wikiDigest?: string }> {
+  const calls: Array<{ task: string; wikiDigest?: string }> = [];
+  const originalDispatch = e.dispatcher.dispatch.bind(e.dispatcher);
+  e.dispatcher.dispatch = (async (message: unknown) => {
+    const req = message as { method?: string; params?: { task?: string; wikiDigest?: string } };
+    if (req.method === "engine.worker.run" && typeof req.params?.task === "string") {
+      calls.push({ task: req.params.task, wikiDigest: req.params.wikiDigest });
+    }
+    return originalDispatch(message);
+  }) as typeof e.dispatcher.dispatch;
+  return calls;
 }
 
 describe("engine.orchestrate — retry feedback", () => {
@@ -702,6 +770,249 @@ describe("engine.orchestrate — empty worker diff", () => {
   });
 });
 
+// M6 Task 2: without this, M6 would measure the harness WITHOUT its
+// headline value (distilled context for cheap models) — a worker attempt
+// that never sees a single wiki digest is functionally identical to one
+// with no harness at all. These tests pin that engine.orchestrate actually
+// forwards the loaded harness's own wiki page digests to engine.worker.run
+// (via its `wikiDigest` param — see orchestrate.ts's own doc comment on why
+// that param, not buildWorkerTask's task string, carries them), bounded so
+// a harness with many pages can't blow a cheap worker model's context.
+describe("engine.orchestrate — wiki digests in worker prompts (M6 Task 2)", () => {
+  const SENTINEL_DIGEST = "SENTINEL_DIGEST_7f3ac1: this project uses a custom widget architecture.";
+
+  it("forwards the harness's wiki page digest to engine.worker.run's wikiDigest param", async () => {
+    dir = makeRepo();
+    await writeTestHarness(dir, {
+      pages: [{ slug: "architecture", title: "Architecture", digest: SENTINEL_DIGEST, body: "# Architecture\n" }],
+    });
+    engine = createEngine();
+    engine.models.registry.configure({ id: "p1", kind: "deepseek", apiKey: TEST_API_KEY });
+    engine.models.registry.setTestModel("p1", makeWorkerMock("hello.txt", "hi", "done"));
+    engine.frontier.registerAdapter(
+      makeFakeFrontierAdapter({ reviewVerdicts: [{ decision: "approve", reasons: [], severity: "none" }] }),
+    );
+    const capturedRuns = captureWorkerRunCalls(engine);
+
+    const res = await call(engine, "engine.orchestrate", { projectDir: dir, task: "add hello.txt" });
+    expect(res.error).toBeUndefined();
+
+    expect(capturedRuns).toHaveLength(1);
+    expect(capturedRuns[0]!.wikiDigest).toContain(SENTINEL_DIGEST);
+    expect(capturedRuns[0]!.wikiDigest).toContain("## Project knowledge (from the harness wiki)");
+    expect(capturedRuns[0]!.wikiDigest).toContain("Architecture");
+    // The digest travels via its own param, not folded into the task text.
+    expect(capturedRuns[0]!.task).not.toContain(SENTINEL_DIGEST);
+  });
+
+  it("bounds the combined digest context and notes how many pages were truncated", async () => {
+    dir = makeRepo();
+    // 8 pages x 1200 chars (the schema's own per-digest max) = 9600 total,
+    // comfortably over the 8000-char cap -- forces truncation after the
+    // 6th page (6 x 1200 = 7200 <= 8000; a 7th would push to 8400).
+    const pages: WikiPage[] = Array.from({ length: 8 }, (_, i) => ({
+      slug: `page-${i + 1}`,
+      title: `Page ${i + 1}`,
+      digest: "X".repeat(1200),
+      body: `# Page ${i + 1}\n`,
+    }));
+    await writeTestHarness(dir, { pages });
+    engine = createEngine();
+    engine.models.registry.configure({ id: "p1", kind: "deepseek", apiKey: TEST_API_KEY });
+    engine.models.registry.setTestModel("p1", makeWorkerMock("hello.txt", "hi", "done"));
+    engine.frontier.registerAdapter(
+      makeFakeFrontierAdapter({ reviewVerdicts: [{ decision: "approve", reasons: [], severity: "none" }] }),
+    );
+    const capturedRuns = captureWorkerRunCalls(engine);
+
+    const res = await call(engine, "engine.orchestrate", { projectDir: dir, task: "add hello.txt" });
+    expect(res.error).toBeUndefined();
+
+    const wikiDigest = capturedRuns[0]!.wikiDigest!;
+    expect(wikiDigest).toContain("Page 1");
+    expect(wikiDigest).toContain("Page 6");
+    // Pages 7/8 didn't fit under the cap -- named as omitted, not silently
+    // dropped, and never included wholesale.
+    expect(wikiDigest).not.toContain("Page 7");
+    expect(wikiDigest).not.toContain("Page 8");
+    expect(wikiDigest.toLowerCase()).toContain("omitted");
+    expect(wikiDigest).toContain("2 more wiki page digest(s)");
+    expect(wikiDigest).toContain("8000 characters");
+  });
+});
+
+describe("engine.orchestrate — taskClass + review/escalate cost split (M6 Task 2)", () => {
+  it("result.taskClass matches the class routeTask actually picked", async () => {
+    dir = makeRepo();
+    await writeTestHarness(dir);
+    engine = createEngine();
+    engine.models.registry.configure({ id: "p1", kind: "deepseek", apiKey: TEST_API_KEY });
+    engine.models.registry.setTestModel("p1", makeWorkerMock("hello.txt", "hi", "done"));
+    engine.frontier.registerAdapter(
+      makeFakeFrontierAdapter({ reviewVerdicts: [{ decision: "approve", reasons: [], severity: "none" }] }),
+    );
+
+    const res = await call(engine, "engine.orchestrate", {
+      projectDir: dir,
+      task: "add hello.txt with a greeting",
+    });
+    expect(res.error).toBeUndefined();
+    // writeTestHarness's only routing.taskClasses entry is "codegen", and
+    // this task text matches no other keyword rule (no test/doc/refactor/
+    // fix mention) so classifyTask falls through to "codegen".
+    expect(res.result.taskClass).toBe("codegen");
+  });
+
+  it("cost.reviewUsd and cost.escalateUsd are populated separately and sum to frontierUsd", async () => {
+    dir = makeRepo();
+    // failuresBeforeFrontier: 1 -> exactly one worker attempt before
+    // escalation, so this run exercises BOTH a review call (rejecting that
+    // one attempt) and an escalation call, letting reviewUsd and
+    // escalateUsd each land a single, distinctly-priced cost.
+    await writeTestHarness(dir, { failuresBeforeFrontier: 1 });
+    engine = createEngine();
+    engine.models.registry.configure({ id: "p1", kind: "deepseek", apiKey: TEST_API_KEY });
+    engine.models.registry.setTestModel("p1", makeWorkerMock("attempt1.txt", "first try", "Attempt 1 summary"));
+    engine.frontier.registerAdapter(
+      makeFakeFrontierAdapter({
+        reviewVerdicts: [{ decision: "request-changes", reasons: ["nope"], severity: "minor" }],
+        reviewCostUsd: 0.05,
+        escalationCostUsd: 0.5,
+      }),
+    );
+
+    const res = await call(engine, "engine.orchestrate", { projectDir: dir, task: "improve the widget" });
+    expect(res.error).toBeUndefined();
+    const result = res.result;
+
+    expect(result.outcome).toBe("escalated");
+    expect(result.cost.reviewUsd).toBeCloseTo(0.05, 10);
+    expect(result.cost.escalateUsd).toBeCloseTo(0.5, 10);
+    expect(result.cost.frontierUsd).toBeCloseTo(result.cost.reviewUsd + result.cost.escalateUsd, 10);
+    expect(result.cost.totalUsd).toBeCloseTo(result.cost.workerUsd + result.cost.frontierUsd, 10);
+  });
+});
+
+// M6 Task 1 review round 1, Fix 1 (Important — the substantive one):
+// reviewTimeoutMs/workerTimeoutMs had NO default. An RPC caller omitting
+// reviewTimeoutMs left the review/escalation frontier call UNBOUNDED — and
+// under the stdin-close shutdown path (main.ts: abortAll -> pipeline.drain
+// -> engine.close), drain() waits on THIS in-flight orchestrate call before
+// close() can ever reap the direct frontier session it opened, so a wedged
+// REAL review/escalation could hang an entire eval batch. Since the real
+// Claude adapter now ENFORCES opts.timeoutMs (M6 Task 1 Change A), giving
+// orchestrate its own default deadline is what makes every sub-call here
+// self-bounding regardless of what a caller passes (or omits). These tests
+// assert the DEFAULT (not `undefined`) reaches the fake frontier session's
+// prompt() call whenever the RPC caller leaves the corresponding param out.
+//
+// Mirrors worker/methods.ts's own DEFAULT_RUN_TIMEOUT_MS convention: the
+// default constants live in orchestrate.ts as internal, unexported consts,
+// so the literal values below (300_000 / 600_000) are asserted directly
+// rather than imported.
+const DEFAULT_REVIEW_TIMEOUT_MS = 300_000;
+const DEFAULT_ESCALATE_TIMEOUT_MS = 600_000;
+
+describe("engine.orchestrate — default deadlines (Fix 1, review round 1)", () => {
+  it("omitted reviewTimeoutMs still passes a bounded timeoutMs to the review session's prompt", async () => {
+    dir = makeRepo();
+    await writeTestHarness(dir);
+    engine = createEngine();
+    engine.models.registry.configure({ id: "p1", kind: "deepseek", apiKey: TEST_API_KEY });
+    engine.models.registry.setTestModel("p1", makeWorkerMock("hello.txt", "HELLO FROM WORKER", "Created hello.txt"));
+    const reviewPromptOpts: Array<{ timeoutMs?: number }> = [];
+    engine.frontier.registerAdapter(
+      makeFakeFrontierAdapter({
+        reviewVerdicts: [{ decision: "approve", reasons: [], severity: "none" }],
+        reviewPromptOpts,
+      }),
+    );
+
+    const res = await call(engine, "engine.orchestrate", {
+      projectDir: dir,
+      task: "add hello.txt with a greeting",
+      // reviewTimeoutMs deliberately OMITTED.
+    });
+    expect(res.error).toBeUndefined();
+
+    expect(reviewPromptOpts).toHaveLength(1);
+    expect(reviewPromptOpts[0]!.timeoutMs).toBe(DEFAULT_REVIEW_TIMEOUT_MS);
+  });
+
+  it("omitted reviewTimeoutMs still passes a bounded timeoutMs to the escalation session's prompt", async () => {
+    dir = makeRepo();
+    const headSha = git(dir, "rev-parse", "HEAD");
+    const agent: AgentDef = {
+      name: "frontier-agent",
+      role: "worker",
+      description: "Frontier-only agent.",
+      prompt: "You handle everything directly.",
+      taskClasses: ["codegen"],
+      model: "frontier",
+      escalation: { maxAttempts: 2 },
+    };
+    const routing: Routing = {
+      version: 1,
+      taskClasses: { codegen: { agent: "frontier-agent" } },
+      escalation: { failuresBeforeFrontier: 2 },
+      defaults: { agent: "frontier-agent" },
+    };
+    const bundle: HarnessBundle = {
+      manifest: {
+        schemaVersion: 1,
+        generatorVersion: "0.0.1",
+        engine: "claude-code",
+        headSha,
+        generatedAt: new Date().toISOString(),
+        verification: { structural: "pass", evals: "pending" },
+        artifacts: [],
+      },
+      pages: [TRIVIAL_PAGE],
+      agents: [agent],
+      routing,
+    };
+    await writeHarness(dir, bundle);
+
+    engine = createEngine();
+    const escalationPromptOpts: Array<{ timeoutMs?: number }> = [];
+    engine.frontier.registerAdapter(makeFakeFrontierAdapter({ escalationPromptOpts }));
+
+    const res = await call(engine, "engine.orchestrate", {
+      projectDir: dir,
+      task: "do everything",
+      // reviewTimeoutMs deliberately OMITTED.
+    });
+    expect(res.error).toBeUndefined();
+
+    expect(escalationPromptOpts).toHaveLength(1);
+    expect(escalationPromptOpts[0]!.timeoutMs).toBe(DEFAULT_ESCALATE_TIMEOUT_MS);
+  });
+
+  it("an explicit reviewTimeoutMs is still honored verbatim for both review and escalation", async () => {
+    dir = makeRepo();
+    await writeTestHarness(dir, { failuresBeforeFrontier: 1 });
+    engine = createEngine();
+    engine.models.registry.configure({ id: "p1", kind: "deepseek", apiKey: TEST_API_KEY });
+    engine.models.registry.setTestModel("p1", makeEmptyWorkerMock("nothing to change"));
+    const reviewPromptOpts: Array<{ timeoutMs?: number }> = [];
+    const escalationPromptOpts: Array<{ timeoutMs?: number }> = [];
+    engine.frontier.registerAdapter(
+      makeFakeFrontierAdapter({ reviewPromptOpts, escalationPromptOpts, escalationWritesFile: false }),
+    );
+
+    const res = await call(engine, "engine.orchestrate", {
+      projectDir: dir,
+      task: "improve the widget",
+      reviewTimeoutMs: 12_345,
+    });
+    expect(res.error).toBeUndefined();
+
+    // Empty worker diff never reaches review — only escalation's prompt runs.
+    expect(escalationPromptOpts).toHaveLength(1);
+    expect(escalationPromptOpts[0]!.timeoutMs).toBe(12_345);
+  });
+});
+
 describe("engine.orchestrate — guard failures", () => {
   it("no harness -> SERVER_ERROR", async () => {
     dir = makeRepo();
@@ -829,6 +1140,66 @@ describe("engine.orchestrate — failure semantics", () => {
     expect(worktrees).toHaveLength(1);
     expect(path.resolve(worktrees[0]!.path)).toBe(path.resolve(worktreePath));
   });
+});
+
+// M6 Task 1 (eval-batch safety gate): the review session orchestrate.ts
+// opens for the frontier-review gate is created DIRECTLY off the registered
+// adapter (adapter.createSession), bypassing engine.frontier.start entirely
+// — so it never lands in FrontierService's addressable #sessions map, and
+// before this fix Engine.close() had no way to reach it at all. A wedged
+// real review turn would therefore survive engine.close() outright, letting
+// an eval batch of N real orchestrate loops hang on one stuck review. Fixed
+// by FrontierService.track()/untrack (engines/methods.ts) — orchestrate.ts
+// tracks its review (and escalation) session on create and untracks it in
+// the same `finally` where it closes the session.
+describe("engine.orchestrate — in-flight review + engine.close() (Task 1 Change B)", () => {
+  it("engine.close() resolves within a bounded time and closes the in-flight review session", async () => {
+    dir = makeRepo();
+    await writeTestHarness(dir);
+    engine = createEngine();
+    engine.models.registry.configure({ id: "p1", kind: "deepseek", apiKey: TEST_API_KEY });
+    engine.models.registry.setTestModel("p1", makeWorkerMock("hello.txt", "HELLO FROM WORKER", "Created hello.txt"));
+    const reviewSessionStarts = { count: 0 };
+    const reviewCloseSpy = { count: 0 };
+    engine.frontier.registerAdapter(
+      makeFakeFrontierAdapter({
+        blockReviewUntilClose: true,
+        reviewSessionStarts,
+        reviewCloseSpy,
+      }),
+    );
+
+    const orchestratePromise = call(engine, "engine.orchestrate", {
+      projectDir: dir,
+      task: "add hello.txt with a greeting",
+    });
+
+    // Wait for the worker attempt to finish and the review session to
+    // actually start (its prompt() is now blocked awaiting close()) before
+    // racing engine.close() against it — polled rather than a flat sleep so
+    // this isn't sensitive to how long the real worktree/worker machinery
+    // takes under load.
+    const deadline = Date.now() + 10_000;
+    while (reviewSessionStarts.count < 1) {
+      if (Date.now() > deadline) throw new Error("review session never started");
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+
+    const start = Date.now();
+    await engine.close();
+    const elapsed = Date.now() - start;
+
+    // Generous bound per the task brief's own flake-avoidance guidance.
+    expect(elapsed).toBeLessThan(3_000);
+    expect(reviewCloseSpy.count).toBe(1);
+
+    const res = await orchestratePromise;
+    // The blocked review session never produced a result event once
+    // close() ended its (still-open) generator — reviewDiff/promptForJson
+    // sees the turn end without schema-valid JSON, which orchestrate.ts
+    // surfaces as a SERVER_ERROR, not a hang.
+    expect(res.error).toBeDefined();
+  }, 15_000);
 });
 
 describe("engine.orchestrate.apply", () => {

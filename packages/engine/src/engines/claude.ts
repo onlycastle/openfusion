@@ -257,20 +257,24 @@ export function createClaudeAdapter(options: CreateClaudeAdapterOptions = {}): F
         id,
         projectDir,
 
-        // M3 final review, Minor 7: this used to also arm its own
-        // `setTimeout(opts.timeoutMs)` here, racing a second independent
-        // timer against engine.frontier.prompt's RPC-level one over the same
-        // deadline (see methods.ts's timeoutPromise) — a review finding from
-        // an earlier round (see docs/superpowers/sdd/m3-task-4-report.md,
-        // "Fix 1 / Finding 1") already made the RPC layer the single
-        // timeout authority and stopped forwarding `opts.timeoutMs` into
-        // this call. That left this branch unreachable dead code; removed
-        // outright rather than left dormant. `opts` (still part of the
-        // FrontierSession contract in types.ts, for any other future caller)
-        // is consequently unused here and dropped from this implementation —
-        // TS structurally allows implementing a method with fewer parameters
-        // than its interface declares.
-        prompt(text): FrontierPromptHandle {
+        // M6 Task 1 (eval-batch safety gate): `opts.timeoutMs` is enforced
+        // again here. It was dropped in M3 final review (Minor 7) when the
+        // RPC layer (methods.ts's engine.frontier.prompt) became the single
+        // timeout authority — forwarding opts.timeoutMs from there too would
+        // have raced two independent timers over the same deadline. That RPC
+        // layer STILL deliberately never forwards its own timeoutMs
+        // (methods.ts's "Deliberately NOT forwarding params.timeoutMs" —
+        // unchanged), so this stays dormant for engine.frontier.prompt
+        // callers specifically. But M5b threaded a PER-ATTEMPT timeoutMs
+        // straight into THIS call from two paths that bypass the RPC prompt
+        // handler entirely — harness/driver.ts's promptForJson (used by
+        // harness/generate.ts and orchestrate/review.ts) and orchestrate.ts's
+        // own escalation turn (runFrontierTurn) — and against the real
+        // adapter it was a silent no-op: a wedged real review/escalate/
+        // generate turn could hang an eval batch of N orchestrate loops
+        // forever on one stuck prompt. `opts` is therefore back in this
+        // method's signature.
+        prompt(text, opts): FrontierPromptHandle {
           const abortController = new AbortController();
 
           const q = queryFn({
@@ -311,52 +315,159 @@ export function createClaudeAdapter(options: CreateClaudeAdapterOptions = {}): F
           });
           activeQuery = q;
 
+          // Combined with the existing per-prompt abortController via
+          // AbortSignal.any (mirrors worker/methods.ts's own combinator: a
+          // timeoutSignal and a separately-triggerable controller/signal
+          // merged into ONE thing the operation reacts to). Either source
+          // firing runs the SAME teardown — abort the query's own
+          // abortController (the existing graceful-cancellation mechanism,
+          // same as `abort()` below) AND force-close the Query (kills the
+          // CLI subprocess outright, per Query#close's own SDK doc comment —
+          // see this session's close() method below), so a wedged real
+          // process can't outlive its budget merely by ignoring the graceful
+          // abort. `timedOut` (checked by mapEvents below) is set true only
+          // when the TIMEOUT specifically fired — not a plain manual abort —
+          // so a caller-initiated `abort()` keeps its existing, unlabeled
+          // ending instead of being misreported as a timeout.
+          let timedOut = false;
+          // `timeoutRejection`, when armed, is raced against every
+          // `q.next()` call below — NOT merely "wait for the query to
+          // notice it was aborted and stop on its own". A truly wedged
+          // subprocess might never react to abortController.abort() (that's
+          // exactly the failure mode this task closes), so the race is what
+          // actually bounds how long a caller can be kept waiting,
+          // independent of the adapter's own cooperation.
+          let timeoutRejection: Promise<never> | undefined;
+          // Fix 2 (M6 Task 1 review round 1 — hygiene): set alongside
+          // timeoutRejection when a deadline is armed; calling it tears the
+          // combinedSignal "abort" listener down. Without this, a prompt
+          // that finishes (or is manually aborted) BEFORE opts.timeoutMs
+          // elapses left that listener registered — and the underlying
+          // AbortSignal.timeout timer running — until the ORIGINAL deadline
+          // eventually fired on a stale abortController/query this call no
+          // longer owns. Harmless in practice today (the timer is unref'd;
+          // q.close() is idempotent; the listener already has `{ once: true
+          // }` so it can only ever fire once), but inconsistent with this
+          // codebase's own pattern elsewhere of tearing a timeout down in a
+          // `finally` (worker/methods.ts, models/methods.ts's
+          // `clearTimeout(timer)`) — this closes the same gap here. Calling
+          // it AFTER the listener already fired (the genuinely-wedged path)
+          // is just a no-op removeEventListener, so this can never weaken
+          // the wedged-query timeout guarantee itself.
+          let removeTimeoutListener: (() => void) | undefined;
+          if (opts?.timeoutMs !== undefined) {
+            const timeoutSignal = AbortSignal.timeout(opts.timeoutMs);
+            const combinedSignal = AbortSignal.any([timeoutSignal, abortController.signal]);
+            timeoutRejection = new Promise<never>((_resolve, reject) => {
+              const onTimeoutSignal = (): void => {
+                timedOut = timeoutSignal.aborted;
+                abortController.abort();
+                q.close();
+                if (timedOut) {
+                  reject(new Error("prompt timed out"));
+                }
+                // A manual (non-timeout) abort while timeoutMs is set:
+                // leave this promise permanently pending — the iteration
+                // loop below ends on its own once the (now-aborted)
+                // query's iterator stops, exactly as it did before this
+                // task, and nothing re-checks this promise afterward.
+              };
+              combinedSignal.addEventListener("abort", onTimeoutSignal, { once: true });
+              removeTimeoutListener = () => combinedSignal.removeEventListener("abort", onTimeoutSignal);
+            });
+          }
+
           async function* mapEvents(): AsyncGenerator<FrontierEvent> {
             // Prompt text and every streamed message body are user/model
             // content — never pass them to `log`. Only lifecycle facts
             // (nothing here) would be safe; this loop logs nothing.
-            for await (const message of q) {
-              if (message.type === "assistant") {
-                // Rate-limit visibility (M3 inherit #2): an API-error tag on
-                // an assistant message is not terminal — it's a mid-turn
-                // notice, so mapping it here and letting the loop fall
-                // through to the message's (likely empty, but not assumed
-                // so) content blocks below is deliberate; the RPC layer
-                // streams `notice` like any other event, with no special
-                // handling (methods.ts's prompt loop is event-type-agnostic).
-                if (message.error !== undefined) {
-                  yield mapAssistantError(message.error);
-                }
-                for (const block of message.message.content) {
-                  if (block.type === "text") {
-                    yield { type: "text", text: block.text };
-                  } else if (block.type === "tool_use") {
-                    yield {
-                      type: "tool_use",
-                      name: block.name,
-                      summary: JSON.stringify(block.input).slice(0, 200),
-                    };
+            //
+            // Fix 3 (M6 Task 1 review round 1 — comment): this manual
+            // `while`/`q.next()` loop does NOT auto-propagate an early
+            // consumer exit down to `q` the way a nested `for await...of q`
+            // would have (that propagation is a language-level behavior of
+            // `for await...of` calling the ITERATED object's own
+            // `.return()` — a manually-driven `q.next()` loop has no such
+            // hook). Every current consumer of `handle.events`
+            // (harness/driver.ts, engines/methods.ts, orchestrate.ts) always
+            // calls `handle.abort()` explicitly on early exit/catch, which is
+            // what actually aborts `abortController` and closes `q` — so
+            // this is inert today. A FUTURE consumer that merely `break`s
+            // out of (or throws out of) its `for await (const event of
+            // handle.events)` loop WITHOUT calling `handle.abort()` would
+            // silently leak the underlying query/subprocess. Don't
+            // reintroduce that leak — call `handle.abort()` on early exit.
+            try {
+              while (true) {
+                const nextPromise = q.next();
+                // Swallow a rejection this promise may settle with LATER, if
+                // it loses the race below (the timeout won instead) —
+                // without this, an eventual reject from an abandoned promise
+                // with no attached handler would surface as an unhandled
+                // rejection. Attaching .catch() here (even though its own
+                // returned promise is discarded) is enough for Node to
+                // consider the ORIGINAL promise handled; the race below
+                // still resolves/rejects off that same original promise when
+                // it settles first.
+                nextPromise.catch(() => {});
+                const result =
+                  timeoutRejection !== undefined
+                    ? await Promise.race([nextPromise, timeoutRejection])
+                    : await nextPromise;
+                if (result.done === true) return;
+                const message = result.value;
+                if (message.type === "assistant") {
+                  // Rate-limit visibility (M3 inherit #2): an API-error tag
+                  // on an assistant message is not terminal — it's a
+                  // mid-turn notice, so mapping it here and letting the loop
+                  // fall through to the message's (likely empty, but not
+                  // assumed so) content blocks below is deliberate; the RPC
+                  // layer streams `notice` like any other event, with no
+                  // special handling (methods.ts's prompt loop is
+                  // event-type-agnostic).
+                  if (message.error !== undefined) {
+                    yield mapAssistantError(message.error);
                   }
+                  for (const block of message.message.content) {
+                    if (block.type === "text") {
+                      yield { type: "text", text: block.text };
+                    } else if (block.type === "tool_use") {
+                      yield {
+                        type: "tool_use",
+                        name: block.name,
+                        summary: JSON.stringify(block.input).slice(0, 200),
+                      };
+                    }
+                  }
+                } else if (message.type === "result") {
+                  resumeSessionId = message.session_id;
+                  const usage = {
+                    inputTokens: message.usage.input_tokens,
+                    outputTokens: message.usage.output_tokens,
+                    cacheReadTokens: message.usage.cache_read_input_tokens,
+                  };
+                  const resultEvent: FrontierResultEvent = {
+                    type: "result",
+                    resultText: message.subtype === "success" ? message.result : message.errors.join("; "),
+                    costUsd: message.total_cost_usd,
+                    usage,
+                    numTurns: message.num_turns,
+                    durationMs: message.duration_ms,
+                    engineSessionId: message.session_id,
+                  };
+                  onResult?.(resultEvent, dominantModel(message.modelUsage), resultLabel);
+                  yield resultEvent;
                 }
-              } else if (message.type === "result") {
-                resumeSessionId = message.session_id;
-                const usage = {
-                  inputTokens: message.usage.input_tokens,
-                  outputTokens: message.usage.output_tokens,
-                  cacheReadTokens: message.usage.cache_read_input_tokens,
-                };
-                const resultEvent: FrontierResultEvent = {
-                  type: "result",
-                  resultText: message.subtype === "success" ? message.result : message.errors.join("; "),
-                  costUsd: message.total_cost_usd,
-                  usage,
-                  numTurns: message.num_turns,
-                  durationMs: message.duration_ms,
-                  engineSessionId: message.session_id,
-                };
-                onResult?.(resultEvent, dominantModel(message.modelUsage), resultLabel);
-                yield resultEvent;
               }
+            } finally {
+              // Fix 2: torn down on EVERY exit from this loop — normal
+              // completion (the `return` above), an early consumer exit
+              // (Fix 3's own doc comment — a `.return()`/`.throw()` on this
+              // generator resumes here), or the timed-out rejection
+              // propagating out of the `await` above. See
+              // removeTimeoutListener's own doc comment for why this can
+              // never weaken the wedged-query guarantee.
+              removeTimeoutListener?.();
             }
           }
 

@@ -119,6 +119,22 @@ export class FrontierService {
   #sessions = new Map<string, SessionEntry>();
   #inFlight = new Set<string>();
   #activeHandles = new Map<string, FrontierPromptHandle>();
+  // M6 Task 1 (eval-batch safety gate): EVERY live frontier session this
+  // service knows about, regardless of whether it's addressable via an
+  // engine.frontier.start sessionId (#sessions above) or was created
+  // DIRECTLY by a caller that bypasses the RPC surface entirely — harness
+  // generation (harness/generate.ts) and orchestrate's review/escalation
+  // sessions (orchestrate/orchestrate.ts) both open a FrontierSession
+  // straight off the registered adapter (engine.frontier.getAdapter) so
+  // reviewDiff/promptForJson/runFrontierTurn can drive session.prompt()
+  // themselves — those sessions never get a sessionId and never touched
+  // #sessions before this Set existed, so close() couldn't reach them: a
+  // wedged generation/review/escalation session would survive Engine.close()
+  // outright, letting one stuck real review hang an entire eval batch of
+  // orchestrate loops. ONE tracking path: addSession (below) adds to this
+  // SAME Set rather than a second bookkeeping mechanism, so close() only
+  // ever needs to sweep it once.
+  #tracked = new Set<FrontierSession>();
 
   registerAdapter(adapter: FrontierAdapter): void {
     this.#adapters.set(adapter.kind, adapter);
@@ -128,8 +144,36 @@ export class FrontierService {
     return this.#adapters.get(kind);
   }
 
+  // Registers ANY live FrontierSession for close()-time reachability,
+  // independent of whether it ever gets an RPC-addressable sessionId (see
+  // #tracked's own doc comment above). Returns an untrack fn the caller MUST
+  // invoke once it closes the session itself — typically in the same
+  // `finally` right after `await session.close()` — otherwise the entry
+  // would live in #tracked forever and a later close() would try to close an
+  // already-closed session a second time (harmless, since every close() call
+  // here is try/catch-isolated, but still a needless double-close and a
+  // permanent bookkeeping leak).
+  track(session: FrontierSession): () => void {
+    this.#tracked.add(session);
+    return () => {
+      this.#tracked.delete(session);
+    };
+  }
+
+  // Testability + operational visibility: how many sessions are currently
+  // tracked for close()-time reachability (both addressable and direct). Not
+  // consumed by any RPC method itself.
+  trackedCount(): number {
+    return this.#tracked.size;
+  }
+
   addSession(sessionId: string, entry: SessionEntry): void {
     this.#sessions.set(sessionId, entry);
+    // Reuses the SAME #tracked Set track() populates (see its doc comment) —
+    // engine.frontier.start's own sessions are the "already tracks" case the
+    // task brief calls out; this keeps them on the ONE tracking path rather
+    // than a parallel mechanism close() would need to sweep separately.
+    this.#tracked.add(entry.session);
   }
 
   getSession(sessionId: string): SessionEntry | undefined {
@@ -179,6 +223,7 @@ export class FrontierService {
     const entry = this.#sessions.get(sessionId);
     if (entry === undefined) return false;
     this.#sessions.delete(sessionId);
+    this.#tracked.delete(entry.session);
     this.#inFlight.delete(sessionId);
     const activeHandle = this.#activeHandles.get(sessionId);
     this.#activeHandles.delete(sessionId);
@@ -208,6 +253,7 @@ export class FrontierService {
   async close(): Promise<void> {
     for (const [sessionId, entry] of [...this.#sessions.entries()]) {
       this.#sessions.delete(sessionId);
+      this.#tracked.delete(entry.session);
       this.#inFlight.delete(sessionId);
       const activeHandle = this.#activeHandles.get(sessionId);
       this.#activeHandles.delete(sessionId);
@@ -220,6 +266,23 @@ export class FrontierService {
         // frontier.close() before wiki.close() — must not skip wiki
         // teardown either. Mirrors WikiService.close()'s per-resource
         // isolation.
+      }
+    }
+    // M6 Task 1: sweep any sessions tracked directly via track() that were
+    // NOT addressable through #sessions above — harness generation and
+    // orchestrate's review/escalation sessions land here. There is no
+    // sessionId and no active-handle bookkeeping for them (their prompt()
+    // calls are driven in-process by their own creating code, never through
+    // engine.frontier.prompt), so session.close() is the only teardown
+    // available — which, per the FrontierSession contract (engines/types.ts,
+    // "must kill any subprocess"), is exactly what unblocks whatever
+    // in-process caller is still awaiting that session's current prompt().
+    for (const session of [...this.#tracked]) {
+      this.#tracked.delete(session);
+      try {
+        await session.close();
+      } catch {
+        // Best-effort, same per-session isolation as the sweep above.
       }
     }
   }
@@ -253,6 +316,20 @@ export function registerFrontierMethods(engine: Engine): void {
           // mapResultLabelToSource's own doc comment above for the full
           // label -> source table.
           source: mapResultLabelToSource(resultLabel),
+          // Frontier cost is never a PRICING-table estimate — it's the
+          // dollar figure the Claude Code CLI itself reports for the turn
+          // (message.total_cost_usd, threaded through as result.costUsd by
+          // claude.ts). That is the provider's own ground truth, so
+          // "provider-reported" reflects its distinct provenance (the literal
+          // amount billed) vs our sourced pricing table. It ranks equal to
+          // "verified" (both rank 3) so a meter mixing frontier provider-reported
+          // + verified-table costs stays at top confidence, while the label
+          // remains distinct for the report card to display provenance.
+          // The null case (an adapter that can't report a cost at all — no such
+          // path exists for claude-code today, but the FrontierEvent type allows
+          // it for a future engine) is "unpriced", matching the models.complete/worker
+          // rule of "no cost figure at all" -> "unpriced".
+          pricingConfidence: result.costUsd !== null ? "provider-reported" : "unpriced",
         });
       },
     }),

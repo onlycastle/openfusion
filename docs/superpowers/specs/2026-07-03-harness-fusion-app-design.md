@@ -145,11 +145,39 @@ crash mid-run needs an explicit sweep.
 
 ## 6. Eval Loop
 
-After generation (and after major refreshes), run micro-evals
-baseline-vs-harness. A harness that degrades quality is flagged, not
-silently deployed. The Harness editor exists because human-corrected context
-demonstrably outperforms purely generated context. GEPA-style automated
-harness optimization is explicitly deferred past v1.
+After generation (and after major refreshes), run micro-evals baseline-vs-harness.
+The loop (realized in M6) works as follows:
+
+1. Per task, create two isolated scratch directories seeded via the task's own
+   setup() method (at the pre-change state — golden tasks mined from repo history,
+   or synthetic fixtures for CI smoke).
+2. **Baseline:** open a direct frontier session with no wiki and no harness routing,
+   write-scoped to one directory. Let it solve the task directly. Oracle-score the result.
+3. **Harness:** run the full `engine.orchestrate` loop (classify → route → worker attempts →
+   review → escalate) against the second directory, which has the harness bundle copied
+   in but otherwise starts from the same pre-change state. Apply the returned diff and
+   oracle-score the result.
+4. Compare pass/fail counts and costs (both routes work each task from identical base
+   state, scored by identical oracle). Verdicts:
+   - **pass** if quality held, savings > 0, and sample size ≥ 5 tasks (credible: 20–50);
+     manifest flips to verified.
+   - **fail** if harness *degraded* quality on the clean subset (no measurement failures);
+     ETH hazard, never shipped. This check deliberately ignores the ≥5-task sample-size
+     floor below: a quality regression is worth flagging even on a small run, since it
+     only ever blocks a claim, never inflates one.
+   - **inconclusive** if too few tasks, unpriced, baseline solved zero, or ≥20% measurement
+     failures (infra hiccups, apply mismatches — run too corrupted for "pass" or "fail").
+5. Cost figures are estimate-class (directional) and carry `pricingConfidence` (worst
+   across the run); an unpriced model taints to inconclusive.
+
+Known residual biases (documented, not corrected in v1): eval harness runs lack the wiki
+MCP server (biases against), and golden-task bundles are generated at HEAD (biases toward
+on those tasks only). Eval integrity assumes non-adversarial workers; full process
+sandboxing deferred to M7.
+
+A harness that degrades quality is flagged, not silently deployed. The Harness editor
+exists because human-corrected context demonstrably outperforms purely generated context.
+GEPA-style automated harness optimization is explicitly deferred past v1.
 
 ## 7. UX Surfaces (five screens)
 
@@ -231,6 +259,30 @@ built-in editor.
    measured rather than assumed; until then, review-gate quality — and by
    extension the savings claim — is UNVERIFIED, same status as the harness
    itself.
+8. **v1 savings numbers are estimate-class and bounded by pricing confidence.**
+   Cost figures are computed from the pricing table and reported token usage,
+   not a billed amount; they are directional, not precise. The `pricingConfidence`
+   field (verified/provider-reported/secondary/unverified/unpriced — worst across
+   the run) taints the savings claim: an unpriced model → no savings number → inconclusive
+   verdict. A real claim requires 20–50 paired tasks (v1 CI uses synthetic fixtures
+   for mechanics; an operator smoke over golden tasks verifies a real project).
+   Documented residual biases (both directions): eval harness runs lack wiki MCP
+   server (biases against), and golden-task bundles generated at HEAD (biases toward
+   on those tasks). Treat v1 savings as directional; a measured "pass" understates
+   what a deployment with full wiki access would measure.
+9. **v1 golden-task construction requires fail-to-pass on a pre-existing test.**
+   Golden tasks are commits mined from repo history (a bugfix or feature that added
+   code); the task is "make the tests pass" — oracle is the pre-existing test that
+   was failing before the commit, now passing after. Commits that added both code
+   and tests together are explicitly out of v1 scope (would require synthesizing a
+   new oracle after the fact, not reusing a pre-existing one); such commits
+   contribute only synthetic fixture tasks, not golden ones.
+10. **Eval integrity against an adversarial worker is deferred to M7.**
+    Full process-level sandbox (preventing raw filesystem reads or git-fetching the
+    parent repo) is required to defend against a worker deliberately trying to reach
+    outside its scratch directory. v1 assumes a non-adversarial worker and places eval
+    scratch directories under `os.tmpdir()`, isolated from the project being evaluated
+    but not defended against deliberate escape.
 
 ## Appendix: Research Summary
 

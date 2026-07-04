@@ -274,6 +274,14 @@ export async function generateHarness(engine: Engine, projectDir: string): Promi
     // models/meter.ts's UsageSource doc comment).
     resultLabel: "frontier-generate",
   });
+  // M6 Task 1 (eval-batch safety gate): this session is created DIRECTLY off
+  // the registered adapter, bypassing engine.frontier.start entirely — it
+  // never gets a sessionId and never touches FrontierService's own
+  // #sessions bookkeeping, so Engine.close() had no way to reach (and
+  // force-kill) it before this fix. track() registers it for close()-time
+  // reachability; the returned untrack fn is called in the same `finally`
+  // below where the session is actually closed.
+  const untrackSession = engine.frontier.track(session);
 
   try {
     let costUsd: number | null = null;
@@ -382,5 +390,6 @@ export async function generateHarness(engine: Engine, projectDir: string): Promi
       // isolation (engines/methods.ts): a throwing adapter close() must
       // never mask the pipeline's actual success/failure outcome.
     });
+    untrackSession();
   }
 }

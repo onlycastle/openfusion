@@ -220,6 +220,7 @@ export function registerWorkerMethods(engine: Engine): void {
 
       const pricing = lookupPricing(kind, params.model);
       const costUsd = pricing !== null ? estimateCostUsd(pricing, loopResult.usage) : null;
+      const pricingConfidence = pricing !== null ? pricing.confidence : "unpriced";
 
       // Metered under the PROVIDER kind (e.g. "deepseek", "zai"), NOT a
       // synthetic "worker/..." kind — pricing.ts's table is keyed by provider
@@ -237,6 +238,7 @@ export function registerWorkerMethods(engine: Engine): void {
         costUsd,
         at: Date.now(),
         source: "worker",
+        pricingConfidence,
       });
 
       engine.log(

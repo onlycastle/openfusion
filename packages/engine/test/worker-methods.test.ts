@@ -170,6 +170,9 @@ describe("engine.worker.run", () => {
       outputTokens: 80,
       costUsd: usage.result.byModel["deepseek/deepseek-v4-flash"].costUsd,
     });
+    // M6 Task 0: deepseek-v4-flash is a verified PRICING entry, so the
+    // ledger-wide worst-of confidence is "verified" too.
+    expect(usage.result.pricingConfidence).toBe("verified");
   });
 
   it("emits worker.progress notifications for both tool and step events", async () => {
@@ -470,8 +473,25 @@ describe("engine.worker.run", () => {
     });
 
     // Let the run actually start (worktree created, controller registered
-    // with WorkerService) before racing engine.close() against it.
-    await new Promise((r) => setTimeout(r, 50));
+    // with WorkerService) before racing engine.close() against it. Polled
+    // (via the real engine.worker.list RPC, not a fixed sleep) rather than
+    // guessing a fixed delay: `manager.create()`'s own `git worktree add`
+    // is a real subprocess spawn whose wall-clock time is NOT bounded by a
+    // small constant under a loaded machine (M6 Task 4: observed this fixed
+    // 50ms wait let engine.close() race ahead of `beginRun()` registering
+    // its controller often enough, under a heavily parallel full-suite run,
+    // that the hanging mock's promise never got aborted at all -- the test
+    // would then hang until ITS OWN timeout, no matter how generous, since
+    // the abort event that was supposed to end it never fired). Mirrors
+    // orchestrate.test.ts's own "in-flight review + engine.close()" test's
+    // identical poll-until-started pattern, for the same reason.
+    const startDeadline = Date.now() + 10_000;
+    for (;;) {
+      const listRes = await call(engine, "engine.worker.list", { projectDir: dir });
+      if ((listRes.result?.worktrees?.length ?? 0) > 0) break;
+      if (Date.now() > startDeadline) throw new Error("worker run never created its worktree");
+      await new Promise((r) => setTimeout(r, 10));
+    }
 
     const closeStart = Date.now();
     await engine.close();
@@ -486,7 +506,7 @@ describe("engine.worker.run", () => {
     expect(res.error.message).toContain("aborted");
     // afterEach calls engine.close() again -- must be harmless once the
     // in-flight set this test emptied out is already empty.
-  });
+  }, 15_000);
 });
 
 // M5b Task 5: the worktree lifecycle policy's discovery (list) and sweep

@@ -25,7 +25,7 @@ vi.mock("node:fs/promises", async (importOriginal) => {
   };
 });
 
-const { harnessDir, harnessStatus, loadHarness, writeHarness, HarnessValidationError } = await import(
+const { harnessDir, harnessStatus, loadHarness, writeHarness, setEvalsVerdict, HarnessValidationError } = await import(
   "../src/harness/store.js"
 );
 
@@ -517,5 +517,46 @@ describe("harnessStatus", () => {
       evals: "fail",
       headSha: "abc123",
     });
+  });
+});
+
+describe("setEvalsVerdict", () => {
+  it("updates ONLY manifest.verification.evals, preserving structural + artifacts + every other field", async () => {
+    makeDir();
+    const bundle = validBundle();
+    await writeHarness(dir, bundle);
+    const before = JSON.parse(readFileSync(path.join(dir, ".openfusion/manifest.json"), "utf8")) as Manifest;
+    expect(before.verification).toEqual({ structural: "pass", evals: "pending" });
+
+    await setEvalsVerdict(dir, "pass");
+
+    const after = JSON.parse(readFileSync(path.join(dir, ".openfusion/manifest.json"), "utf8")) as Manifest;
+    expect(after.verification).toEqual({ structural: "pass", evals: "pass" });
+    expect(after.artifacts).toEqual(before.artifacts);
+    expect(after.headSha).toBe(before.headSha);
+    expect(after.generatedAt).toBe(before.generatedAt);
+    expect(after.schemaVersion).toBe(before.schemaVersion);
+    expect(after.generatorVersion).toBe(before.generatorVersion);
+    expect(after.engine).toBe(before.engine);
+
+    // Only manifest.json was touched -- every wiki/agent/routing file this
+    // generation wrote is untouched (still present, still readable).
+    expect(loadHarness(dir)).not.toBeNull();
+  });
+
+  it("flips to 'fail' and back to 'pending'", async () => {
+    makeDir();
+    await writeHarness(dir, validBundle());
+
+    await setEvalsVerdict(dir, "fail");
+    expect(harnessStatus(dir).evals).toBe("fail");
+
+    await setEvalsVerdict(dir, "pending");
+    expect(harnessStatus(dir).evals).toBe("pending");
+  });
+
+  it("throws HarnessValidationError when no harness has been generated yet", async () => {
+    makeDir();
+    await expect(setEvalsVerdict(dir, "pass")).rejects.toThrow(HarnessValidationError);
   });
 });

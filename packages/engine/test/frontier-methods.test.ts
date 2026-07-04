@@ -379,6 +379,75 @@ describe("frontier RPC methods", () => {
     expect(okClose.closed).toBe(true);
   });
 
+  // M6 Task 1 (eval-batch safety gate): sessions created via
+  // adapter.createSession(...) OUTSIDE engine.frontier.start (harness
+  // generation, orchestrate's review/escalation sessions) never get a
+  // sessionId and never touch #sessions, so close()/abortAll() couldn't
+  // reach them before this fix — a wedged direct session would survive
+  // Engine.close() outright. FrontierService.track(session) registers ANY
+  // live session for close()-time reachability and returns an untrack fn;
+  // addSession (engine.frontier.start's own path) reuses the SAME
+  // bookkeeping so there is only ONE tracking path.
+  it("track() registers a directly-created session for close() reachability, and returns an untrack fn", async () => {
+    dir = makeRepo();
+    engine = createEngine();
+    const closeSpy = { closed: false };
+    const directSession: FrontierSession = {
+      id: "direct-session",
+      projectDir: dir,
+      prompt(): FrontierPromptHandle {
+        throw new Error("not used in this test");
+      },
+      close: async () => {
+        closeSpy.closed = true;
+      },
+    };
+
+    engine.frontier.track(directSession);
+    expect(engine.frontier.trackedCount()).toBe(1);
+
+    await engine.frontier.close();
+    expect(closeSpy.closed).toBe(true);
+    expect(engine.frontier.trackedCount()).toBe(0);
+  });
+
+  it("track()'s untrack fn removes the session before close(), so close() never touches it", async () => {
+    dir = makeRepo();
+    engine = createEngine();
+    const closeSpy = { closed: false };
+    const directSession: FrontierSession = {
+      id: "direct-session",
+      projectDir: dir,
+      prompt(): FrontierPromptHandle {
+        throw new Error("not used in this test");
+      },
+      close: async () => {
+        closeSpy.closed = true;
+      },
+    };
+
+    const untrack = engine.frontier.track(directSession);
+    untrack();
+    expect(engine.frontier.trackedCount()).toBe(0);
+
+    await engine.frontier.close();
+    expect(closeSpy.closed).toBe(false);
+  });
+
+  it("addSession (engine.frontier.start's own path) registers in the SAME tracked bookkeeping track() uses", async () => {
+    dir = makeRepo();
+    engine = createEngine();
+    engine.frontier.registerAdapter(makeFakeAdapter());
+
+    expect(engine.frontier.trackedCount()).toBe(0);
+    const start = await call("engine.frontier.start", { projectDir: dir, attachWiki: false });
+    const { sessionId } = start.result;
+    expect(engine.frontier.trackedCount()).toBe(1);
+
+    await call("engine.frontier.stop", { sessionId });
+    expect(engine.frontier.trackedCount()).toBe(0);
+  });
+
   it("prompt timeoutMs schema accepts up to 3_600_000 and rejects below the 100ms floor", async () => {
     dir = makeRepo();
     engine = createEngine();

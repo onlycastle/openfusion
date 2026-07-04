@@ -31,7 +31,7 @@ import path from "node:path";
 import { RpcErrorCodes } from "@openfusion/shared";
 import type { Engine } from "../engine.js";
 import type { FrontierSession } from "../engines/types.js";
-import type { AgentDef } from "../harness/schema.js";
+import type { AgentDef, WikiPage } from "../harness/schema.js";
 import { validateHarness } from "../harness/schema.js";
 import { HarnessValidationError, loadHarness } from "../harness/store.js";
 import { RpcMethodError } from "../rpc/errors.js";
@@ -45,6 +45,36 @@ import { routeTask } from "./routing.js";
 // harness/generate.ts's FRONTIER_KIND.
 const FRONTIER_KIND = "claude-code";
 const DEFAULT_MAX_WORKER_ATTEMPTS = 2;
+
+// M6 Task 1 review round 1 (Important — Fix 1): reviewTimeoutMs (and, by
+// extension, the escalation turn's own deadline) had NO default anywhere in
+// this pipeline — an RPC caller simply omitting it left the review/
+// escalation frontier call fully UNBOUNDED. That matters specifically
+// because of the stdin-close shutdown path (main.ts: abortAll ->
+// pipeline.drain -> engine.close): drain() waits on THIS in-flight
+// orchestrate call to settle BEFORE close() ever runs and can reach (and
+// force-close) the direct frontier session engine.frontier.track registered
+// (see runEscalation/the worker loop's review session below) — so a wedged
+// REAL review or escalation turn would hang the entire process, not just
+// this one call, taking down an eval batch of N orchestrate loops with it.
+// M6 Task 1 Change A made the real Claude adapter actually ENFORCE
+// opts.timeoutMs (claude.ts) — before that, a default here would have been
+// a no-op against the real adapter. With enforcement now real, defaulting
+// here is what makes every sub-call self-bounding regardless of what an RPC
+// caller passes (or omits). Kept as internal, unexported constants — same
+// convention as worker/methods.ts's own DEFAULT_RUN_TIMEOUT_MS (the wire
+// schema, methods.ts's OrchestrateParamsSchema, keeps both params OPTIONAL;
+// applying the default HERE, not there, is what guarantees an omitted param
+// still yields a bounded call).
+const DEFAULT_REVIEW_TIMEOUT_MS = 300_000; // 5 min — a read-only judgment call; should be fast.
+// 10 min — a full editing turn, comparable in scope to a worker attempt, so
+// this mirrors worker/methods.ts's own DEFAULT_RUN_TIMEOUT_MS rather than
+// reusing the (shorter) review default. An EXPLICIT reviewTimeoutMs from the
+// caller is still reused verbatim for escalation too (unchanged from before
+// this fix — see OrchestrateParamsSchema's own doc comment) since a caller
+// providing one is clearly stating a per-sub-call deadline for this whole
+// run; only the OMITTED case gets escalation's own, longer default.
+const DEFAULT_ESCALATE_TIMEOUT_MS = 600_000;
 
 export interface OrchestrateParams {
   projectDir: string;
@@ -65,6 +95,14 @@ export interface OrchestrateAttempt {
 export interface OrchestrateResult {
   outcome: "worker-approved" | "escalated" | "failed";
   agent: string;
+  // M6 Task 2: the RoutedAgent's own taskClass (routing.ts), including the
+  // DEFAULT_TASK_CLASS sentinel when nothing matched — previously only
+  // surfaced in an "orchestrate.progress" notification (see the `route`
+  // stage's progress() call below), so a caller reading only the RETURNED
+  // result (M6's report card, notably) had no way to bucket a run by which
+  // task class it was routed as. Kept alongside `agent`/`resolution` since
+  // all three come off the same routeTask() call.
+  taskClass: string;
   resolution: { providerId: string; model: string } | "frontier";
   attempts: OrchestrateAttempt[];
   diff: string;
@@ -72,7 +110,26 @@ export interface OrchestrateResult {
   worktree: { path: string; branch: string } | null;
   cost: {
     workerUsd: number | null;
+    // M6 Task 2: frontier cost split by WHERE it was spent — reviewUsd is
+    // the sum of every reviewDiff (read-only review session) call's own
+    // costUsd across all worker attempts; escalateUsd is the write-scoped
+    // escalation session's costUsd (at most one per orchestrate run, since
+    // there is only ever one escalation attempt). Both are computed at
+    // their own distinct call sites below (the review loop's
+    // `reviewUsd = addCost(...)` and runEscalation's own
+    // `escalateUsd = addCost(...)`) and surfaced separately so M6's report
+    // card can bucket "review" spend apart from "escalate" spend — the two
+    // answer different cost questions (the ongoing price of quality-gating
+    // EVERY worker attempt vs. the one-time price of a frontier doing the
+    // task itself).
+    reviewUsd: number | null;
+    // Kept for backward compatibility with every existing caller/test that
+    // reads `cost.frontierUsd` as "total frontier spend" — now DERIVED as
+    // reviewUsd + escalateUsd (addCost's null-safe sum) rather than
+    // independently accumulated, so this can never drift from the split
+    // that backs it.
     frontierUsd: number | null;
+    escalateUsd: number | null;
     totalUsd: number | null;
     note: "estimate-class";
   };
@@ -165,13 +222,85 @@ function describePriorAttempt(prior: PriorAttempt | undefined): string | undefin
   return undefined;
 }
 
+// M6 Task 2: the total combined wiki-digest text handed to the worker via
+// engine.worker.run's `wikiDigest` param (see buildWikiDigestContext below)
+// is capped here so a harness with many wiki pages can never blow a cheap
+// worker model's context window. 8000 chars is roughly 2000 tokens at a
+// conservative 4-chars/token estimate — small next to any current worker
+// model's context, even stacked on top of the agent's own prompt and the
+// task text. Measured against the DIGEST TEXT ONLY (not the "### <title>"
+// markup this module wraps each page in below), so the actual prompt
+// contribution is somewhat larger than this number but never
+// unboundedly so.
+const MAX_WIKI_DIGEST_CHARS = 8000;
+
+// v1 of "wire wiki digests into worker prompts" (M6 Task 2): there is no
+// agent.taskClasses -> wiki-page mapping yet (harness/schema.ts's WikiPage
+// has no per-agent/per-taskClass affinity), so "which pages actually matter
+// for THIS task" isn't decidable — sending every page's digest, bounded, is
+// the simplest choice that can't silently starve a worker of context a
+// smarter selection might have kept. This is the harness's headline value
+// (distilled per-file/per-area knowledge that lets a cheap model work
+// without reading the whole repo) actually reaching the worker for the
+// first time; before this, buildWorkerTask (below) gave the worker only
+// agent.prompt + the task, with no wiki context of any kind.
+//
+// Pages are taken in the harness's own order (bundle.pages, i.e. on-disk
+// slug order — see harness/store.ts's loadHarness) until the NEXT page's
+// digest would push the running total over MAX_WIKI_DIGEST_CHARS; every
+// page up to that point is included in full (a digest is never
+// partially/mid-sentence truncated), and everything left over is named —
+// not silently dropped — in a trailing note so a truncated run is visible
+// rather than quietly incomplete. Returns undefined when the harness has no
+// pages at all (loadHarness's own readRequiredDir makes an empty
+// `pages` vanishingly rare for a real engine.harness.generate output, but a
+// hand-edited harness — schema.ts's own documented allowance — could still
+// have one), so callers never send an empty/meaningless digest section.
+//
+// Composed as its OWN `wikiDigest` param on the engine.worker.run call
+// (worker/methods.ts's RunParamsSchema already had this field; nothing
+// wired it until now) rather than folded into buildWorkerTask's own task
+// string — worker/loop.ts's buildPrompt already renders wikiDigest under
+// its own "# Repository context" heading, ahead of the task, exactly
+// mirroring how a real repository wiki would be handed to a human
+// contributor: read the context, then do the task. The "## Project
+// knowledge (from the harness wiki)" heading below nests one level inside
+// that existing "# Repository context" section.
+function buildWikiDigestContext(pages: readonly WikiPage[]): string | undefined {
+  if (pages.length === 0) return undefined;
+
+  const included: WikiPage[] = [];
+  let total = 0;
+  for (const page of pages) {
+    if (total + page.digest.length > MAX_WIKI_DIGEST_CHARS) break;
+    included.push(page);
+    total += page.digest.length;
+  }
+  // Unreachable under a schema-valid harness (WikiPageSchema caps a single
+  // digest at 1200 chars, well under MAX_WIKI_DIGEST_CHARS, so the FIRST
+  // page always fits) — guarded anyway so a future cap change or a
+  // hand-edited harness loaded straight off disk can never silently emit
+  // an empty digest section instead of at least the first page's own.
+  if (included.length === 0) {
+    included.push(pages[0]!);
+  }
+
+  const sections = included.map((page) => `### ${page.title}\n\n${page.digest}`);
+  const omitted = pages.length - included.length;
+  const truncationNote =
+    omitted > 0
+      ? `\n\n[... ${omitted} more wiki page digest(s) omitted — combined digest context is capped at ${MAX_WIKI_DIGEST_CHARS} characters]`
+      : "";
+  return `## Project knowledge (from the harness wiki)\n\n${sections.join("\n\n")}${truncationNote}`;
+}
+
 // Builds the single `task` string handed to engine.worker.run: the routed
-// agent's own specialist prompt, then the user's task — "keep simple: pass
-// task + agent.prompt as the worker task framing" per the task brief (a
-// fuller wiki-digest-aware framing is left to later work) — plus, from the
+// agent's own specialist prompt, then the user's task — plus, from the
 // second attempt onward, a feedback line naming what the PRIOR attempt got
 // wrong (Final review Fix 3), so a retry is an informed correction rather
-// than an identical re-roll.
+// than an identical re-roll. The harness's wiki digests are NOT folded in
+// here — see buildWikiDigestContext's own doc comment above for why they
+// travel as engine.worker.run's separate `wikiDigest` param instead.
 function buildWorkerTask(agent: AgentDef, task: string, prior?: PriorAttempt): string {
   const base = `${agent.prompt}\n\n${task}`;
   const feedback = describePriorAttempt(prior);
@@ -270,8 +399,17 @@ interface EscalationResult {
 // access scoped to that worktree's root (toolPolicy.writeScope) — the first
 // use of the M4 write-policy path in anger. Reached either because routing
 // resolved straight to "frontier", or because every worker attempt above
-// was rejected/empty.
-async function runEscalation(engine: Engine, params: OrchestrateParams, agent: AgentDef): Promise<EscalationResult> {
+// was rejected/empty. `timeoutMs` is the CALLER'S already-resolved deadline
+// (params.reviewTimeoutMs if the caller passed one, else
+// DEFAULT_ESCALATE_TIMEOUT_MS — see orchestrate()'s own resolution below) —
+// this function never reads params.reviewTimeoutMs itself, so it can never
+// silently forward an unbounded `undefined` to the escalation turn.
+async function runEscalation(
+  engine: Engine,
+  params: OrchestrateParams,
+  agent: AgentDef,
+  timeoutMs: number,
+): Promise<EscalationResult> {
   const manager = await engine.worker.getManager(params.projectDir);
   const worktree = await manager.create(randomUUID());
 
@@ -303,6 +441,14 @@ async function runEscalation(engine: Engine, params: OrchestrateParams, agent: A
       toolPolicy: { writeScope: [worktree.path] },
       resultLabel: "frontier-escalate",
     });
+    // M6 Task 1 (eval-batch safety gate): this session is created DIRECTLY
+    // off the registered adapter, bypassing engine.frontier.start entirely —
+    // it never gets a sessionId and never touches FrontierService's own
+    // #sessions bookkeeping, so Engine.close() had no way to reach (and
+    // force-kill) a wedged escalation turn before this fix. track()
+    // registers it for close()-time reachability; the returned untrack fn is
+    // called in the same `finally` below where the session is closed.
+    const untrackSession = engine.frontier.track(session);
     try {
       const turn = await runFrontierTurn(
         session,
@@ -313,7 +459,7 @@ async function runEscalation(engine: Engine, params: OrchestrateParams, agent: A
         // working directory" is now literally correct: the session's cwd IS
         // the worktree (see the createSession call above).
         `${agent.prompt}\n\nComplete this task by editing files in the current working directory: ${params.task}`,
-        params.reviewTimeoutMs,
+        timeoutMs,
       );
       const diff = await manager.diff(worktree);
       const diffStat = await manager.diffStat(worktree);
@@ -330,6 +476,7 @@ async function runEscalation(engine: Engine, params: OrchestrateParams, agent: A
         // isolation; a throwing adapter close() must never mask this
         // escalation's real outcome.
       });
+      untrackSession();
     }
   } catch (err) {
     // Mirrors worker/methods.ts's own failure posture: leave the worktree in
@@ -358,13 +505,20 @@ export async function orchestrate(engine: Engine, params: OrchestrateParams): Pr
   // removed.
   let lastWorktree: { path: string; branch: string } | null = null;
   let workerUsd: number | null = null;
-  let frontierUsd: number | null = null;
+  // M6 Task 2: split by where the cost was spent — see OrchestrateResult's
+  // own doc comment on `cost.reviewUsd`/`cost.escalateUsd` for why these are
+  // tracked as two separate running totals now instead of one combined
+  // `frontierUsd` (frontierUsd is still returned, derived from these two,
+  // for backward compatibility — see finish() below).
+  let reviewUsd: number | null = null;
+  let escalateUsd: number | null = null;
 
   const nextAttemptNumber = (): number => attempts.length + 1;
 
   function finish(
     outcome: OrchestrateResult["outcome"],
     agentName: string,
+    taskClass: string,
     resolution: OrchestrateResult["resolution"],
     diff: string,
     diffStat: string,
@@ -374,6 +528,7 @@ export async function orchestrate(engine: Engine, params: OrchestrateParams): Pr
     return {
       outcome,
       agent: agentName,
+      taskClass,
       resolution,
       attempts,
       diff,
@@ -381,8 +536,10 @@ export async function orchestrate(engine: Engine, params: OrchestrateParams): Pr
       worktree,
       cost: {
         workerUsd,
-        frontierUsd,
-        totalUsd: addCost(workerUsd, frontierUsd),
+        reviewUsd,
+        frontierUsd: addCost(reviewUsd, escalateUsd),
+        escalateUsd,
+        totalUsd: addCost(workerUsd, addCost(reviewUsd, escalateUsd)),
         note: "estimate-class",
       },
     };
@@ -417,8 +574,24 @@ export async function orchestrate(engine: Engine, params: OrchestrateParams): Pr
     const routed = routeTask(params.task, harness, engine.models.registry);
     progress(engine, "route", `routed to agent "${routed.agent.name}" (class ${routed.taskClass})`);
 
+    // M6 Task 2: computed ONCE per run (the harness's own pages never change
+    // between worker attempts) and threaded into every engine.worker.run
+    // call below via its `wikiDigest` param — see buildWikiDigestContext's
+    // own doc comment for the v1 "send every page, bounded" design and the
+    // MAX_WIKI_DIGEST_CHARS cap. Never logged (engine.log) anywhere in this
+    // module — it's worker-prompt content, same posture as `params.task`
+    // and every worker/frontier summary this pipeline handles.
+    const wikiDigest = buildWikiDigestContext(harness.pages);
+
     const maxWorkerAttempts =
       params.maxWorkerAttempts ?? harness.routing.escalation.failuresBeforeFrontier ?? DEFAULT_MAX_WORKER_ATTEMPTS;
+    // Fix 1 (M6 Task 1 review round 1): resolved ONCE, here — every
+    // review/escalation call below reads these locals, never
+    // params.reviewTimeoutMs directly, so an omitted param can't leak an
+    // unbounded `undefined` past this point. See the DEFAULT_* constants'
+    // own doc comment (top of file) for the drain()-hang rationale.
+    const reviewTimeoutMs = params.reviewTimeoutMs ?? DEFAULT_REVIEW_TIMEOUT_MS;
+    const escalateTimeoutMs = params.reviewTimeoutMs ?? DEFAULT_ESCALATE_TIMEOUT_MS;
 
     if (routed.resolution !== "frontier") {
       const { providerId, model } = routed.resolution;
@@ -438,8 +611,17 @@ export async function orchestrate(engine: Engine, params: OrchestrateParams): Pr
           workerResult = await callEngineMethod<WorkerRunResponse>(engine, "engine.worker.run", {
             projectDir: params.projectDir,
             task: buildWorkerTask(routed.agent, params.task, priorAttempt),
+            wikiDigest,
             providerId,
             model,
+            // Fix 1: unlike reviewTimeoutMs/escalateTimeoutMs above, this is
+            // deliberately left as `params.workerTimeoutMs` verbatim
+            // (possibly undefined) rather than defaulted here —
+            // engine.worker.run's OWN handler (worker/methods.ts) already
+            // applies its own bounded default (`params.timeoutMs ??
+            // DEFAULT_RUN_TIMEOUT_MS`, 600000) whenever this arrives as
+            // undefined, so this sub-call is ALREADY self-bounding without
+            // orchestrate needing to duplicate that default.
             timeoutMs: params.workerTimeoutMs,
           });
         } catch (err) {
@@ -480,19 +662,29 @@ export async function orchestrate(engine: Engine, params: OrchestrateParams): Pr
           log: engine.log,
           resultLabel: "frontier-review",
         });
+        // M6 Task 1 (eval-batch safety gate): this session is created
+        // DIRECTLY off the registered adapter, bypassing
+        // engine.frontier.start entirely — it never gets a sessionId and
+        // never touches FrontierService's own #sessions bookkeeping, so
+        // Engine.close() had no way to reach (and force-kill) a wedged
+        // review turn before this fix. track() registers it for
+        // close()-time reachability; the returned untrack fn is called in
+        // the same `finally` below where the session is closed.
+        const untrackReviewSession = engine.frontier.track(reviewSession);
         let verdict: ReviewVerdict;
         try {
           const reviewResult = await reviewDiff(
             reviewSession,
             { task: params.task, diff: workerResult.diff, summary: workerResult.summary },
-            { timeoutMs: params.reviewTimeoutMs },
+            { timeoutMs: reviewTimeoutMs },
           );
           verdict = reviewResult.verdict;
-          frontierUsd = addCost(frontierUsd, reviewResult.costUsd);
+          reviewUsd = addCost(reviewUsd, reviewResult.costUsd);
         } finally {
           await reviewSession.close().catch(() => {
             // Best-effort — see runEscalation's identical close() comment.
           });
+          untrackReviewSession();
         }
 
         attempts.push({ n, kind: "worker", summary: workerResult.summary, verdict });
@@ -501,6 +693,7 @@ export async function orchestrate(engine: Engine, params: OrchestrateParams): Pr
           return finish(
             "worker-approved",
             routed.agent.name,
+            routed.taskClass,
             routed.resolution,
             workerResult.diff,
             workerResult.diffStat,
@@ -519,14 +712,14 @@ export async function orchestrate(engine: Engine, params: OrchestrateParams): Pr
     progress(engine, "escalate", "escalating to the frontier with write access");
     let escalation: EscalationResult;
     try {
-      escalation = await runEscalation(engine, params, routed.agent);
+      escalation = await runEscalation(engine, params, routed.agent, escalateTimeoutMs);
     } catch (err) {
       // Mirrors the worker-attempt catch's identical lift, above.
       const worktree = liftWorktreeFromError(err);
       if (worktree !== undefined) lastWorktree = worktree;
       throw err;
     }
-    frontierUsd = addCost(frontierUsd, escalation.costUsd);
+    escalateUsd = addCost(escalateUsd, escalation.costUsd);
     lastWorktree = escalation.worktree;
 
     const n = nextAttemptNumber();
@@ -534,13 +727,14 @@ export async function orchestrate(engine: Engine, params: OrchestrateParams): Pr
       attempts.push({ n, kind: "frontier", summary: escalation.text, empty: true });
       await cleanupWorktree(engine, params.projectDir, escalation.worktree.path);
       lastWorktree = null;
-      return finish("failed", routed.agent.name, routed.resolution, "", "", null);
+      return finish("failed", routed.agent.name, routed.taskClass, routed.resolution, "", "", null);
     }
 
     attempts.push({ n, kind: "frontier", summary: escalation.text });
     return finish(
       "escalated",
       routed.agent.name,
+      routed.taskClass,
       routed.resolution,
       escalation.diff,
       escalation.diffStat,

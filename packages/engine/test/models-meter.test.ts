@@ -10,6 +10,7 @@ function record(overrides: Partial<UsageRecord> = {}): UsageRecord {
     costUsd: 0.01,
     at: Date.now(),
     source: "complete",
+    pricingConfidence: "verified",
     ...overrides,
   };
 }
@@ -93,5 +94,147 @@ describe("CostMeter — per-surface source tagging", () => {
   it("an empty meter has an empty bySource map", () => {
     const meter = new CostMeter();
     expect(meter.totals().bySource).toEqual({});
+  });
+});
+
+describe("CostMeter — totals().pricingConfidence (worst across all records)", () => {
+  it("an empty meter reports the vacuous best case: verified", () => {
+    const meter = new CostMeter();
+    expect(meter.totals().pricingConfidence).toBe("verified");
+  });
+
+  it("a single verified record reports verified", () => {
+    const meter = new CostMeter();
+    meter.record(record({ pricingConfidence: "verified" }));
+    expect(meter.totals().pricingConfidence).toBe("verified");
+  });
+
+  it("a verified record plus a secondary record reports secondary (worst wins)", () => {
+    const meter = new CostMeter();
+    meter.record(record({ pricingConfidence: "verified" }));
+    meter.record(record({ pricingConfidence: "secondary" }));
+    expect(meter.totals().pricingConfidence).toBe("secondary");
+  });
+
+  it("adding an unpriced record on top of verified + secondary drags totals to unpriced (worst wins)", () => {
+    const meter = new CostMeter();
+    meter.record(record({ pricingConfidence: "verified" }));
+    meter.record(record({ pricingConfidence: "secondary" }));
+    meter.record(record({ pricingConfidence: "unpriced", costUsd: null }));
+    expect(meter.totals().pricingConfidence).toBe("unpriced");
+  });
+
+  it("unverified ranks worse than secondary/verified but better than unpriced", () => {
+    const verifiedPlusUnverified = new CostMeter();
+    verifiedPlusUnverified.record(record({ pricingConfidence: "verified" }));
+    verifiedPlusUnverified.record(record({ pricingConfidence: "unverified" }));
+    expect(verifiedPlusUnverified.totals().pricingConfidence).toBe("unverified");
+
+    const unverifiedPlusUnpriced = new CostMeter();
+    unverifiedPlusUnpriced.record(record({ pricingConfidence: "unverified" }));
+    unverifiedPlusUnpriced.record(record({ pricingConfidence: "unpriced", costUsd: null }));
+    expect(unverifiedPlusUnpriced.totals().pricingConfidence).toBe("unpriced");
+  });
+
+  it("record order does not matter — worst-of is order-independent", () => {
+    const meter = new CostMeter();
+    meter.record(record({ pricingConfidence: "unpriced", costUsd: null }));
+    meter.record(record({ pricingConfidence: "verified" }));
+    meter.record(record({ pricingConfidence: "secondary" }));
+    expect(meter.totals().pricingConfidence).toBe("unpriced");
+  });
+
+  // Finding 1: provider-reported confidence (from frontier CLI cost) ranks
+  // EQUAL to verified (both rank 3) so a meter mixing frontier provider-reported
+  // + verified-table costs stays at the top confidence. Label is still distinct
+  // for the report card to display provenance. When worst rank is shared,
+  // prefer "verified" if any verified record exists.
+  it("provider-reported ranks equal to verified (both rank 3)", () => {
+    const meter = new CostMeter();
+    meter.record(record({ pricingConfidence: "provider-reported" }));
+    meter.record(record({ pricingConfidence: "secondary" }));
+    expect(meter.totals().pricingConfidence).toBe("secondary");
+  });
+
+  it("a single provider-reported record reports provider-reported", () => {
+    const meter = new CostMeter();
+    meter.record(record({ pricingConfidence: "provider-reported" }));
+    expect(meter.totals().pricingConfidence).toBe("provider-reported");
+  });
+
+  it("verified + provider-reported (rank tie): prefers verified label", () => {
+    const meter = new CostMeter();
+    meter.record(record({ pricingConfidence: "verified" }));
+    meter.record(record({ pricingConfidence: "provider-reported" }));
+    expect(meter.totals().pricingConfidence).toBe("verified");
+  });
+
+  it("provider-reported alone (no verified): reports provider-reported label", () => {
+    const meter = new CostMeter();
+    meter.record(record({ pricingConfidence: "provider-reported" }));
+    meter.record(record({ pricingConfidence: "provider-reported" }));
+    expect(meter.totals().pricingConfidence).toBe("provider-reported");
+  });
+
+  it("provider-reported + unpriced: unpriced wins (rank 0 < 3)", () => {
+    const meter = new CostMeter();
+    meter.record(record({ pricingConfidence: "provider-reported" }));
+    meter.record(record({ pricingConfidence: "unpriced", costUsd: null }));
+    expect(meter.totals().pricingConfidence).toBe("unpriced");
+  });
+});
+
+// M6 final review (C1 / I2): recordCount() + totals(sinceIndex) let a caller
+// (engine.evals.run) scope every aggregate to a window of records added
+// during ITS OWN run, not the engine's whole-lifetime ledger — see run.ts's
+// own runMeterStartIndex.
+describe("CostMeter — recordCount() + totals(sinceIndex) run-scoping", () => {
+  it("recordCount() reflects the number of records seen so far", () => {
+    const meter = new CostMeter();
+    expect(meter.recordCount()).toBe(0);
+    meter.record(record());
+    expect(meter.recordCount()).toBe(1);
+    meter.record(record());
+    expect(meter.recordCount()).toBe(2);
+  });
+
+  it("totals(sinceIndex) excludes records recorded before sinceIndex from every aggregate", () => {
+    const meter = new CostMeter();
+    // Prior "unrelated" records — verified, priced — as if left over from an
+    // earlier run against the same long-lived engine.
+    meter.record(record({ pricingConfidence: "verified", costUsd: 1 }));
+    meter.record(record({ pricingConfidence: "verified", costUsd: 1 }));
+    const sinceIndex = meter.recordCount();
+
+    // "This run"'s own records: one unpriced call alongside a priced one.
+    meter.record(record({ pricingConfidence: "unpriced", costUsd: null }));
+    meter.record(record({ pricingConfidence: "verified", costUsd: 2 }));
+
+    const wholeLedger = meter.totals();
+    expect(wholeLedger.calls).toBe(4);
+    expect(wholeLedger.unpricedCalls).toBe(1);
+
+    const thisRunOnly = meter.totals(sinceIndex);
+    expect(thisRunOnly.calls).toBe(2);
+    expect(thisRunOnly.unpricedCalls).toBe(1);
+    expect(thisRunOnly.pricingConfidence).toBe("unpriced");
+    expect(thisRunOnly.costUsd).toBe(2);
+  });
+
+  it("totals(sinceIndex) at the CURRENT recordCount() (nothing added yet) reports the vacuous empty case", () => {
+    const meter = new CostMeter();
+    meter.record(record({ pricingConfidence: "unpriced", costUsd: null }));
+    const sinceIndex = meter.recordCount();
+
+    const emptySlice = meter.totals(sinceIndex);
+    expect(emptySlice.calls).toBe(0);
+    expect(emptySlice.unpricedCalls).toBe(0);
+    expect(emptySlice.pricingConfidence).toBe("verified");
+  });
+
+  it("totals() with no argument is unchanged: the whole ledger, default sinceIndex 0", () => {
+    const meter = new CostMeter();
+    meter.record(record({ pricingConfidence: "secondary" }));
+    expect(meter.totals()).toEqual(meter.totals(0));
   });
 });

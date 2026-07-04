@@ -76,6 +76,11 @@ describe("engine.models.complete", () => {
       expect(res.result.costUsd).toBeCloseTo((10 * 0.14 + 20 * 0.28) / 1e6, 10);
       expect(res.result.providerId).toBe("p1");
       expect(res.result.attempts).toEqual([{ providerId: "p1", model: "deepseek-v4-flash" }]);
+
+      // M6 Task 0: a priced (verified) model's record carries that
+      // confidence through to engine.models.usage's ledger-wide worst-of.
+      const usage = await call(engine, "engine.models.usage", {});
+      expect(usage.result.pricingConfidence).toBe("verified");
     } finally {
       await engine.close();
     }
@@ -123,6 +128,9 @@ describe("engine.models.complete", () => {
         outputTokens: 5,
         costUsd: 0,
       });
+      // M6 Task 0: no pricing entry found at all -> "unpriced", the worst
+      // confidence, surfaced on the ledger-wide totals.
+      expect(usage.result.pricingConfidence).toBe("unpriced");
     } finally {
       await engine.close();
     }

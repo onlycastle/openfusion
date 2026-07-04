@@ -32,6 +32,18 @@ export type UsageSource =
   | "frontier-generate"
   | "frontier-interactive";
 
+// How much to trust `costUsd` for this record. Set at record() call time
+// from the looked-up ModelPricing's own `confidence` field, or "unpriced"
+// when no pricing entry was found at all (costUsd is null in that case).
+// "provider-reported" is used when the cost comes directly from the provider's
+// own reported figure (e.g., frontier CLI's total_cost_usd), not derived from
+// our verified PRICING table — ranks equal to "verified" as trustworthy since
+// it's the literal amount billed, but the label is distinct for provenance.
+// Surfaced so a consumer (the M6 savings report card) can flag a cost
+// figure that rests on a secondary/unverified/absent price rather than
+// trusting every costUsd number equally.
+export type PricingConfidence = "verified" | "provider-reported" | "secondary" | "unverified" | "unpriced";
+
 // One successful `engine.models.complete` attempt. Failed attempts are never
 // recorded here — only what actually consumed tokens (see methods.ts).
 export interface UsageRecord {
@@ -42,6 +54,7 @@ export interface UsageRecord {
   costUsd: number | null;
   at: number;
   source: UsageSource;
+  pricingConfidence: PricingConfidence;
 }
 
 export interface ModelTotals {
@@ -63,7 +76,29 @@ export interface MeterTotals {
   // "<kind>/<model>" — a per-surface cost breakdown alongside the existing
   // per-model one.
   bySource: Record<string, ModelTotals>;
+  // The WORST (least-trustworthy) pricingConfidence across every record seen
+  // — see CONFIDENCE_RANK below for the ordering. An empty meter reports
+  // "verified" (the vacuous best case: nothing has been observed to distrust
+  // yet). engine.models.usage exposes this verbatim so the M6 report card
+  // can flag a savings figure that rests on any less-than-verified cost.
+  pricingConfidence: PricingConfidence;
 }
+
+// Worst-to-best. Higher rank = more trustworthy. "unpriced" (no pricing
+// entry found at all, costUsd null) is worse than "unverified" (a priced
+// entry we simply haven't confirmed against an official source yet) is
+// worse than "secondary" (soft-documented / endpoint-pinned) is worse than
+// "verified" and "provider-reported" (equal rank 3).
+// "provider-reported" (e.g., frontier CLI's own reported cost) ranks equal
+// to "verified" since both are authoritative — it's the literal amount billed
+// or our sourced verified table. The label is distinct for provenance display.
+const CONFIDENCE_RANK: Record<PricingConfidence, number> = {
+  unpriced: 0,
+  unverified: 1,
+  secondary: 2,
+  verified: 3,
+  "provider-reported": 3,
+};
 
 // In-memory cost/usage ledger for the engine process's lifetime. Never
 // persisted — a fresh engine starts at zero.
@@ -74,7 +109,23 @@ export class CostMeter {
     this.#records.push(r);
   }
 
-  totals(): MeterTotals {
+  // Number of records in the ledger right now. Lets a caller snapshot a
+  // starting index BEFORE some window of work (e.g. engine.evals.run's own
+  // task loop — see evals/run.ts) and later call `totals(sinceIndex)` to
+  // scope every aggregate (including `unpricedCalls` and
+  // `pricingConfidence`) to just the records produced during that window,
+  // rather than the engine's whole lifetime ledger. Exists specifically for
+  // M6 final review I2 (run-scoped pricingConfidence) and C1 (the
+  // unpriced-calls gate) — under M7's long-lived engine, unrelated prior
+  // records must not taint a single run's own report card.
+  recordCount(): number {
+    return this.#records.length;
+  }
+
+  // `sinceIndex` (default 0 — the whole ledger, this class's original
+  // behavior) scopes every aggregate to records at that index or later, per
+  // `recordCount()`'s own doc comment above.
+  totals(sinceIndex = 0): MeterTotals {
     const totals: MeterTotals = {
       calls: 0,
       inputTokens: 0,
@@ -84,9 +135,17 @@ export class CostMeter {
       unpricedCalls: 0,
       byModel: {},
       bySource: {},
+      // Vacuous best case for an empty ledger (or an empty since-index
+      // slice) — see CONFIDENCE_RANK's doc comment. Downgraded below as
+      // records are folded in.
+      pricingConfidence: "verified",
     };
+    let worstRank = CONFIDENCE_RANK.verified;
+    let hasVerified = false;
+    let hasProviderReported = false;
 
-    for (const r of this.#records) {
+    const records = sinceIndex > 0 ? this.#records.slice(sinceIndex) : this.#records;
+    for (const r of records) {
       totals.calls += 1;
       totals.inputTokens += r.usage.inputTokens;
       totals.outputTokens += r.usage.outputTokens;
@@ -96,6 +155,23 @@ export class CostMeter {
         totals.unpricedCalls += 1;
       } else {
         totals.costUsd += r.costUsd;
+      }
+
+      if (r.pricingConfidence === "verified") {
+        hasVerified = true;
+      }
+      if (r.pricingConfidence === "provider-reported") {
+        hasProviderReported = true;
+      }
+
+      const rank = CONFIDENCE_RANK[r.pricingConfidence];
+      if (rank < worstRank) {
+        worstRank = rank;
+        totals.pricingConfidence = r.pricingConfidence;
+      } else if (rank === worstRank && rank === CONFIDENCE_RANK.verified && totals.pricingConfidence === "verified" && r.pricingConfidence === "provider-reported") {
+        // First provider-reported record at rank 3: update the label, but
+        // prefer "verified" at the end if any verified record exists
+        totals.pricingConfidence = "provider-reported";
       }
 
       const key = `${r.kind}/${r.model}`;
@@ -122,6 +198,15 @@ export class CostMeter {
       sourceEntry.outputTokens += r.usage.outputTokens;
       if (r.costUsd !== null) sourceEntry.costUsd += r.costUsd;
       totals.bySource[r.source] = sourceEntry;
+    }
+
+    // When worst rank is 3 (both "verified" and "provider-reported" share this rank),
+    // prefer the "verified" label if any verified record exists, for determinism.
+    // This ensures a meter mixing frontier provider-reported + table-verified costs
+    // reports "verified" (same highest rank, preferred label). A meter with ONLY
+    // provider-reported reports "provider-reported" (its own distinct label).
+    if (worstRank === CONFIDENCE_RANK.verified && hasVerified && hasProviderReported && totals.pricingConfidence === "provider-reported") {
+      totals.pricingConfidence = "verified";
     }
 
     return totals;
