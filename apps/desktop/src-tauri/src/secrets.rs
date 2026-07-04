@@ -206,7 +206,13 @@ impl SecretStore {
     /// the opted-in-persisted-ids index (so a future
     /// `load_persisted_secrets` — e.g. after an app restart — knows to
     /// reload it). `persist: false` never touches `backend` at all.
+    ///
+    /// **Rejects the reserved sentinel id** (`PERSISTED_INDEX_ID`) to prevent
+    /// caller-inflicted corruption of the backend's opted-in index.
     pub fn set(&self, id: &str, value: &str, persist: bool) -> Result<(), String> {
+        if id == PERSISTED_INDEX_ID {
+            return Err(format!("rejected reserved secret id {id:?}"));
+        }
         self.memory_lock().insert(id.to_string(), value.to_string());
         if persist {
             self.backend.set(id, value)?;
@@ -219,7 +225,13 @@ impl SecretStore {
     /// persistence, fall back to the Keychain backend (populating memory
     /// on a hit, so subsequent calls are memory-fast). Returns `None` for
     /// an unknown id — never panics/throws.
+    ///
+    /// **Rejects the reserved sentinel id** (`PERSISTED_INDEX_ID`) to prevent
+    /// caller access to the backend's opted-in index.
     pub fn get(&self, id: &str) -> Option<String> {
+        if id == PERSISTED_INDEX_ID {
+            return None;
+        }
         if let Some(value) = self.memory_lock().get(id).cloned() {
             return Some(value);
         }
@@ -246,7 +258,13 @@ impl SecretStore {
     /// never persisted (the backend treats deleting a non-existent entry
     /// as a no-op success — see [`KeyringImpl::delete`]/
     /// [`FakeKeyringBackend`]).
+    ///
+    /// **Rejects the reserved sentinel id** (`PERSISTED_INDEX_ID`) to prevent
+    /// caller deletion of the backend's opted-in index.
     pub fn delete(&self, id: &str) -> Result<(), String> {
+        if id == PERSISTED_INDEX_ID {
+            return Err(format!("rejected reserved secret id {id:?}"));
+        }
         self.memory_lock().remove(id);
         self.backend.delete(id)?;
         self.remove_from_persisted_index(id)?;
@@ -275,7 +293,13 @@ impl SecretStore {
     /// Keychain entry.
     pub fn load_persisted(&self) {
         let index = match self.backend.get(PERSISTED_INDEX_ID) {
-            Ok(Some(json)) => serde_json::from_str::<Vec<String>>(&json).unwrap_or_default(),
+            Ok(Some(json)) => match serde_json::from_str::<Vec<String>>(&json) {
+                Ok(ids) => ids,
+                Err(_) => {
+                    eprintln!("[secrets] persisted-ids index was malformed; resetting to empty");
+                    Vec::new()
+                }
+            },
             Ok(None) => Vec::new(),
             Err(err) => {
                 eprintln!("[secrets] failed to load persisted-ids index: {err}");
@@ -490,6 +514,103 @@ mod tests {
     fn get_secret_for_unknown_id_returns_none_without_panicking() {
         let (_backend, store) = fake_store();
         assert_eq!(store.get("never-set"), None);
+    }
+
+    #[test]
+    fn reserved_id_sentinel_attack_rejected() {
+        let (backend, store) = fake_store();
+
+        // Persist a legitimate secret first
+        store.set("openai", "sk-openai-key", true).expect("set openai should succeed");
+        let initial_index = backend.get(PERSISTED_INDEX_ID).expect("index get should not error").expect("index should exist");
+        let initial_ids: Vec<String> = serde_json::from_str(&initial_index).expect("index should be valid JSON");
+        assert_eq!(initial_ids, vec!["openai"], "initial index should contain only openai");
+
+        // Attempt to set the reserved id with persist=true: must be rejected or no-op
+        let set_result = store.set(PERSISTED_INDEX_ID, "malicious-value", true);
+        assert!(
+            set_result.is_err(),
+            "set with reserved id must be rejected (return Err), not silently accepted"
+        );
+
+        // Verify the reserved id is NOT in the memory map
+        assert_eq!(
+            store.get(PERSISTED_INDEX_ID),
+            None,
+            "reserved id must not be readable from memory"
+        );
+
+        // Verify the persisted index was NOT overwritten: openai should still be there
+        let after_attack_index = backend.get(PERSISTED_INDEX_ID).expect("index get should not error").expect("index should exist after attack");
+        let after_attack_ids: Vec<String> = serde_json::from_str(&after_attack_index).expect("index should be valid JSON after attack");
+        assert_eq!(
+            after_attack_ids, initial_ids,
+            "persisted index must not be corrupted by reserved-id attack"
+        );
+
+        // Simulate restart: verify openai still loads correctly
+        let restarted = SecretStore::new(backend.clone());
+        restarted.load_persisted();
+        assert_eq!(
+            restarted.get("openai"),
+            Some("sk-openai-key".to_string()),
+            "legitimate persisted secret must still survive after sentinel-attack attempt"
+        );
+    }
+
+    #[test]
+    fn reserved_id_get_rejected() {
+        let (_backend, store) = fake_store();
+
+        // get with reserved id must return None (the sentinel is not a real secret)
+        let result = store.get(PERSISTED_INDEX_ID);
+        assert_eq!(result, None, "get with reserved id must return None");
+    }
+
+    #[test]
+    fn reserved_id_delete_rejected() {
+        let (backend, store) = fake_store();
+
+        // Persist a legitimate secret first
+        store.set("openai", "sk-openai-key", true).expect("set openai should succeed");
+
+        // Attempt to delete the reserved id: must be rejected or no-op
+        let delete_result = store.delete(PERSISTED_INDEX_ID);
+        assert!(
+            delete_result.is_err(),
+            "delete with reserved id must be rejected (return Err)"
+        );
+
+        // Verify the legitimate secret's index entry is still there
+        let index = backend.get(PERSISTED_INDEX_ID).expect("index get should not error").expect("index should exist");
+        let ids: Vec<String> = serde_json::from_str(&index).expect("index should be valid JSON");
+        assert_eq!(ids, vec!["openai"], "index must not be corrupted by reserved-id delete");
+    }
+
+    #[test]
+    fn load_persisted_malformed_index_logs_and_resets() {
+        let (backend, _store) = fake_store();
+
+        // Corrupt the persisted index: store non-JSON in the __persisted_ids__ entry
+        backend.set(PERSISTED_INDEX_ID, "{invalid json [").expect("backend set should succeed");
+
+        // Create a new store and load persisted: must not crash, must reset to empty
+        let new_store = SecretStore::new(backend.clone());
+        new_store.load_persisted();
+
+        // Verify it didn't crash and reset to empty index
+        let ids = new_store.list_ids();
+        assert!(
+            ids.is_empty(),
+            "corrupted index should reset to empty on load, got {ids:?}"
+        );
+
+        // Verify the persisted_ids set is empty
+        assert_eq!(
+            new_store.persisted_ids_lock().len(),
+            0,
+            "persisted_ids should be empty after loading corrupted index"
+        );
     }
 
     #[test]
