@@ -113,9 +113,43 @@ function toEngineNotification(message: unknown): EngineNotification {
 export type EngineEventHandler = (notification: EngineNotification) => void;
 export type Unsubscribe = () => void;
 
+// ---------------------------------------------------------------------------
+// Hand-mirrored response shapes — evaluated at Task 6, kept hand-mirrored
+// ---------------------------------------------------------------------------
+//
+// `ModelProviderSummary`/`WikiBuildStats`/`WikiStatus` mirror response types
+// that really live in `@openfusion/engine`
+// (`packages/engine/src/models/providers.ts`'s `ProviderRegistry.list()`
+// return type, `packages/engine/src/wiki/indexer.ts`'s `IndexStats`,
+// `packages/engine/src/wiki/methods.ts`'s inline `engine.wiki.status`
+// result). Task 6 evaluated importing rather than re-declaring them:
+//
+//   - `@openfusion/engine` is a Node-only backend package (better-sqlite3
+//     native bindings, tree-sitter WASM parsers, the `ai` SDK and its
+//     provider clients) — a browser/webview bundle (this Vite app) has no
+//     business depending on it, even just for types; the desktop
+//     `package.json` doesn't (and shouldn't) list it as a dependency.
+//   - `@openfusion/shared` (`packages/shared/src/index.ts`/`rpc.ts`) IS
+//     already the clean cross-package import site (zod, no Node-only
+//     runtime deps) — but today it only exports the generic JSON-RPC
+//     envelope (`RpcErrorCodes`, request/response schemas), not per-method
+//     result shapes. Making it export e.g. a `WikiBuildResultSchema` would
+//     mean moving/duplicating that shape out of `@openfusion/engine`,
+//     which is engine-side work outside this task's scope (the engine
+//     package + its test suite are untouched by this milestone).
+//
+// Decision: keep hand-mirroring here, but fix the drift Task 5 shipped with
+// (`WikiBuildStats` below was missing over half of the real `IndexStats`
+// fields) and document the risk inline. TODO(future milestone): if
+// `@openfusion/shared` grows per-method zod schemas that both the engine's
+// `registerMethod` call sites and this client can import, switch to those
+// and delete these hand mirrors — until then, a shape change on the engine
+// side (`IndexStats`, `ProviderRegistry.list()`, `engine.wiki.status`'s
+// inline return) has no compile-time link to these interfaces; only a
+// runtime shape mismatch would catch drift.
 export interface ModelProviderSummary {
   id: string;
-  kind: string;
+  kind: "moonshot" | "zai" | "deepseek" | "openai-compatible";
   baseURL?: string;
 }
 
@@ -123,9 +157,32 @@ export interface ModelsListResult {
   providers: ModelProviderSummary[];
 }
 
+/** Mirrors `packages/engine/src/wiki/indexer.ts`'s `IndexStats` — the real
+ * result of `engine.wiki.build`. Task 5's version of this interface only had
+ * `filesIndexed`/`filesSkipped`; fixed here to match every field the engine
+ * actually returns. */
 export interface WikiBuildStats {
+  filesSeen: number;
   filesIndexed: number;
   filesSkipped: number;
+  filesFailed: number;
+  filesRemoved: number;
+  symbols: number;
+  refs: number;
+  headSha: string;
+}
+
+/** Mirrors the inline result shape of `engine.wiki.status`
+ * (`packages/engine/src/wiki/methods.ts`). `headSha` is `null` when the
+ * wiki hasn't been built yet for this project. */
+export interface WikiStatus {
+  built: boolean;
+  headSha: string | null;
+  currentSha: string;
+  stale: boolean;
+  files: number;
+  symbols: number;
+  refs: number;
 }
 
 /** The engine-RPC half of the client (`call` + typed method wrappers) plus
@@ -187,6 +244,16 @@ export class EngineClient {
 
   wikiBuild(projectDir: string, opts?: CallOptions): Promise<WikiBuildStats> {
     return this.call<WikiBuildStats>("engine.wiki.build", { projectDir }, opts);
+  }
+
+  /** `engine.wiki.status` — cheap, non-mutating: whether a wiki index
+   * exists for `projectDir`, whether it's stale (HEAD moved since the last
+   * build), and its current file/symbol/ref counts. Also doubles as the
+   * Project screen's "is this even a git repo" check: like `wikiBuild`,
+   * this throws the engine's `SERVER_ERROR` (via `requireGitRepo`) for a
+   * non-git directory. */
+  wikiStatus(projectDir: string, opts?: CallOptions): Promise<WikiStatus> {
+    return this.call<WikiStatus>("engine.wiki.status", { projectDir }, opts);
   }
 }
 

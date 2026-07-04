@@ -46,6 +46,15 @@ const EXIT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(8);
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let app = tauri::Builder::default()
+        // The Project screen's "Choose project…" directory picker
+        // (`apps/desktop/src/screens/ProjectScreen.tsx`) calls
+        // `@tauri-apps/plugin-dialog`'s `open({directory: true})` — that JS
+        // API is backed by this plugin's own Tauri commands (not something
+        // `commands.rs` wraps), so it needs registering here plus the
+        // `dialog:allow-open` permission grant in
+        // `capabilities/default.json` (capabilities gate webview->plugin
+        // calls the same way they would gate a call into `commands.rs`).
+        .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             let binary_path = resolve_dev_sidecar_binary_path()?;
 

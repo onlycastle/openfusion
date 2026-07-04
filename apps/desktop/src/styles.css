@@ -105,6 +105,11 @@ body {
   color: var(--error);
 }
 
+.muted-text {
+  color: var(--muted);
+  font-size: 0.85rem;
+}
+
 .error-boundary {
   padding: 2rem;
   color: var(--error);
