@@ -47,6 +47,23 @@ export type DecodedLine =
 export class NdjsonDecoder {
   #buffer: Buffer = Buffer.alloc(0);
   readonly #maxLineBytes: number;
+  // True while resyncing past the tail of a message already rejected for
+  // being oversized (see the "growing buffer past cap, no newline yet"
+  // branch at the bottom of push()). A legitimate-but-oversized single
+  // message (e.g. a big diff in a worker.progress notification) doesn't stop
+  // sending once its prefix trips the cap — its remaining bytes keep
+  // arriving as the tail of the SAME rejected message, across any number of
+  // further push() calls, not as fresh input. While this flag is set, push()
+  // discards bytes (never buffering them — see below) up to and including
+  // the next real newline, which is that rejected message's own terminator;
+  // only then does it clear the flag and resume normal line framing on
+  // whatever follows. This keeps a single oversized rejection to exactly one
+  // diagnostic (emitted at the moment of breach, below) instead of
+  // re-tripping the cap on every subsequent oversized chunk, or — once a
+  // newline eventually lands inside the tail's garbage bytes — misparsing it
+  // as a new, merely-malformed line (a spurious parse-error attributable to
+  // a message the engine already rejected).
+  #skipping = false;
 
   constructor(options: NdjsonDecoderOptions = {}) {
     this.#maxLineBytes = options.maxLineBytes ?? MAX_NDJSON_LINE_BYTES;
@@ -57,6 +74,24 @@ export class NdjsonDecoder {
     this.#buffer = this.#buffer.length === 0 ? incoming : Buffer.concat([this.#buffer, incoming]);
 
     const out: DecodedLine[] = [];
+
+    if (this.#skipping) {
+      const newlineIndex = this.#buffer.indexOf(0x0a);
+      if (newlineIndex === -1) {
+        // Still no terminator for the rejected message: none of these bytes
+        // belong to a line we'll ever parse, so drop them immediately rather
+        // than retain them — this is what keeps skipping memory-bounded even
+        // against a tail that never terminates.
+        this.#buffer = Buffer.alloc(0);
+        return out;
+      }
+      // Found the rejected message's real terminator: discard through it
+      // (inclusive) and fall through to resume normal framing on whatever
+      // follows, all within this same push() call.
+      this.#buffer = this.#buffer.subarray(newlineIndex + 1);
+      this.#skipping = false;
+    }
+
     let newlineIndex = this.#buffer.indexOf(0x0a);
     while (newlineIndex !== -1) {
       if (newlineIndex > this.#maxLineBytes) {
@@ -82,11 +117,17 @@ export class NdjsonDecoder {
     // What's left has no newline yet — it's the partial start of the next
     // line. If it has already grown past the cap, there is no telling
     // whether (or when) a terminating newline will ever show up, so there is
-    // no id to recover either way: reject now and reset rather than keep
-    // accumulating bytes waiting on a newline that may never arrive.
+    // no id to recover either way: reject now rather than keep accumulating
+    // bytes waiting on a newline that may never arrive. Enter skip mode
+    // (rather than just resetting and resuming clean framing at the next
+    // byte) so the rest of THIS message's tail — which keeps arriving across
+    // however many further push() calls — is discarded as one unit through
+    // its own terminating newline, instead of being misparsed as new lines;
+    // see #skipping's doc comment above.
     if (this.#buffer.length > this.#maxLineBytes) {
       out.push({ ok: false, oversized: true, discardedBytes: this.#buffer.length });
       this.#buffer = Buffer.alloc(0);
+      this.#skipping = true;
     }
     return out;
   }
