@@ -1,6 +1,7 @@
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { Language, Parser, Query } from "web-tree-sitter";
+import { isPackagedSidecar, packagedAssetPath } from "../util/sidecar-runtime.js";
 import { LANGUAGE_SPECS, queriesDir, wasmDir } from "./languages.js";
 import type { SymbolEntry } from "./store.js";
 
@@ -25,7 +26,18 @@ export class WikiParser {
   }
 
   static async create(): Promise<WikiParser> {
-    await Parser.init();
+    // Compiled-sidecar case: Parser.init() loads tree-sitter's own core
+    // runtime wasm (distinct from the per-language grammar wasm files
+    // Language.load() takes an explicit path for below) via an Emscripten
+    // `locateFile` hook that defaults to resolving next to `import.meta.url`
+    // — meaningless once bundled/compiled (see wasmDir()'s doc comment).
+    // build-sidecar.mjs copies the real file to
+    // "<binary>.assets/wasm/web-tree-sitter.wasm".
+    await Parser.init(
+      isPackagedSidecar()
+        ? { locateFile: (fileName: string) => packagedAssetPath("wasm", fileName) }
+        : undefined,
+    );
     const parser = new Parser();
     const byExtension = new Map<string, LoadedLanguage>();
     const queryCache = new Map<string, string>();
