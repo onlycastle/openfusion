@@ -8,6 +8,14 @@ function makeDispatcher(): RpcDispatcher {
   dispatcher.register("boom", () => {
     throw new Error("kaboom");
   });
+  dispatcher.register("boom-string", () => {
+    // Deliberately throwing a non-Error value to exercise dispatch()'s
+    // `err instanceof Error ? err.message : String(err)` fallback branch.
+    throw "kaboom-string";
+  });
+  dispatcher.register("boom-object", () => {
+    throw { weird: true };
+  });
   dispatcher.register("nothing", () => undefined);
   return dispatcher;
 }
@@ -60,6 +68,28 @@ describe("RpcDispatcher", () => {
     });
     expect(res?.error?.code).toBe(RpcErrorCodes.INTERNAL_ERROR);
     expect(res?.error?.message).toBe("kaboom");
+  });
+
+  it("converts a handler throwing a non-Error string into an INTERNAL_ERROR envelope with the right id", async () => {
+    const res = await makeDispatcher().dispatch({
+      jsonrpc: "2.0",
+      id: 3,
+      method: "boom-string",
+    });
+    expect(res?.id).toBe(3);
+    expect(res?.error?.code).toBe(RpcErrorCodes.INTERNAL_ERROR);
+    expect(res?.error?.message).toBe("kaboom-string");
+  });
+
+  it("converts a handler throwing a non-Error, non-RpcError object into an INTERNAL_ERROR envelope with the right id", async () => {
+    const res = await makeDispatcher().dispatch({
+      jsonrpc: "2.0",
+      id: "req-4",
+      method: "boom-object",
+    });
+    expect(res?.id).toBe("req-4");
+    expect(res?.error?.code).toBe(RpcErrorCodes.INTERNAL_ERROR);
+    expect(res?.error?.message).toBe(String({ weird: true }));
   });
 
   it("returns null for notifications (no id), even on error", async () => {

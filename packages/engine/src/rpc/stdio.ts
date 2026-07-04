@@ -29,6 +29,18 @@ export class StdioPipeline {
   }
 
   handleDecoded(line: DecodedLine): void {
+    if (!line.ok && line.oversized) {
+      // The ndjson reader rejected a line for blowing past its byte cap
+      // before ever completing — there is no id to recover (we deliberately
+      // stopped buffering before the line finished), so there is nothing
+      // meaningful to reply to over stdout. Surface it as a transport-level
+      // diagnostic (metadata only — byte count, never content) and keep
+      // reading; the decoder has already reset its own buffer.
+      this.#onError(
+        new Error(`ndjson: rejected oversized line (${line.discardedBytes} bytes discarded)`),
+      );
+      return;
+    }
     const task = (async () => {
       const response = line.ok
         ? await this.#dispatcher.dispatch(line.value)
