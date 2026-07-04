@@ -137,6 +137,32 @@
 //! which unblocks the writer's write with a broken-pipe error so it can
 //! finish and be joined.
 //!
+//! ## M8 Task 2: `OPENFUSION_ASSETS_DIR` on spawn
+//!
+//! The sidecar self-locates its runtime assets (better-sqlite3's native
+//! addon, tree-sitter wasm files, tags.scm queries) via
+//! `${process.execPath}.assets` by default, but that self-location breaks
+//! once the sidecar is bundled into a packaged `.app`: `bundle.externalBin`
+//! puts the binary in `Contents/MacOS/`, while `bundle.resources` puts the
+//! `.assets/` dir in a *different* directory, `Contents/Resources/` (see
+//! `lib.rs`'s "M8 Task 2" section and `tauri.conf.json`'s `bundle.resources`
+//! entry). The engine sidecar (Task 1) accepts `OPENFUSION_ASSETS_DIR` as an
+//! override that takes priority over `${execPath}.assets`; this module is
+//! the other end of that contract — [`EngineBridge::spawn_with_assets_dir`]
+//! sets it on the child's environment via [`build_command`]. `lib.rs`
+//! resolves the correct directory for whichever mode it's running in
+//! (dev or packaged) and always passes `Some(..)` — see its "M8 Task 2"
+//! section for why setting it in dev too (rather than leaving it unset) is
+//! the simpler, more uniform choice, not a functional necessity.
+//!
+//! [`spawn`](EngineBridge::spawn) and
+//! [`spawn_with_shutdown_timeout`](EngineBridge::spawn_with_shutdown_timeout)
+//! keep their existing signatures unchanged (no `assets_dir` parameter) so
+//! every pre-existing call site — in particular the large `tests/*.rs` mock-
+//! sidecar suite — keeps compiling and passing verbatim; both are now thin
+//! wrappers over the same private [`spawn_with_options`](EngineBridge::spawn_with_options)
+//! constructor [`spawn_with_assets_dir`](EngineBridge::spawn_with_assets_dir) also delegates to.
+//!
 //! ## What this module deliberately does NOT log
 //!
 //! Diagnostic lines below (`eprintln!`) are metadata only — method names,
@@ -146,7 +172,7 @@
 
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
@@ -267,6 +293,23 @@ impl std::fmt::Display for RpcError {
 
 impl std::error::Error for RpcError {}
 
+/// Builds the sidecar's `tokio::process::Command`: stdio wiring
+/// (piped in/out/err), `kill_on_drop`, and — when `assets_dir` is provided —
+/// the `OPENFUSION_ASSETS_DIR` environment override (see the module's "M8
+/// Task 2" doc section). Factored out of
+/// [`EngineBridge::spawn_with_options`] purely so tests can inspect the
+/// constructed `Command` (via `tokio::process::Command::as_std().get_envs()`)
+/// without actually spawning a child process — "spy the Command env", per
+/// the M8 task brief.
+fn build_command(binary_path: &Path, assets_dir: Option<&Path>) -> Command {
+    let mut command = Command::new(binary_path);
+    command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
+    if let Some(dir) = assets_dir {
+        command.env("OPENFUSION_ASSETS_DIR", dir);
+    }
+    command
+}
+
 /// Owns the spawned engine sidecar child and speaks JSON-RPC 2.0 over its
 /// stdio. See module docs for the tokio::process-vs-plugin-shell decision,
 /// and the "M7b Task 1" module doc section for why `ChildStdin` is owned by
@@ -299,7 +342,7 @@ impl EngineBridge {
     /// tokio runtime (Tauri's async commands and `#[tokio::test]` both
     /// qualify) since it uses `tokio::spawn` internally.
     pub fn spawn(binary_path: PathBuf) -> std::io::Result<Self> {
-        Self::spawn_with_shutdown_timeout(binary_path, DEFAULT_SHUTDOWN_TIMEOUT)
+        Self::spawn_with_options(binary_path, None, DEFAULT_SHUTDOWN_TIMEOUT)
     }
 
     /// Same as [`spawn`](Self::spawn) but with a configurable bound for
@@ -309,12 +352,26 @@ impl EngineBridge {
     /// shrink the bound well below the 5s production default so the
     /// kill-on-overrun path doesn't make the test suite slow.
     pub fn spawn_with_shutdown_timeout(binary_path: PathBuf, shutdown_timeout: Duration) -> std::io::Result<Self> {
-        let mut child = Command::new(&binary_path)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()?;
+        Self::spawn_with_options(binary_path, None, shutdown_timeout)
+    }
+
+    /// Same as [`spawn`](Self::spawn), but also sets `OPENFUSION_ASSETS_DIR`
+    /// on the sidecar's environment when `assets_dir` is `Some` (see the
+    /// module's "M8 Task 2" doc section). `lib.rs`'s `.setup()` is the real
+    /// call site — it always resolves *some* assets dir (dev or packaged)
+    /// and passes `Some(..)`; `None` is kept as a distinct, meaningful state
+    /// for tests (a bridge spawned with no override at all).
+    pub fn spawn_with_assets_dir(binary_path: PathBuf, assets_dir: Option<PathBuf>) -> std::io::Result<Self> {
+        Self::spawn_with_options(binary_path, assets_dir, DEFAULT_SHUTDOWN_TIMEOUT)
+    }
+
+    /// The shared constructor every `spawn*` variant above delegates to.
+    fn spawn_with_options(
+        binary_path: PathBuf,
+        assets_dir: Option<PathBuf>,
+        shutdown_timeout: Duration,
+    ) -> std::io::Result<Self> {
+        let mut child = build_command(&binary_path, assets_dir.as_deref()).spawn()?;
 
         let stdin = child.stdin.take().expect("child spawned with piped stdin");
         let stdout = child.stdout.take().expect("child spawned with piped stdout");
@@ -796,5 +853,52 @@ mod tests {
         let (tx, mut rx) = broadcast::channel(4);
         route_message(json!({"jsonrpc": "2.0", "error": {"code": -32000, "message": "boom"}}), &pending, &tx);
         assert!(rx.try_recv().is_err(), "malformed missing-id error response must not be broadcast");
+    }
+
+    // --- M8 Task 2: OPENFUSION_ASSETS_DIR on spawn --------------------
+    //
+    // "Spy the Command env" per the task brief: `build_command` is spawned
+    // nowhere here — these inspect the `std::process::Command` env overrides
+    // via `as_std().get_envs()` directly, so the packaged/dev distinction is
+    // proven without needing a real child process or a real `.app`.
+
+    fn env_value<'a>(command: &'a Command, key: &str) -> Option<Option<&'a std::ffi::OsStr>> {
+        command.as_std().get_envs().find(|(k, _)| *k == std::ffi::OsStr::new(key)).map(|(_, v)| v)
+    }
+
+    #[test]
+    fn build_command_sets_assets_dir_env_to_the_resolved_path_when_provided() {
+        // Stands in for the packaged case: `lib.rs`'s
+        // `resolve_packaged_assets_dir` resolves something shaped like this
+        // (`Contents/Resources/assets`) and passes it through here.
+        let assets_dir = Path::new("/Applications/OpenFusion.app/Contents/Resources/assets");
+        let command = build_command(Path::new("/bin/true"), Some(assets_dir));
+
+        let value = env_value(&command, "OPENFUSION_ASSETS_DIR");
+        assert_eq!(
+            value,
+            Some(Some(assets_dir.as_os_str())),
+            "OPENFUSION_ASSETS_DIR must be set to exactly the resolved assets dir"
+        );
+    }
+
+    #[test]
+    fn build_command_sets_assets_dir_env_for_the_dev_shaped_path_too() {
+        // Stands in for the dev case: `lib.rs`'s `dev_assets_dir_from_binary_path`
+        // resolves `<binary_path>.assets`.
+        let assets_dir = Path::new("/repo/apps/desktop/src-tauri/binaries/openfusion-engine-aarch64-apple-darwin.assets");
+        let command = build_command(Path::new("/repo/apps/desktop/src-tauri/binaries/openfusion-engine-aarch64-apple-darwin"), Some(assets_dir));
+
+        assert_eq!(env_value(&command, "OPENFUSION_ASSETS_DIR"), Some(Some(assets_dir.as_os_str())));
+    }
+
+    #[test]
+    fn build_command_does_not_set_assets_dir_env_when_none() {
+        let command = build_command(Path::new("/bin/true"), None);
+        assert_eq!(
+            env_value(&command, "OPENFUSION_ASSETS_DIR"),
+            None,
+            "no override was requested, so the env var must not appear at all (not even set-to-empty)"
+        );
     }
 }

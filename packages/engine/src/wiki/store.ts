@@ -2,7 +2,7 @@ import Database from "better-sqlite3";
 import { mkdirSync, rmSync } from "node:fs";
 import path from "node:path";
 import { ensureGitignoreGuard } from "../util/gitignore-guard.js";
-import { isPackagedSidecar, packagedAssetPath } from "../util/sidecar-runtime.js";
+import { packagedAssetPath, resolveAssetsBaseDir } from "../util/sidecar-runtime.js";
 
 export interface SymbolEntry {
   name: string;
@@ -244,25 +244,35 @@ function ensureWalMode(db: Database.Database): void {
   }
 }
 
+// Exported for direct unit-testing (test/sidecar-assets-env.test.ts) without
+// needing a working native addon at the fake path: proves the nativeBinding
+// option derives from the SAME resolved assets base as wiki/parser.ts's
+// parserInitOptions() and wiki/languages.ts's wasmDir()/queriesDir() — see
+// util/sidecar-runtime.ts's resolveAssetsBaseDir() for the shared
+// precedence.
+export function nativeBindingOption(): { nativeBinding: string } | undefined {
+  return resolveAssetsBaseDir() !== null
+    ? { nativeBinding: packagedAssetPath("better_sqlite3.node") }
+    : undefined;
+}
+
 export function openWikiStore(projectDir: string): WikiStore {
   const openfusionDir = path.join(projectDir, ".openfusion");
   const cacheDir = path.join(openfusionDir, "cache");
   mkdirSync(cacheDir, { recursive: true });
   ensureGitignoreGuard(openfusionDir, ["cache/"]);
   const dbPath = wikiDbPath(projectDir);
-  // Compiled-sidecar case: better-sqlite3's own bindings-package auto-locate
+  // Resolved-assets case: better-sqlite3's own bindings-package auto-locate
   // searches candidate paths INSIDE the pkg virtual snapshot (which never
   // contains the real .node — native addons can't be embedded in a V8
   // snapshot, only shipped alongside it), so it always fails there. Passing
   // `nativeBinding` is better-sqlite3's own documented escape hatch for
   // exactly this bundler/pkg scenario: it skips the auto-locate entirely and
   // requires the given real absolute path directly. build-sidecar.mjs copies
-  // the real better_sqlite3.node to "<binary>.assets/better_sqlite3.node" —
-  // see util/sidecar-runtime.ts for the shared convention.
-  const db = new Database(
-    dbPath,
-    isPackagedSidecar() ? { nativeBinding: packagedAssetPath("better_sqlite3.node") } : undefined,
-  );
+  // the real better_sqlite3.node to "<assets-base>/better_sqlite3.node" —
+  // see nativeBindingOption() above and util/sidecar-runtime.ts's
+  // resolveAssetsBaseDir() for where <assets-base> comes from.
+  const db = new Database(dbPath, nativeBindingOption());
   // busy_timeout must be set before attempting the WAL transition: it
   // covers ordinary statement contention, and setting it first means
   // ensureWalMode's own retry loop is only needed for the pragma's narrower

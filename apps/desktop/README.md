@@ -159,6 +159,17 @@ scans the staged directory for the one entry at `.setup()` time (a separate,
 runtime-only check — the `tauri-build` validation above happens earlier, at
 compile time).
 
+**Running the Rust tests:** use `pnpm --filter @openfusion/desktop test:rust`
+(equivalently, `cargo test --manifest-path src-tauri/Cargo.toml --features
+test-mocks` from the repo root) — a bare `cargo test` fails to compile,
+because the `src/bin/mock_*.rs` fixture binaries the integration tests spawn
+are gated behind the `test-mocks` feature (see `Cargo.toml`'s `[[bin]]`
+comments) so they never ship inside a notarized release bundle. `pnpm
+--filter @openfusion/desktop test` runs only the Vite/vitest script tests —
+it does not run the Rust suite; `test:rust` is the canonical, separate
+command for that. (Note: this is not yet wired into CI — `.github/workflows/ci.yml`
+has no cargo-test step, a pre-existing gap.)
+
 ## The Cockpit: Four Screens
 
 The desktop app exposes a "cockpit" UI with four screens:
@@ -312,34 +323,63 @@ done:
    messages). If CSP violations appear, that's a regression in the policy or a
    new inline script/style somewhere in the bundle.
 
-## Packaging, signing, entitlements (deferred to M8)
+## Packaging, signing, entitlements (M8)
 
 This scaffold's `Entitlements.plist` already documents
 `com.apple.security.cs.disable-library-validation` (needed because the
 engine sidecar dlopen()s better-sqlite3's native addon under macOS's
 hardened runtime) and leaves `allow-jit`/`allow-unsigned-executable-memory`
 commented out pending empirical verification against a signed build.
-Everything else about packaging a real, distributable `.app`/DMG is **M8
-scope**, not this milestone's:
 
-- **Packaged sidecar path resolution.** `lib.rs`'s
-  `resolve_packaged_sidecar_binary_path()` exists and is unit-tested (it
-  mirrors `tauri-plugin-shell`'s own sidecar resolution: join
-  `current_exe()`'s directory with the bundled, triple-suffix-stripped
-  binary name), but it is **not yet wired into `.setup()`'s dispatch**.
-  Switching between it and the dev-path resolver needs a reliable
-  compile-time "packaged build vs `tauri dev`" signal (Tauri's `cfg(dev)`
-  alias, driven by a `custom-protocol` Cargo feature this scaffold's
-  `Cargo.toml` never wired up), and the packaged path can only really be
-  exercised against a real bundled `.app` — so both the feature wiring and
-  the runtime switch are left to M8, alongside the rest of packaging.
-- **Nested code signing**, including the manual sidecar pre-sign fallback
-  for the known Tauri bundler bug (#11992: sidecar signing during bundling
-  can produce an invalid signature).
+- **Packaged sidecar + assets-dir dispatch — DONE (M8 Task 2).** `.setup()`
+  now resolves both the sidecar binary path and its assets dir for whichever
+  mode it's running in, and passes the assets dir to the sidecar via
+  `OPENFUSION_ASSETS_DIR` on spawn. Dev-vs-packaged is decided by
+  `exe_dir_has_packaged_sidecar` in `lib.rs`: a filesystem check ("does
+  `<exe_dir>/openfusion-engine` — the triple-stripped bundled name — exist
+  next to the running executable?"), deliberately **not** `cfg(dev)`/
+  `tauri::is_dev()` (both are driven by a `custom-protocol` Cargo feature
+  this crate's `Cargo.toml` never forwards to `tauri`, so they'd evaluate
+  `true` unconditionally in every build, packaged or not — see that
+  function's doc comment for the full reasoning). `tauri.conf.json`'s new
+  `bundle.resources` entry (`"binaries/openfusion-engine.assets": "assets"`)
+  ships the sidecar's `.assets/` dir into `Contents/Resources/assets`;
+  `stage-sidecar.mjs` now also stages a triple-less `.assets` copy at a fixed
+  path for that entry to reference (`tauri.conf.json` is static and can't
+  glob/interpolate the host's target triple the way `externalBin` does).
+  Empirically verified with a real `pnpm tauri build --debug --bundles app`:
+  the resulting `.app` has `Contents/MacOS/openfusion-engine` (no triple) and
+  `Contents/Resources/assets/{better_sqlite3.node,wasm/*.wasm,queries/**}`
+  exactly as expected, and launching that `.app` directly showed the engine
+  sidecar spawning from the packaged path and exiting cleanly (no orphan) on
+  quit — see `.superpowers/sdd/m8-task-2-report.md` for the full account.
+- **Nested code signing — DONE (M8 Task 3).** `scripts/presign-sidecar-assets.mjs`
+  runs automatically as `tauri.conf.json`'s `beforeBundleCommand`: it finds
+  every Mach-O under the staged, triple-less `binaries/openfusion-engine.assets/`
+  (in practice, `better_sqlite3.node`) and code-signs it with
+  `--options runtime --timestamp` before Tauri copies `bundle.resources`
+  into the `.app` — closing the one gap Tauri itself doesn't cover (it only
+  auto-signs the externalBin sidecar binary, never `bundle.resources`
+  content). A documented manual fallback covers the known Tauri bundler bug
+  (#11992: sidecar signing during bundling can occasionally produce an
+  invalid signature).
 - **Notarization** (`xcrun notarytool`) and **stapling the `.dmg`** itself
-  (not just the `.app`).
+  (not just the `.app`) — DONE (M8 Task 3/4). `tauri build` notarizes +
+  staples the `.app` inline when credentials are present in env;
+  `scripts/notarize-staple-dmg.mjs` staples (or, with `--notarize`, submits
+  + staples) the `.dmg` container afterward, since Tauri never notarizes the
+  `.dmg` itself.
 - Verifying empirically whether `allow-jit`/`allow-unsigned-executable-memory`
-  are actually needed for a WKWebView-based (not Electron-based) app.
+  are actually needed for a WKWebView-based (not Electron-based) app — still
+  open, needs a signed+notarized build (the JIT empirical check).
 
-See `docs/research/2026-07-04-m7-tauri-verification.md` for the full
+**The full operator runbook — prerequisites, exact env vars, the build
+sequence, verification, and troubleshooting — lives in
+[`BUILDING.md`](./BUILDING.md).** Producing an actual signed, notarized
+`.dmg` requires the operator's own Apple Developer credentials, which
+neither this repo nor CI holds; nothing here claims a signed artifact has
+actually been produced.
+
+See `docs/research/2026-07-04-m7-tauri-verification.md` and
+`docs/research/2026-07-04-m8-signing-verification.md` for the full
 investigation behind these notes.

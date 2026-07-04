@@ -1,5 +1,5 @@
 //! Integration tests for `EngineBridge` against scripted mock sidecars
-//! (see `src/bin/mock_*.rs` + `src/bin/support/mock_common.rs`).
+//! (see `src/bin/mock_*.rs` + `src/mock_common_support.rs`).
 //!
 //! These run headlessly under `cargo test` — no Tauri app, no window, no
 //! real engine binary required. Each mock binary is a genuine separate

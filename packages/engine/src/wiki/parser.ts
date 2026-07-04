@@ -1,7 +1,7 @@
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { Language, Parser, Query } from "web-tree-sitter";
-import { isPackagedSidecar, packagedAssetPath } from "../util/sidecar-runtime.js";
+import { packagedAssetPath, resolveAssetsBaseDir } from "../util/sidecar-runtime.js";
 import { LANGUAGE_SPECS, queriesDir, wasmDir } from "./languages.js";
 import type { SymbolEntry } from "./store.js";
 
@@ -16,6 +16,18 @@ interface LoadedLanguage {
   query: Query;
 }
 
+// Exported for direct unit-testing (test/sidecar-assets-env.test.ts) without
+// needing a working wasm runtime at the fake path: proves Parser.init()'s
+// locateFile hook derives from the SAME resolved assets base as
+// wiki/store.ts's nativeBindingOption() and wiki/languages.ts's
+// wasmDir()/queriesDir() — see util/sidecar-runtime.ts's
+// resolveAssetsBaseDir() for the shared precedence.
+export function parserInitOptions(): { locateFile: (fileName: string) => string } | undefined {
+  return resolveAssetsBaseDir() !== null
+    ? { locateFile: (fileName: string) => packagedAssetPath("wasm", fileName) }
+    : undefined;
+}
+
 export class WikiParser {
   #parser: Parser;
   #byExtension: Map<string, LoadedLanguage>;
@@ -26,18 +38,16 @@ export class WikiParser {
   }
 
   static async create(): Promise<WikiParser> {
-    // Compiled-sidecar case: Parser.init() loads tree-sitter's own core
+    // Resolved-assets case: Parser.init() loads tree-sitter's own core
     // runtime wasm (distinct from the per-language grammar wasm files
     // Language.load() takes an explicit path for below) via an Emscripten
     // `locateFile` hook that defaults to resolving next to `import.meta.url`
     // — meaningless once bundled/compiled (see wasmDir()'s doc comment).
     // build-sidecar.mjs copies the real file to
-    // "<binary>.assets/wasm/web-tree-sitter.wasm".
-    await Parser.init(
-      isPackagedSidecar()
-        ? { locateFile: (fileName: string) => packagedAssetPath("wasm", fileName) }
-        : undefined,
-    );
+    // "<assets-base>/wasm/web-tree-sitter.wasm" — see
+    // util/sidecar-runtime.ts's resolveAssetsBaseDir() for where
+    // <assets-base> comes from.
+    await Parser.init(parserInitOptions());
     const parser = new Parser();
     const byExtension = new Map<string, LoadedLanguage>();
     const queryCache = new Map<string, string>();

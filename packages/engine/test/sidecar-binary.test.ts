@@ -1,5 +1,5 @@
 import { execFileSync, spawn } from "node:child_process";
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -67,9 +67,13 @@ interface JsonRpcResponse {
 function callSidecar(
   bin: string,
   request: { jsonrpc: "2.0"; id: number; method: string; params: unknown },
+  extraEnv?: Record<string, string>,
 ): Promise<{ response: JsonRpcResponse; stdout: string; stderr: string }> {
   return new Promise((resolve, reject) => {
-    const child = spawn(bin, [], { stdio: ["pipe", "pipe", "pipe"] });
+    const child = spawn(bin, [], {
+      stdio: ["pipe", "pipe", "pipe"],
+      env: extraEnv === undefined ? process.env : { ...process.env, ...extraEnv },
+    });
     let stdout = "";
     let stderr = "";
     let settled = false;
@@ -172,6 +176,75 @@ describe("compiled sidecar binary", () => {
       expect(lines.length).toBeGreaterThanOrEqual(1);
       for (const line of lines) {
         expect(() => JSON.parse(line)).not.toThrow();
+      }
+    },
+    30_000,
+  );
+
+  // THE LOAD-BEARING PROOF for M8 Blocker B: in the packaged `.app`, Tauri
+  // stages the sidecar binary at `Contents/MacOS/openfusion-engine` (no
+  // sibling `.assets/` dir there at all — `bundle.resources` ships it into
+  // the DIFFERENT `Contents/Resources/` dir instead), so `${execPath}.
+  // assets` self-location (the default proven above) cannot work in the
+  // packaged app. This test simulates exactly that: it HIDES the binary's
+  // real sibling `.assets/` dir (rename, not delete, so it's restored for
+  // any other test/run afterward), copies its contents to an unrelated tmp
+  // dir, and spawns the SAME compiled binary with `OPENFUSION_ASSETS_DIR`
+  // pointed at that relocated copy — proving the env var alone is
+  // sufficient even when the binary's own default self-location has
+  // nothing there to find.
+  it.skipIf(!binaryExists)(
+    "with OPENFUSION_ASSETS_DIR pointed at a relocated assets dir (simulating the packaged-.app layout) and no sibling .assets dir present, still loads the native addon + wasm and returns a well-formed result",
+    async () => {
+      const realAssetsDir = `${binaryPath}.assets`;
+      const hiddenAssetsDir = `${realAssetsDir}.hidden-for-relocation-test`;
+      const relocatedRoot = mkdtempSync(path.join(os.tmpdir(), "of-relocated-assets-"));
+      const relocatedAssetsDir = path.join(relocatedRoot, "assets");
+
+      renameSync(realAssetsDir, hiddenAssetsDir);
+      try {
+        execFileSync("cp", ["-R", hiddenAssetsDir, relocatedAssetsDir]);
+        // Sanity-check the simulated packaged layout: the binary's default
+        // self-location target must genuinely be gone, or this test would
+        // pass for the wrong reason (falling back to it instead of using
+        // OPENFUSION_ASSETS_DIR).
+        expect(existsSync(realAssetsDir)).toBe(false);
+
+        dir = mkdtempSync(path.join(os.tmpdir(), "of-sidecar-relocated-"));
+        execFileSync("git", ["init", "-q", dir]);
+        execFileSync("git", ["-C", dir, "config", "user.email", "t@t"]);
+        execFileSync("git", ["-C", dir, "config", "user.name", "t"]);
+        writeFileSync(path.join(dir, "x.ts"), "export function xray() {}\nxray();\n");
+        execFileSync("git", ["-C", dir, "add", "-A"]);
+        execFileSync("git", ["-C", dir, "commit", "-qm", "init"]);
+
+        const { response } = await callSidecar(
+          binaryPath!,
+          {
+            jsonrpc: "2.0",
+            id: 3,
+            method: "engine.wiki.build",
+            params: { projectDir: dir },
+          },
+          { OPENFUSION_ASSETS_DIR: relocatedAssetsDir },
+        );
+
+        expect(response.error).toBeUndefined();
+        const result = response.result as {
+          filesIndexed: number;
+          symbols: number;
+          refs: number;
+        };
+        // Same load-bearing assertions as the default-self-location proof
+        // above: a real row got written (native addon loaded) and at least
+        // one symbol/ref got extracted (wasm parser ran) — from the
+        // RELOCATED dir, with no sibling .assets dir in sight.
+        expect(result.filesIndexed).toBe(1);
+        expect(result.symbols).toBeGreaterThanOrEqual(1);
+        expect(result.refs).toBeGreaterThanOrEqual(1);
+      } finally {
+        rmSync(relocatedRoot, { recursive: true, force: true });
+        renameSync(hiddenAssetsDir, realAssetsDir);
       }
     },
     30_000,

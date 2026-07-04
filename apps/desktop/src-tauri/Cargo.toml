@@ -19,6 +19,105 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 name = "openfusion-desktop"
 path = "src/main.rs"
 
+# --- test-only mock sidecar binaries (src/bin/mock_*.rs) -------------------
+# These are cargo-test fixtures (see src/mock_common_support.rs's doc
+# comment): tests/engine_bridge.rs, tests/commands.rs, and tests/lifecycle.rs
+# spawn them via `env!("CARGO_BIN_EXE_mock_<name>")`. Left as plain
+# auto-discovered `src/bin/*.rs` targets, `cargo build --release` / `tauri
+# build` would ALSO produce them as `Contents/MacOS/mock_*` — unsigned nested
+# Mach-Os that hard-fail notarization (see
+# docs/research/2026-07-04-m8-signing-verification.md).
+#
+# Fix: give each an explicit `[[bin]]` (merged with its auto-discovered
+# target by name+path) gated by `required-features = ["test-mocks"]`. Cargo
+# skips a target entirely when its required feature isn't enabled, for BOTH
+# `cargo build` and `cargo test` — so a plain `cargo build --release` (no
+# --features) produces none of them, while `cargo test --features
+# test-mocks` builds them so the integration tests can spawn them.
+#
+# `test-mocks` is intentionally NOT a default feature: default features are
+# not stripped by `--release`, so making it default-on would still leak the
+# mocks into a release build. That means `cargo test` MUST be invoked as
+# `cargo test --features test-mocks` for these tests to compile (a plain
+# `cargo test` fails at compile time on the `env!("CARGO_BIN_EXE_mock_*")`
+# calls, since those env vars are only set for targets Cargo actually
+# builds). Verified: a `[alias] test = "test --features test-mocks"` in
+# .cargo/config.toml does NOT work — Cargo ignores aliases that shadow a
+# built-in subcommand name ("user-defined alias `test` is ignored, because
+# it is shadowed by a built-in command").
+[[bin]]
+name = "mock_echo"
+path = "src/bin/mock_echo.rs"
+required-features = ["test-mocks"]
+test = false
+
+[[bin]]
+name = "mock_reverse3"
+path = "src/bin/mock_reverse3.rs"
+required-features = ["test-mocks"]
+test = false
+
+[[bin]]
+name = "mock_error"
+path = "src/bin/mock_error.rs"
+required-features = ["test-mocks"]
+test = false
+
+[[bin]]
+name = "mock_notify"
+path = "src/bin/mock_notify.rs"
+required-features = ["test-mocks"]
+test = false
+
+[[bin]]
+name = "mock_malformed_between"
+path = "src/bin/mock_malformed_between.rs"
+required-features = ["test-mocks"]
+test = false
+
+[[bin]]
+name = "mock_die_on_request"
+path = "src/bin/mock_die_on_request.rs"
+required-features = ["test-mocks"]
+test = false
+
+[[bin]]
+name = "mock_clean_exit_on_eof"
+path = "src/bin/mock_clean_exit_on_eof.rs"
+required-features = ["test-mocks"]
+test = false
+
+[[bin]]
+name = "mock_ignore_eof"
+path = "src/bin/mock_ignore_eof.rs"
+required-features = ["test-mocks"]
+test = false
+
+[[bin]]
+name = "mock_stdin_black_hole"
+path = "src/bin/mock_stdin_black_hole.rs"
+required-features = ["test-mocks"]
+test = false
+
+[[bin]]
+name = "mock_delayed_drain_echo"
+path = "src/bin/mock_delayed_drain_echo.rs"
+required-features = ["test-mocks"]
+test = false
+
+[[bin]]
+name = "mock_slow_response_echo"
+path = "src/bin/mock_slow_response_echo.rs"
+required-features = ["test-mocks"]
+test = false
+
+[features]
+# Gates the src/bin/mock_*.rs test-fixture binaries (see the `[[bin]]` doc
+# comment above). Default-off on purpose. Run tests with:
+#   cargo test --features test-mocks
+default = []
+test-mocks = []
+
 [build-dependencies]
 tauri-build = { version = "2.6", features = [] }
 

@@ -36,11 +36,15 @@ export default defineConfig(async () => ({
   },
   test: {
     // Component tests render into a DOM (App shell, screens); jsdom gives
-    // them one without a real browser/webview.
+    // them one without a real browser/webview. `scripts/**` are plain Node
+    // ESM build/CI scripts (no DOM involved) -- those files opt into the
+    // real `node` environment individually via a `@vitest-environment node`
+    // docblock at the top of each file (Vitest 4 removed
+    // `environmentMatchGlobs`, which used to do this per-glob here).
     environment: "jsdom",
     // No `vitest/globals` — every test file imports `describe`/`it`/`expect`
     // explicitly, so tsconfig.json needs no ambient-globals type addition.
     globals: false,
-    include: ["src/**/*.test.{ts,tsx}"],
+    include: ["src/**/*.test.{ts,tsx}", "scripts/**/*.test.mjs"],
   },
 }));

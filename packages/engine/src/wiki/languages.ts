@@ -1,7 +1,7 @@
 import { createRequire } from "node:module";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { isPackagedSidecar, packagedAssetPath } from "../util/sidecar-runtime.js";
+import { packagedAssetPath, resolveAssetsBaseDir } from "../util/sidecar-runtime.js";
 
 export interface LanguageSpec {
   id: string;
@@ -35,15 +35,18 @@ export const LANGUAGE_SPECS: LanguageSpec[] = [
   { id: "java", wasmFile: "tree-sitter-java.wasm", queryDir: "java", extensions: [".java"] },
 ];
 
-// Compiled-sidecar case FIRST in both functions below: a pkg snapshot has no
+// Resolved-assets case FIRST in both functions below: a pkg snapshot has no
 // real node_modules and import.meta.url points into the virtual `/snapshot/`
 // filesystem, so the normal dev-mode resolution (require.resolve /
 // file-URL-relative) would resolve to paths that don't exist on the real
 // filesystem at runtime. build-sidecar.mjs copies the real wasm files and
-// queries/ tree into "<binary>.assets/" alongside the compiled executable —
-// see util/sidecar-runtime.ts for the shared convention.
+// queries/ tree into the resolved assets base dir (the sibling
+// "<binary>.assets/" dir, or OPENFUSION_ASSETS_DIR in the packaged .app —
+// see util/sidecar-runtime.ts's resolveAssetsBaseDir() for the shared
+// precedence both this file and wiki/store.ts's nativeBindingOption() /
+// wiki/parser.ts's parserInitOptions() derive from).
 export function wasmDir(): string {
-  if (isPackagedSidecar()) return packagedAssetPath("wasm");
+  if (resolveAssetsBaseDir() !== null) return packagedAssetPath("wasm");
   const require = createRequire(import.meta.url);
   return path.join(
     path.dirname(require.resolve("@vscode/tree-sitter-wasm/package.json")),
@@ -52,7 +55,7 @@ export function wasmDir(): string {
 }
 
 export function queriesDir(): string {
-  if (isPackagedSidecar()) return packagedAssetPath("queries");
+  if (resolveAssetsBaseDir() !== null) return packagedAssetPath("queries");
   // src/wiki/ and dist/wiki/ are both two levels below the package root,
   // where queries/ lives (shipped via package.json "files").
   return path.resolve(

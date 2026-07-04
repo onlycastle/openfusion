@@ -1,6 +1,6 @@
 //! Integration tests for the Tauri command layer (`src/commands.rs`), run
 //! against real mock-sidecar-backed `EngineBridge` instances (see Task 3's
-//! `src/bin/mock_*.rs` fixtures + `src/bin/support/mock_common.rs`).
+//! `src/bin/mock_*.rs` fixtures + `src/mock_common_support.rs`).
 //!
 //! These deliberately do NOT bootstrap a Tauri `App`/`State`/window.
 //! `route_engine_call` takes a bare `&EngineBridge`, and `forward_notifications`
