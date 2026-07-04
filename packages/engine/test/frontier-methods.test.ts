@@ -2,7 +2,7 @@ import { execFileSync } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { RpcErrorCodes } from "@openfusion/shared";
 import { createEngine, type Engine } from "../src/engine.js";
 import type {
@@ -633,6 +633,50 @@ describe("frontier RPC methods", () => {
     const list = await call("engine.frontier.list", {});
     expect(list.result.sessions).toEqual([{ sessionId, engine: "claude-code", projectDir: dir }]);
   }, 5_000);
+
+  // M7b Task 2 (M6 inherit — the review flagged this exact gap): abortAll()
+  // used to only ever sweep #activeHandles (RPC-addressable
+  // engine.frontier.prompt calls) — it had no way to reach a session
+  // tracked ONLY via track() (orchestrate.ts's review/escalation sessions,
+  // evals/run.ts's baseline session, harness/generate.ts's generation
+  // session — all opened DIRECTLY off the adapter, bypassing
+  // engine.frontier.start entirely). Fixed by adding a second, best-effort
+  // sweep over #tracked that calls close() on each — the only interrupt
+  // surface FrontierSession exposes for a session with no RPC-addressable
+  // handle. This is a focused unit test of that fix ALONE (constructing a
+  // minimal fake FrontierSession and calling track()/abortAll() directly),
+  // independent of engine.cancel (a separate, per-runId mechanism tested
+  // elsewhere).
+  it("abortAll() also reaches a #tracked session with no RPC-addressable handle, by calling its close()", async () => {
+    dir = makeRepo();
+    engine = createEngine();
+    const closeSpy = vi.fn(async () => {});
+    const fakeSession: FrontierSession = {
+      id: "direct-tracked-session",
+      projectDir: dir,
+      prompt(): FrontierPromptHandle {
+        throw new Error("not used in this test");
+      },
+      close: closeSpy,
+    };
+
+    engine.frontier.track(fakeSession);
+    expect(engine.frontier.trackedCount()).toBe(1);
+
+    engine.frontier.abortAll();
+
+    // abortAll() is synchronous and fire-and-forget (close()'s own promise
+    // is not awaited by abortAll itself) — give the microtask queue one
+    // tick to let the close() call actually run before asserting.
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(closeSpy).toHaveBeenCalledTimes(1);
+    // abortAll() does NOT remove #tracked entries — that stays each
+    // session's own owning caller's job via track()'s returned untrack fn
+    // (unchanged, mirrors close()'s own identical non-removal-by-abortAll
+    // contract for #activeHandles above).
+    expect(engine.frontier.trackedCount()).toBe(1);
+  });
 
   // Review finding 4 (Minor): removeSession()'s `await entry.session.close()`
   // was unguarded (unlike close()'s per-session try/catch over the same

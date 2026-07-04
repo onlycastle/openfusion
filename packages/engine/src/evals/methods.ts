@@ -32,6 +32,13 @@ const RunParamsSchema = z.object({
   projectDir: z.string().min(1),
   tasks: z.array(TaskDescriptorSchema).min(1),
   sampleNote: z.string().optional(),
+  // M7b Task 2: THIS handler is the outermost owner of this runId's
+  // lifecycle (register()/deregister() below) -- runEvals's own per-task
+  // loop, and any nested engine.orchestrate call it drives per task, only
+  // ever get() the SAME runId, so engine.cancel({runId}) reaches whichever
+  // task/sub-operation is currently in flight, however deep. See
+  // cancel-registry.ts's header comment for the full ownership split.
+  runId: z.string().min(1).optional(),
 });
 
 // Sibling-pattern marker class (mirrors OrchestrateService/HarnessService on
@@ -40,25 +47,32 @@ export class EvalsService {}
 
 export function registerEvalsMethods(engine: Engine): void {
   registerMethod(engine.dispatcher, "engine.evals.run", RunParamsSchema, async (params) => {
-    let tasks: EvalTask[];
+    const runId = params.runId;
+    if (runId !== undefined) engine.cancelRegistry.register(runId);
     try {
-      tasks = await Promise.all(
-        params.tasks.map((d) => goldenTaskFromCommit(params.projectDir, d.commitSha, d.testCommand)),
-      );
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      throw new RpcMethodError(RpcErrorCodes.SERVER_ERROR, `failed to construct golden task: ${message}`);
-    }
+      let tasks: EvalTask[];
+      try {
+        tasks = await Promise.all(
+          params.tasks.map((d) => goldenTaskFromCommit(params.projectDir, d.commitSha, d.testCommand)),
+        );
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        throw new RpcMethodError(RpcErrorCodes.SERVER_ERROR, `failed to construct golden task: ${message}`);
+      }
 
-    const report: EvalsReportCard = await runEvals(engine, {
-      projectDir: params.projectDir,
-      tasks,
-      sampleNote: params.sampleNote,
-    });
-    engine.log(
-      `evals.run ${params.projectDir}: verdict=${report.verdict} taskCount=${report.taskCount} ` +
-        `savingsPct=${report.savingsPct ?? "null"}`,
-    );
-    return report;
+      const report: EvalsReportCard = await runEvals(engine, {
+        projectDir: params.projectDir,
+        tasks,
+        sampleNote: params.sampleNote,
+        runId: params.runId,
+      });
+      engine.log(
+        `evals.run ${params.projectDir}: verdict=${report.verdict} taskCount=${report.taskCount} ` +
+          `savingsPct=${report.savingsPct ?? "null"}`,
+      );
+      return report;
+    } finally {
+      if (runId !== undefined) engine.cancelRegistry.deregister(runId);
+    }
   });
 }

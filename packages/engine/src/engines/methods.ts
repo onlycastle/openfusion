@@ -248,6 +248,32 @@ export class FrontierService {
     for (const handle of this.#activeHandles.values()) {
       handle.abort();
     }
+    // M7b Task 2 (M6 inherit — the review flagged this as a gap): #tracked
+    // holds EVERY live session (addSession() re-adds engine.frontier.start's
+    // own sessions to this SAME Set — see its doc comment), but only the
+    // DIRECT ones (review/escalation/generate/eval-baseline — opened
+    // straight off the adapter, bypassing engine.frontier.start) have no
+    // RPC-addressable handle for the loop above to reach. An addressable
+    // session (one backing a #sessions entry) is deliberately EXCLUDED from
+    // this sweep — abortAll()'s own contract is "abort handles, never close
+    // sessions" (see this method's own doc comment above and its dedicated
+    // test), and #activeHandles already covers that session's in-flight
+    // prompt, if any. close() is the only interrupt surface FrontierSession
+    // exposes at all (types.ts: "must kill any subprocess") for a session
+    // with NO addressable handle, which is why only THOSE get closed here.
+    // Mirrors close()'s own identical #tracked sweep below (which closes
+    // everything, addressable or not, since it's full teardown), but WITHOUT
+    // removing entries from #tracked — that stays each session's own owning
+    // caller's job via track()'s returned untrack fn, unchanged. Best-effort,
+    // fire-and-forget: this method stays synchronous (never awaited by any
+    // caller) and a throwing adapter close() must not block or fail it.
+    const addressableSessions = new Set([...this.#sessions.values()].map((entry) => entry.session));
+    for (const session of this.#tracked) {
+      if (addressableSessions.has(session)) continue;
+      session.close().catch(() => {
+        // Best-effort, same per-session isolation as close()'s own sweep.
+      });
+    }
   }
 
   async close(): Promise<void> {

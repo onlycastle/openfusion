@@ -37,6 +37,13 @@ export interface ReviewDiffOpts {
   // M5b Task 4's orchestrator, which owns overall run deadlines and is the
   // first caller to actually pass a value here.
   timeoutMs?: number;
+  // M7b Task 2: this run's own cancellation signal (orchestrate.ts's
+  // cancelSignal, a READ-ONLY get() off engine.cancelRegistry) — forwarded
+  // verbatim to promptForJson's own opts.abortSignal, which applies it
+  // per-attempt (see driver.ts's own doc comment). Absent -> undefined ->
+  // every downstream `abortSignal?.` check is a no-op, so an un-cancellable
+  // review call behaves exactly as before this task.
+  abortSignal?: AbortSignal;
 }
 
 // Final review Fix 4 (Important): the diff/summary are fenced in
@@ -131,6 +138,7 @@ export async function reviewDiff(
   const result = await promptForJson(session, prompt, ReviewVerdictSchema, {
     stage: "review",
     timeoutMs: opts.timeoutMs,
+    abortSignal: opts.abortSignal,
   });
   return { verdict: result.value, costUsd: result.costUsd };
 }

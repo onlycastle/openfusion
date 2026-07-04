@@ -203,6 +203,28 @@ function makeAttempt1ThenThrowWorkerMock(): MockLanguageModelV4 {
   });
 }
 
+// M7b Task 2: simulates a hung worker model call — the returned promise
+// never settles on its own, but DOES honor the `abortSignal` generateText
+// attaches to the call, so the cancel-signal plumbing (timeoutMs ->
+// AbortSignal.timeout(), WorkerService.close(), and now engine.cancel's own
+// per-run AbortController — all combined via worker/methods.ts's
+// AbortSignal.any) has something real to interrupt. Ported verbatim from
+// worker-methods.test.ts's own makeHangingWorkerMock (see its doc comment
+// for why the arrow function is `return`ed rather than `await`ed-then-
+// fallen-off-the-end).
+function makeHangingWorkerMock(): MockLanguageModelV4 {
+  return new MockLanguageModelV4({
+    doGenerate: async ({ abortSignal }) =>
+      new Promise<never>((_resolve, reject) => {
+        if (abortSignal?.aborted) {
+          reject(abortSignal.reason);
+          return;
+        }
+        abortSignal?.addEventListener("abort", () => reject(abortSignal.reason), { once: true });
+      }),
+  });
+}
+
 // --- Scripted fake frontier adapter ----------------------------------------
 
 function resultEvent(overrides: Partial<Extract<FrontierEvent, { type: "result" }>> = {}): FrontierEvent {
@@ -1200,6 +1222,101 @@ describe("engine.orchestrate — in-flight review + engine.close() (Task 1 Chang
     // surfaces as a SERVER_ERROR, not a hang.
     expect(res.error).toBeDefined();
   }, 15_000);
+});
+
+// M7b Task 2: engine-side cancellation of an in-flight engine.orchestrate
+// run via engine.cancel { runId }. Unlike the engine.close()-driven test
+// above (which tears down EVERYTHING), engine.cancel targets exactly ONE
+// run by its client-supplied runId, leaving any other in-flight run (and
+// the engine itself) untouched.
+describe("engine.orchestrate — cancellation via engine.cancel (M7b Task 2)", () => {
+  it("cancel mid-run (hanging worker attempt): aborts promptly, reports the cancelled marker, preserves the worktree breadcrumb, and leaves the registry empty", async () => {
+    dir = makeRepo();
+    await writeTestHarness(dir);
+    engine = createEngine();
+    engine.models.registry.configure({ id: "p1", kind: "deepseek", apiKey: TEST_API_KEY });
+    engine.models.registry.setTestModel("p1", makeHangingWorkerMock());
+    engine.frontier.registerAdapter(makeFakeFrontierAdapter({}));
+
+    const start = Date.now();
+    const orchestratePromise = call(engine, "engine.orchestrate", {
+      projectDir: dir,
+      task: "add hello.txt with a greeting",
+      runId: "r1",
+    });
+
+    // Wait for the worker attempt to actually start (worktree created) —
+    // polled via the real engine.worker.list RPC rather than a fixed sleep,
+    // mirroring worker-methods.test.ts's own "engine.close() aborts an
+    // in-flight run" test's identical poll-until-started pattern (and this
+    // suite's own "in-flight review + engine.close()" test above).
+    const startDeadline = Date.now() + 10_000;
+    for (;;) {
+      const listRes = await call(engine, "engine.worker.list", { projectDir: dir });
+      if ((listRes.result?.worktrees?.length ?? 0) > 0) break;
+      if (Date.now() > startDeadline) throw new Error("worker run never created its worktree");
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+
+    const cancelRes = await call(engine, "engine.cancel", { runId: "r1" });
+    expect(cancelRes.error).toBeUndefined();
+    expect(cancelRes.result.cancelled).toBe(true);
+
+    const res = await orchestratePromise;
+    const elapsed = Date.now() - start;
+    // Generous bound — only engine.cancel's abort (not the hanging model's
+    // own never-settling promise) could plausibly end this run this fast.
+    expect(elapsed).toBeLessThan(5_000);
+
+    expect(res.result).toBeUndefined();
+    expect(res.error).toBeDefined();
+    expect(res.error.code).toBe(RpcErrorCodes.SERVER_ERROR);
+    expect(res.error.data.cancelled).toBe(true);
+    // Breadcrumb, not deleted: the worker attempt's worktree is left on disk
+    // exactly like any other failed attempt (worktree.ts's own "never
+    // remove on a failure path" discipline) — cancellation is deliberately
+    // treated just like any other failure for worktree-preservation
+    // purposes.
+    expect(res.error.data.worktree).not.toBeNull();
+    expect(existsSync(res.error.data.worktree.path)).toBe(true);
+
+    // No leak: the registry entry this run's runId occupied is gone once
+    // the run has settled (methods.ts's own register/finally-deregister).
+    expect(engine.cancelRegistry.size()).toBe(0);
+  }, 15_000);
+
+  it("engine.cancel on an unknown runId resolves { cancelled: false } without erroring", async () => {
+    dir = makeRepo();
+    engine = createEngine();
+
+    const res = await call(engine, "engine.cancel", { runId: "no-such-run" });
+    expect(res.error).toBeUndefined();
+    expect(res.result.cancelled).toBe(false);
+  });
+
+  it("an ordinary (uncancelled) run with a runId behaves exactly as before, and the registry empties on normal completion too", async () => {
+    dir = makeRepo();
+    await writeTestHarness(dir);
+    engine = createEngine();
+    engine.models.registry.configure({ id: "p1", kind: "deepseek", apiKey: TEST_API_KEY });
+    engine.models.registry.setTestModel(
+      "p1",
+      makeWorkerMock("hello.txt", "HELLO FROM WORKER", "Created hello.txt"),
+    );
+    engine.frontier.registerAdapter(makeFakeFrontierAdapter({}));
+
+    const res = await call(engine, "engine.orchestrate", {
+      projectDir: dir,
+      task: "add hello.txt with a greeting",
+      runId: "r-normal",
+    });
+
+    expect(res.error).toBeUndefined();
+    expect(res.result.outcome).toBe("worker-approved");
+    expect(res.result.diff).toContain("hello.txt");
+    // Registry emptied on NORMAL completion too, not just on cancel.
+    expect(engine.cancelRegistry.size()).toBe(0);
+  });
 });
 
 describe("engine.orchestrate.apply", () => {
