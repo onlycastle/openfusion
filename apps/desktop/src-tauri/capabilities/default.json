@@ -11,7 +11,7 @@
         {
           "name": "binaries/openfusion-engine",
           "sidecar": true,
-          "args": true
+          "args": false
         }
       ]
     }
