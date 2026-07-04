@@ -162,18 +162,36 @@ async fn forward_notifications_continues_after_lagged_receiver() {
     let (_shutdown_tx, shutdown_rx) = watch::channel(false);
     let (channel, mut received) = observing_channel();
 
-    let handle = forward_notifications(rx, shutdown_rx, channel);
-
-    // Flood well past the channel's capacity before the pump can drain
-    // anything, guaranteeing its next `rx.recv()` observes
-    // `RecvError::Lagged` rather than a normal value.
+    // Flood — and send the post-lag marker — *before* the pump is spawned,
+    // while `rx` is still a plain, un-polled local receiver that only we can
+    // touch. `forward_notifications` hands `rx` off to
+    // `tauri::async_runtime::spawn`, which (since no test in this file ever
+    // calls `tauri::async_runtime::set`) lazily boots its own independent
+    // multi-threaded Tokio runtime the first time it's called — a separate
+    // thread pool from this `#[tokio::test]`'s own runtime. That means the
+    // pump task runs with genuine OS-level concurrency against this test
+    // body, not just cooperative interleaving: spawning the pump *before*
+    // flooding let its worker thread occasionally win the race and drain
+    // messages as fast as they were produced, keeping pace with the
+    // capacity-4 channel and never lagging at all — which buried the
+    // `after-lag` marker past the read budget below and made the test flaky
+    // (~1-in-20). A receiver's lag is purely a function of "how many sends
+    // happened past capacity while this receiver's read cursor didn't
+    // move" — arithmetic, not scheduling — so doing all the sends against
+    // `rx` here, before the pump (and thus any contending task) exists,
+    // pins the "17 messages behind" state up front. Whenever the pump
+    // *does* get scheduled afterward, its very first `rx.recv()` is
+    // guaranteed to observe `RecvError::Lagged`, regardless of which
+    // runtime's thread pool wins that race.
     for i in 0..20u32 {
-        tx.send(json!({"n": i})).expect("the pump's receiver keeps the broadcast channel from being subscriber-less");
+        tx.send(json!({"n": i})).expect("rx is still alive and subscribed, so sends must succeed");
     }
     // A distinguishable message sent after the flood — if Lagged caused the
     // pump to exit or panic instead of `continue`-ing the loop, this would
     // never arrive.
-    tx.send(json!({"marker": "after-lag"})).expect("pump receiver still subscribed");
+    tx.send(json!({"marker": "after-lag"})).expect("rx is still alive and subscribed, so sends must succeed");
+
+    let handle = forward_notifications(rx, shutdown_rx, channel);
 
     let mut saw_marker = false;
     for _ in 0..8 {
