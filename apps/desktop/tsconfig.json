@@ -4,6 +4,10 @@
     "useDefineForClassFields": true,
     "module": "ESNext",
     "lib": ["ES2023", "DOM", "DOM.Iterable"],
+    "jsx": "react-jsx",
+    /* Only the "no console.* logging" test (noConsoleLogging.test.ts) needs
+       Node's fs/path/url modules, to scan this app's own source files. */
+    "types": ["node"],
     "skipLibCheck": true,
 
     /* Bundler mode (webview frontend, not a Node package — see tsconfig.base.json
