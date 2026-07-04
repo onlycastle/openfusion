@@ -160,6 +160,27 @@ This is still backbone only: the actual cockpit UI (chat, task tree, worker
 cards, diff review, cost meter) is M7b; today's webview is a single proof
 screen that calls `engine.models.list` end to end.
 
+**Realized in the shell (M7c):** the four cockpit screens are now live:
+**Project** (repo discovery, `wiki.build` live progress streamed via
+`wiki.build.progress` notifications, eval report card with verdict/savings/per-task
+results); **Keys** (frontier + open-model provider configuration, secrets
+Keychain-backed); **Orchestrate** (the "route → cheap-worker diff → frontier
+review → escalate → apply" loop end to end, streaming `orchestrate.progress`
+notifications with runId); **Evals** (baseline-vs-harness report card,
+streaming `evals.progress`, displaying honest verdict—pass/ETH-HAZARD
+fail/inconclusive, savings % with pricingConfidence caveat or "not computable,"
+per-task results, clean-subset counts). Both Orchestrate and Evals screens
+support **cancellation:** the app mints a UUID `runId` for every long-running
+call and cancels via `engine.cancel({runId})` (no per-call timeout;
+cancellation is a distinct state from failure). The engine now emits
+`orchestrate.progress` and `evals.progress` carrying runId + detail;
+`wiki.build` was updated to emit progress notifications. Eval report card
+gained structured clean-subset fields (cleanTaskCount, cleanBaselinePassed,
+cleanHarnessPassed, cleanSavingsPct, measurementFailureCount). `CancelRegistry`
+rejects duplicate active runIds. CSP is tightened (strict local-only for
+production, dev-only relaxation for HMR); CSP correctness is an operator
+smoke (verified on a running app built with `tauri build`).
+
 ## 6. Eval Loop
 
 After generation (and after major refreshes), run micro-evals baseline-vs-harness.
