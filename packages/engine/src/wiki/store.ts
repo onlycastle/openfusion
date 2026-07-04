@@ -2,6 +2,7 @@ import Database from "better-sqlite3";
 import { mkdirSync, rmSync } from "node:fs";
 import path from "node:path";
 import { ensureGitignoreGuard } from "../util/gitignore-guard.js";
+import { isPackagedSidecar, packagedAssetPath } from "../util/sidecar-runtime.js";
 
 export interface SymbolEntry {
   name: string;
@@ -249,7 +250,19 @@ export function openWikiStore(projectDir: string): WikiStore {
   mkdirSync(cacheDir, { recursive: true });
   ensureGitignoreGuard(openfusionDir, ["cache/"]);
   const dbPath = wikiDbPath(projectDir);
-  const db = new Database(dbPath);
+  // Compiled-sidecar case: better-sqlite3's own bindings-package auto-locate
+  // searches candidate paths INSIDE the pkg virtual snapshot (which never
+  // contains the real .node — native addons can't be embedded in a V8
+  // snapshot, only shipped alongside it), so it always fails there. Passing
+  // `nativeBinding` is better-sqlite3's own documented escape hatch for
+  // exactly this bundler/pkg scenario: it skips the auto-locate entirely and
+  // requires the given real absolute path directly. build-sidecar.mjs copies
+  // the real better_sqlite3.node to "<binary>.assets/better_sqlite3.node" —
+  // see util/sidecar-runtime.ts for the shared convention.
+  const db = new Database(
+    dbPath,
+    isPackagedSidecar() ? { nativeBinding: packagedAssetPath("better_sqlite3.node") } : undefined,
+  );
   // busy_timeout must be set before attempting the WAL transition: it
   // covers ordinary statement contention, and setting it first means
   // ensureWalMode's own retry loop is only needed for the pragma's narrower

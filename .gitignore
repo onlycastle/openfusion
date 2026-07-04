@@ -1,7 +1,19 @@
 node_modules/
 dist/
+dist-sidecar/
 coverage/
 *.log
 .DS_Store
 .superpowers/
 .claude/
+
+# Rust (apps/desktop/src-tauri and any future crates)
+# Cargo.lock is intentionally NOT ignored — src-tauri is a binary crate
+# (a Tauri app), and binary crates should commit their lockfile for
+# reproducible builds.
+target/
+
+# Staged sidecar binary copied into the Tauri bundle dir before dev/build —
+# never committed, see apps/desktop/scripts/stage-sidecar.mjs.
+apps/desktop/src-tauri/binaries/
+apps/desktop/src-tauri/gen/

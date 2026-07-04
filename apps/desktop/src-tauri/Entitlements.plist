@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!--
+      NEEDED: our externalBin sidecar (the compiled @openfusion/engine binary)
+      loads better-sqlite3's native .node addon at runtime. Hardened runtime
+      enforces same-Team-ID library validation by default, which blocks
+      dlopen()-ing that addon (ERR_DLOPEN_FAILED) unless this is disabled.
+      Verified against docs/research/2026-07-04-m7-tauri-verification.md.
+    -->
+    <key>com.apple.security.cs.disable-library-validation</key>
+    <true/>
+
+    <!--
+      LEFT COMMENTED, NOT ENABLED: every Tauri signing guide pairs these two
+      with disable-library-validation for apps that JIT-compile JS in-process
+      (e.g. Electron). WKWebView (what Tauri uses on macOS) runs JS inside
+      Apple's own entitled, sandboxed helper process, so these MAY be
+      unnecessary for us. Per the research doc: verify empirically — build a
+      signed release WITHOUT them first, and only add them back if the app
+      actually crashes on JIT/executable-memory operations. This is an M8
+      (bundling/signing) concern, not part of this scaffold task.
+
+    <key>com.apple.security.cs.allow-jit</key>
+    <true/>
+    <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+    <true/>
+    -->
+</dict>
+</plist>
