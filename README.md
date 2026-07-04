@@ -59,6 +59,57 @@ routing as unproven against your project until then.
     engine.worker.list       { "projectDir": "/path/to/repo" }
     engine.worker.gc         { "projectDir": "/path/to/repo", "keep": ["/path/to/repo/.openfusion/worktrees/<id>"] }
 
+## Measuring the harness
+
+    engine.evals.run { "projectDir": "/path/to/repo", "tasks": [/* ... */] }
+
+`engine.evals.run` produces a baseline-vs-harness report card: a direct frontier session
+(no harness, no wiki) solves each task alongside the full orchestrate loop, both scored
+by the same oracle (the repo's own test suite). The report card carries three verdicts:
+
+- **pass**: the harness held quality on all clean tasks (no measurement failures), saved
+  cost, and the sample size (20–50 tasks) supports a credible claim. Manifest flips to
+  verified. This is the only report that ships as a savings win.
+- **fail**: the harness *degraded* quality below baseline on the clean subset — a genuine
+  ETH hazard (generated context can hurt). Flagged and never shipped, regardless of cost.
+- **inconclusive**: one of: (1) too few tasks (<5 is a demo, not a claim); (2) unpriced
+  cost figures (an unknown model or no cost data → no savings number → no claim);
+  (3) baseline solved zero tasks (nothing to hold quality against);
+  (4) ≥20% of tasks hit measurement failures (infra hiccups, apply mismatches — the run
+  is too corrupted to ground a verdict in either direction).
+
+**Cost figures are estimate-class** — computed from the pricing table and reported token
+usage, not a billed amount. Treat as directional. They carry a `pricingConfidence` field
+(worst across the run; see `packages/engine/src/models/meter.ts`): `verified` (from the
+provider's API), `provider-reported` (official docs), `secondary` (research), `unverified`
+(guess), or `unpriced` (unknown model). A single unpriced call taints the savings claim
+to `inconclusive`.
+
+**Sample size guidance** (Anthropic evaluation practice): 20–50 paired tasks make a
+credible claim. A v1 CI smoke run uses synthetic fixture tasks (mechanics verification);
+a real claim requires the operator smoke (`OPENFUSION_EVALS_SMOKE=1 pnpm test`) over
+repo-mined golden tasks (commits adding code without tests, or tests verifying a bug fix).
+
+**Two documented residual biases** (both directions, so numbers are read honestly):
+
+1. **Against the harness**: eval harness runs execute WITHOUT the wiki MCP server
+   attached — the symbol-index SQLite db isn't copied into the eval directory. So the
+   measured harness is a conservatively degraded variant; it lacks a tool that deployed
+   instances would have. This biases against.
+2. **Toward the harness** (golden tasks only): golden-task wiki bundles are generated at
+   the real project's current HEAD, which for a golden task is at or after the fix commit.
+   The bundle can already describe the post-fix world — answer-adjacent context the
+   baseline never sees. This biases toward on golden tasks specifically.
+
+Net: treat v1 savings numbers as directional, not precise. A "pass" run
+(quality held, savings > 0, 20+ tasks) understates what a deployment with the wiki MCP
+server would measure; a synthetic-task run is a mechanics proof, not a credibility claim.
+
+**Eval integrity** against an adversarial worker (one that could `git fetch` the parent
+repo for the answer) relies on the worker sandbox, whose full process isolation is
+deferred to M7. v1 assumes non-adversarial workers; both baseline and harness scratch
+directories are placed under `os.tmpdir()`, isolated from the project directory.
+
 `engine.orchestrate` requires a generated harness (`engine.harness.generate`
 first) and drives one task through the full pipeline:
 
