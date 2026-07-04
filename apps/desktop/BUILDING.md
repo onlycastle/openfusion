@@ -78,30 +78,30 @@ Run these in order, from the repository root, in the same shell session
 where you exported the variables above.
 
 ```sh
-# 0. Install dependencies (skip if already installed / lockfile unchanged)
+# 1. Install dependencies (skip if already installed / lockfile unchanged)
 pnpm install
 
-# 1. Compile the engine into a self-contained sidecar binary + its
+# 2. Compile the engine into a self-contained sidecar binary + its
 #    .assets sibling (native addon, tree-sitter wasm, tags.scm queries)
 pnpm --filter @openfusion/engine build:sidecar
 
-# 2. Stage the sidecar (+ two .assets copies) into src-tauri/binaries/,
+# 3. Stage the sidecar (+ two .assets copies) into src-tauri/binaries/,
 #    where Tauri's bundle.externalBin / bundle.resources expect them
 pnpm --filter @openfusion/desktop stage-sidecar
 
-# 3. Signing + notarization env vars must already be exported (§2) —
-#    do this BEFORE step 4, or the build fails at the presign step below.
+# 4. Signing + notarization env vars must already be exported (§2) —
+#    do this BEFORE step 5, or the build fails at the presign step below.
 
-# 4. Build the frontend, bundle the app, sign it, and (if notarization
+# 5. Build the frontend, bundle the app, sign it, and (if notarization
 #    creds are present) notarize + staple the .app — all in one command
 pnpm --filter @openfusion/desktop tauri build
 
-# 5. Staple the notarization ticket onto the .dmg container itself
+# 6. Staple the notarization ticket onto the .dmg container itself
 #    (tauri build only staples the .app inside it, never the .dmg)
 node apps/desktop/scripts/notarize-staple-dmg.mjs
 ```
 
-**What step 4 actually does**, in order: it runs `beforeBuildCommand`
+**What step 5 actually does**, in order: it runs `beforeBuildCommand`
 (`pnpm build`, compiling the React frontend), then Tauri's bundler starts,
 which first runs `beforeBundleCommand` — `node
 scripts/presign-sidecar-assets.mjs`, run **automatically**, no separate
@@ -117,9 +117,9 @@ in `Contents/MacOS/`, gets auto-signed by Tauri). Tauri then bundles the
 **only if** ASC API key or Apple-ID credentials are present in env —
 submits the `.app` to `notarytool submit --wait` and staples the resulting
 ticket onto the `.app`. If you set only `APPLE_SIGNING_IDENTITY` and no
-notarization credentials, the `.app` is signed but not notarized, and step 5
+notarization credentials, the `.app` is signed but not notarized, and step 6
 below will fail (nothing to staple) until you either add notarization creds
-and rebuild, or run step 5 with `--notarize` (§4).
+and rebuild, or run step 6 with `--notarize` (§4).
 
 **Where the artifacts land:**
 
@@ -153,7 +153,7 @@ node apps/desktop/scripts/notarize-staple-dmg.mjs --dmg <path>   # explicit .dmg
 
 - **Default (no flags):** staples whatever notarization ticket already
   exists — the right choice when `tauri build` notarized the `.app` inline
-  (i.e. notarization credentials were present in env during step 4).
+  (i.e. notarization credentials were present in env during step 5).
 - **`--notarize`:** submits the `.dmg` itself to `xcrun notarytool submit
   --wait` (using whichever credential mode resolves from env — API key,
   Apple ID, or `APPLE_KEYCHAIN_PROFILE`), then staples. Use this if the
@@ -207,21 +207,46 @@ stapler validate "apps/desktop/src-tauri/target/release/bundle/dmg/OpenFusion_<v
 
 `Entitlements.plist` deliberately ships **without**
 `com.apple.security.cs.allow-jit` / `com.apple.security.cs.allow-unsigned-executable-memory`
-— every Tauri signing guide pairs these with `disable-library-validation`
-for apps that JIT-compile JS in-process (e.g. Electron), but Tauri's
-WKWebView runs JS inside Apple's own entitled, sandboxed helper process, so
-they may not be needed here. **Verify empirically:**
+— but **expect to likely need them**. The bundle contains two executables,
+and Tauri's bundler signs both with hardened runtime + this SAME
+`Entitlements.plist`:
+
+- `Contents/MacOS/openfusion-engine` — the sidecar, a `@yao-pkg/pkg`-compiled
+  Node binary that embeds and JITs V8 **in-process**. This is exactly the
+  Electron-like case every Tauri signing guide has in mind when it pairs
+  `allow-jit`/`allow-unsigned-executable-memory` with
+  `disable-library-validation` — Node's own official release binaries ship
+  both entitlements for this reason. A hardened-runtime V8 process without
+  them typically **aborts at startup**. So the likely first-signed-build
+  failure mode is **not** the app window crashing — it's the engine sidecar
+  dying silently on launch while the window opens fine, and every cockpit
+  screen then errors out because it has nothing to talk to.
+- The WKWebView itself (secondary point) — Tauri's shell runs its JS inside
+  Apple's own entitled, sandboxed WebContent helper process, so the window/
+  webview likely does **not** need these entitlements. The sidecar is the
+  probable JIT consumer, not the WebView.
+
+Because the sidecar embeds V8, budget for one rebuild cycle with these
+entitlements uncommented — the no-JIT build below is a cheap first probe,
+not necessarily the end state. **Verify empirically:**
 
 1. Build signed + notarized **without** them first (as above).
 2. Launch-test on a clean Mac per §5 above.
-3. **Only if the app crashes on launch** post-notarization: uncomment the
-   `allow-jit`/`allow-unsigned-executable-memory` block in
+3. **If the app window crashes on launch, OR the engine sidecar fails to
+   start** post-notarization — cockpit screens error out immediately,
+   `openfusion-engine` exits right after launch (check `ps aux | grep
+   openfusion-engine`), or the app surfaces an engine-connection error —
+   uncomment the `allow-jit`/`allow-unsigned-executable-memory` block in
    `apps/desktop/src-tauri/Entitlements.plist`, then redo the full sequence
-   from step 4 (`tauri build`) onward — a full rebuild is required, not just
-   a re-sign, since entitlements are baked in at signing time.
+   from step 5 (`tauri build`) onward — a full rebuild is required, not just
+   a re-sign, since entitlements are baked in at signing time. This
+   remediation works because the bundler applies the same
+   `Entitlements.plist` to every binary it signs, including the sidecar.
 
-If the app launches fine without them, leave them out — smaller attack
-surface, and one less thing notarization can flag in the future.
+If the app **and** the engine sidecar both launch fine without them, leave
+them out — smaller attack surface, and one less thing notarization can flag
+in the future. But don't be surprised if you need them: the sidecar's
+in-process V8 is precisely the case these entitlements exist for.
 
 ## 6. Troubleshooting: top notarization rejections
 
@@ -234,16 +259,26 @@ xcrun notarytool log <submission-id> --key "$APPLE_API_KEY_PATH" --key-id "$APPL
 ```
 
 (The `<submission-id>` is printed by `notarytool submit` — either from
-`tauri build`'s own inline notarization output in step 4, or from step 6's
+`tauri build`'s own inline notarization output in step 5, or from step 6's
 `--notarize` output.)
 
 | Rejection | Cause | Fix |
 |---|---|---|
-| "The signature of the binary is invalid" / "not signed" on a nested Mach-O (usually `better_sqlite3.node` under `Contents/Resources/assets/`) | `APPLE_SIGNING_IDENTITY` wasn't set when `tauri build` ran, so `presign-sidecar-assets.mjs` skipped (debug build) or the identity didn't match a real cert | Set `APPLE_SIGNING_IDENTITY` correctly (§2) and rebuild from step 4; check for `[presign-sidecar-assets] signing N Mach-O file(s)` in the build log to confirm it ran |
+| "The signature of the binary is invalid" / "not signed" on a nested Mach-O (usually `better_sqlite3.node` under `Contents/Resources/assets/`) | `APPLE_SIGNING_IDENTITY` wasn't set when `tauri build` ran, so `presign-sidecar-assets.mjs` skipped (debug build) or the identity didn't match a real cert | Set `APPLE_SIGNING_IDENTITY` correctly (§2) and rebuild from step 5; check for `[presign-sidecar-assets] signing N Mach-O file(s)` in the build log to confirm it ran |
 | "The executable does not have the hardened runtime enabled" | Should not happen — `tauri.conf.json`'s `bundle.macOS.hardenedRuntime` defaults to `true` and is never overridden here | Check `tauri.conf.json` hasn't been edited to disable it |
 | Cert-type rejection (wrong certificate) | Signed with an "Apple Development" or "Mac App Store" cert instead of "Developer ID Application" | `security find-identity -v -p codesigning` — confirm you're using the Developer ID Application identity, not another one |
 | Rejection citing the sidecar binary itself (`Contents/MacOS/openfusion-engine`), not the `.node` | Known open Tauri issue [#11992](https://github.com/tauri-apps/tauri/issues/11992) — externalBin signing during bundling can occasionally produce an invalid signature | Re-run `tauri build`; if it recurs, manually re-sign after bundling: `codesign --force -s "$APPLE_SIGNING_IDENTITY" --options runtime --timestamp <App>.app/Contents/MacOS/openfusion-engine`, then re-bundle the `.dmg` |
 | `get-task-allow` entitlement present / malformed entitlements | Something added a debug entitlement or broke the plist | Diff `Entitlements.plist` against the version in this repo; it should only ever contain `disable-library-validation` (and, if the JIT check required them, the two JIT keys) |
+
+If `stapler staple` fails **immediately** after `notarize-staple-dmg.mjs
+--notarize` logs "submission completed" — some `notarytool` versions exit 0
+from `submit --wait` even when the submission's actual status is `Invalid`
+(rejected), so a completed submit is not proof of acceptance. Treat the
+staple step as the real verification, and read why with:
+
+```sh
+xcrun notarytool log <submission-id> --key "$APPLE_API_KEY_PATH" --key-id "$APPLE_API_KEY" --issuer "$APPLE_API_ISSUER"
+```
 
 ## 7. CI note
 

@@ -284,7 +284,14 @@ export function main(argv = process.argv.slice(2)) {
     }
     log(`submitting ${path.basename(dmgPath)} for notarization (credential mode: ${creds.mode})...`);
     runSigningTool("xcrun notarytool submit", "xcrun", buildNotarytoolSubmitArgs(dmgPath, creds));
-    log("notarization submission accepted.");
+    // NOTE: a zero exit code here only means `notarytool submit --wait`
+    // itself ran to completion -- some notarytool versions exit 0 even when
+    // the submission's actual status is "Invalid" (rejected). We don't parse
+    // `--output-format json` here (that would mean swallowing notarytool's
+    // own live progress output), so we deliberately do NOT claim
+    // "accepted" -- the stapling step right below is the real verification:
+    // `stapler staple` fails immediately if the ticket was never approved.
+    log("notarization submission completed (exit 0); verifying via staple next.");
   }
 
   log(`stapling ${path.basename(dmgPath)}...`);

@@ -1,8 +1,13 @@
+/** @vitest-environment node */
 // Unit tests for the parts of presign-sidecar-assets.mjs that don't require
 // an actual codesign identity/cert: Mach-O magic-byte detection (against
 // fixtures written to a temp dir) and the sign/skip/fail gate. The actual
 // `codesign --sign ...` invocation is an OPERATOR step (needs a real Apple
 // Developer ID cert) and is intentionally NOT exercised here.
+//
+// This file does real filesystem/exec work (mkdtempSync, execFileSync), so
+// it needs the `node` test environment, not the project-wide `jsdom`
+// default (see vite.config.ts) -- the docblock above opts it in per-file.
 import { execFileSync } from "node:child_process";
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";

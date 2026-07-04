@@ -1,9 +1,14 @@
+/** @vitest-environment node */
 // Unit tests for the parts of notarize-staple-dmg.mjs that don't require
 // actual Apple credentials/notarization: .dmg discovery (against a fixture
 // dir tree) and credential-mode resolution. The actual `xcrun notarytool` /
 // `xcrun stapler` invocations are an OPERATOR step (needs real Apple
 // Developer credentials + network access) and are intentionally NOT
 // exercised here.
+//
+// This file does real filesystem/exec work (mkdtempSync, execFileSync), so
+// it needs the `node` test environment, not the project-wide `jsdom`
+// default (see vite.config.ts) -- the docblock above opts it in per-file.
 import { execFileSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";

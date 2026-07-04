@@ -13,14 +13,24 @@
     <true/>
 
     <!--
-      LEFT COMMENTED, NOT ENABLED: every Tauri signing guide pairs these two
-      with disable-library-validation for apps that JIT-compile JS in-process
-      (e.g. Electron). WKWebView (what Tauri uses on macOS) runs JS inside
-      Apple's own entitled, sandboxed helper process, so these MAY be
-      unnecessary for us. Per the research doc: verify empirically — build a
-      signed release WITHOUT them first, and only add them back if the app
-      actually crashes on JIT/executable-memory operations. This is an M8
-      (bundling/signing) concern, not part of this scaffold task.
+      LEFT COMMENTED, but EXPECT TO LIKELY NEED THESE: the bundle's second
+      executable, `Contents/MacOS/openfusion-engine` (a `@yao-pkg/pkg`-
+      compiled Node binary), embeds and JITs V8 IN-PROCESS -- exactly the
+      Electron-like case every Tauri signing guide pairs with
+      disable-library-validation. Node's own official release binaries ship
+      both entitlements for this reason; a hardened-runtime V8 process
+      without them typically aborts at startup. The WKWebView (what Tauri
+      itself uses on macOS) runs JS inside Apple's own entitled, sandboxed
+      helper process, so IT likely doesn't need these -- the sidecar is the
+      probable consumer. Per the research doc: verify empirically -- build a
+      signed release WITHOUT them first, then check BOTH that the app window
+      launches AND that the engine sidecar actually starts (cockpit screens
+      work; `ps aux | grep openfusion-engine` shows it running) -- only if
+      the app crashes on launch OR the sidecar fails to start, uncomment
+      this block and rebuild (a full rebuild, not just a re-sign: the
+      bundler applies this same entitlements plist to every binary it
+      signs, including the sidecar). See apps/desktop/BUILDING.md's JIT
+      empirical check section.
 
     <key>com.apple.security.cs.allow-jit</key>
     <true/>

@@ -314,9 +314,12 @@ running the build sequence there):
 - A real orchestration + a real eval run inside that signed, notarized
   build (not just a dev build).
 - No console CSP violations; no orphaned engine process on quit.
-- **JIT empirical check:** if (and only if) the app crashes on launch post-
-  notarization, uncomment `allow-jit`/`allow-unsigned-executable-memory` in
-  `Entitlements.plist` and rebuild from scratch.
+- **JIT empirical check:** expect to likely need this — the sidecar
+  (`openfusion-engine`, a Node/V8 binary that JITs in-process) is the likely
+  reason, not the WKWebView. If the app crashes on launch **or** the engine
+  sidecar fails to start (cockpit screens error out, `openfusion-engine`
+  exits immediately), uncomment `allow-jit`/`allow-unsigned-executable-memory`
+  in `Entitlements.plist` and rebuild from scratch.
 
 ## Development
 
