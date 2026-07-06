@@ -94,5 +94,22 @@ describe("ModelProvidersPane", () => {
     fireEvent.click(screen.getByRole("button", { name: /remove/i }));
     await waitFor(() => expect(deleteSecretMock).toHaveBeenCalledWith("deepseek"));
     expect(deleteProviderConfigMock).toHaveBeenCalledWith("deepseek");
+    // Optimistic removal: the row disappears immediately and stays gone —
+    // no reload happens on success (the live engine registry would still
+    // return the "removed" provider since there's no models.unconfigure).
+    await waitFor(() => expect(screen.queryByText("deepseek")).toBeNull());
+  });
+
+  it("shows an error and does not call setSecret when the API key is empty", async () => {
+    render(<ModelProvidersPane />);
+    await waitFor(() => expect(modelsListMock).toHaveBeenCalled());
+
+    fireEvent.change(screen.getByLabelText(/^provider$/i), { target: { value: "deepseek" } });
+    fireEvent.change(screen.getByLabelText(/^model$/i), { target: { value: "deepseek-v4-flash" } });
+    fireEvent.click(screen.getByRole("button", { name: /^save$/i }));
+
+    expect(await screen.findByText(/enter an api key/i)).toBeTruthy();
+    expect(setSecretMock).not.toHaveBeenCalled();
+    expect(modelsConfigureMock).not.toHaveBeenCalled();
   });
 });

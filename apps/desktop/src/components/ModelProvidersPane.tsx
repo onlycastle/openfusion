@@ -78,7 +78,11 @@ export function ModelProvidersPane() {
   const handleSubmit = useCallback(
     (event: FormEvent<HTMLFormElement>) => {
       event.preventDefault();
-      if (!model.trim() || !apiKey) return;
+      if (!model.trim()) return;
+      if (!apiKey) {
+        setFormError("Enter an API key.");
+        return;
+      }
       const effectiveBaseURL = preset.baseURLHidden ? undefined : baseURL.trim() || undefined;
       if (preset.baseURLRequired && !effectiveBaseURL) {
         setFormError("This provider needs a base URL.");
@@ -103,9 +107,15 @@ export function ModelProvidersPane() {
 
   const handleRemove = useCallback(
     (id: string) => {
-      Promise.all([deleteSecret(id), deleteProviderConfig(id)])
-        .then(reload)
-        .catch((err: unknown) => setListError(friendlyMessage(err)));
+      // Optimistically drop the row: the engine has no `models.unconfigure`,
+      // so `modelsList()` would still return this provider after a reload
+      // and the row would reappear. Only resync from the live registry on
+      // failure, when the optimistic removal was wrong.
+      setRows((prev) => (prev === null ? prev : prev.filter((r) => r.id !== id)));
+      Promise.all([deleteSecret(id), deleteProviderConfig(id)]).catch((err: unknown) => {
+        reload();
+        setListError(friendlyMessage(err));
+      });
     },
     [reload],
   );
