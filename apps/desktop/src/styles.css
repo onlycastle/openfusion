@@ -1591,3 +1591,7 @@ input[type="checkbox"] {
 .section-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 2px; }
 .section-item { width: 100%; text-align: left; padding: 6px 8px; border-radius: 6px; background: none; border: none; color: inherit; cursor: pointer; }
 .section-item-active { background: var(--active-bg, #26262b); }
+
+/* ---------------------------------------------------------------- shell-three-pane -- */
+.shell-three-pane { display: flex; flex-direction: row; align-items: stretch; height: 100%; }
+.shell-three-pane .content { flex: 1; overflow: auto; }
