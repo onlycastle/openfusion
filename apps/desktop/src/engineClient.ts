@@ -777,6 +777,31 @@ export function deleteProviderConfig(id: string): Promise<void> {
   return invoke("delete_provider_config", { id });
 }
 
+// ---------------------------------------------------------------------------
+// Project registry commands (non-secret) — Rust host, NOT engine RPC.
+// ---------------------------------------------------------------------------
+
+/** A remembered project. Mirrors `projects.rs`'s `ProjectMeta`. Never a key. */
+export interface ProjectMeta {
+  path: string;
+  name: string;
+}
+
+/** `invoke('list_projects')` — MRU order, front = most recently opened. */
+export function listProjects(): Promise<ProjectMeta[]> {
+  return invoke<ProjectMeta[]>("list_projects");
+}
+
+/** `invoke('add_project', { project })` — upsert-to-front. */
+export function addProject(project: ProjectMeta): Promise<void> {
+  return invoke("add_project", { project });
+}
+
+/** `invoke('remove_project', { path })` — metadata only; never touches the repo. */
+export function removeProject(path: string): Promise<void> {
+  return invoke("remove_project", { path });
+}
+
 /** On launch, re-register every persisted provider with the engine (whose
  * registry starts empty each run) by pairing its saved metadata with its
  * Keychain key. The key value is read into a local and passed straight to
