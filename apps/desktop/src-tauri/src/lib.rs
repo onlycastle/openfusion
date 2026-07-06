@@ -15,6 +15,7 @@
 // how this realizes the spec's shell architecture.
 pub mod commands;
 pub mod engine_bridge;
+pub mod providers;
 pub mod secrets;
 
 use std::path::{Path, PathBuf};
@@ -22,6 +23,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use engine_bridge::EngineBridge;
+use providers::{FileMetaBackend, ProviderConfigStore};
 use secrets::{KeyringImpl, SecretStore};
 use tauri::Manager;
 
@@ -99,6 +101,15 @@ pub fn run() {
             secret_store.load_persisted();
             app.manage(secret_store);
 
+            // Non-secret provider metadata store (see `providers.rs`). Pairs with the
+            // Keychain on startup-reconfigure (webview-driven) to re-register providers.
+            let providers_path = app
+                .path()
+                .app_config_dir()
+                .map_err(|err| std::io::Error::other(format!("no app config dir: {err}")))?
+                .join("providers.json");
+            app.manage(Arc::new(ProviderConfigStore::new(Arc::new(FileMetaBackend::new(providers_path)))));
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -109,6 +120,9 @@ pub fn run() {
             secrets::delete_secret,
             secrets::list_secret_ids,
             secrets::load_persisted_secrets,
+            providers::list_provider_configs,
+            providers::save_provider_config,
+            providers::delete_provider_config,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application");
