@@ -6,11 +6,12 @@ import { act, render, screen, fireEvent, waitFor, cleanup } from "@testing-libra
 // EvalsScreen.test.tsx/KeysScreen.test.tsx.
 afterEach(cleanup);
 
-// The Tauri dialog plugin's `open()` — mocked so tests drive the project
-// directory picker without a real native dialog (same pattern as
-// EvalsScreen.test.tsx).
-const { openMock } = vi.hoisted(() => ({ openMock: vi.fn() }));
-vi.mock("@tauri-apps/plugin-dialog", () => ({ open: openMock }));
+// The active project now comes from `ProjectContext` (Rail 1 owns picking
+// it, Task 6/8) rather than an in-screen folder dialog — mocked so tests
+// can drive `activeProjectDir` directly, same pattern as
+// HarnessSettingPanel.test.tsx.
+const { useProjectMock } = vi.hoisted(() => ({ useProjectMock: vi.fn() }));
+vi.mock("../ProjectContext", () => ({ useProject: () => useProjectMock() }));
 
 // `engineClient` (the singleton) is what OrchestrateScreen calls through
 // for `runOrchestrate`/`call`. `importOriginal` keeps `EngineError`/
@@ -131,7 +132,8 @@ function makeControllableRun() {
 }
 
 beforeEach(() => {
-  openMock.mockReset();
+  useProjectMock.mockReset();
+  useProjectMock.mockReturnValue({ activeProjectDir: "/r/alpha" });
   runOrchestrateMock.mockReset();
   callMock.mockReset();
   modelsListMock.mockReset();
@@ -143,20 +145,21 @@ beforeEach(() => {
   frontierLoginStatusMock.mockResolvedValue({ state: "connected" });
   modelsListMock.mockResolvedValue({ providers: [{ id: "deepseek", kind: "deepseek" }] });
   // A benign default so tests that only exercise the run loop aren't forced
-  // to stub the wiki check that choosing a project fires.
+  // to stub the wiki check that mounting with an active project fires.
   wikiStatusMock.mockResolvedValue(wikiStatusFixture());
   harnessStatusMock.mockResolvedValue(harnessStatusFixture());
   harnessGenerateMock.mockResolvedValue(generateHarnessFixture());
 });
 
-async function chooseProjectAndFillTask(
-  task = "fix the null check bug",
-  path = "/Users/test/project",
-): Promise<{ path: string; task: string }> {
-  openMock.mockResolvedValueOnce(path);
+/** The active project is already set via `ProjectContext` (mocked to
+ * `/r/alpha` in `beforeEach`) by the time the screen mounts, so — unlike the
+ * old in-screen folder dialog — there is nothing to click to "choose" it.
+ * This just waits for the harness check that fires on mount to resolve
+ * (default fixtures classify it "ready"), opens the task chat, and fills
+ * in the task text. */
+async function openChatAndFillTask(task = "fix the null check bug"): Promise<{ path: string; task: string }> {
+  const path = "/r/alpha";
   render(<OrchestrateScreen />);
-  fireEvent.click(screen.getByRole("button", { name: /select project/i }));
-  await waitFor(() => expect(screen.getByText(path)).toBeTruthy());
   await waitFor(() => expect(screen.getByRole("button", { name: /open task chat/i })).toBeTruthy());
   fireEvent.click(screen.getByRole("button", { name: /open task chat/i }));
   fireEvent.change(screen.getByLabelText(/task/i), { target: { value: task } });
@@ -170,7 +173,10 @@ describe("OrchestrateScreen", () => {
     render(<OrchestrateScreen />);
 
     expect(screen.getByText(/building harness/i)).toBeTruthy();
-    expect(screen.getByRole("button", { name: /select project/i })).toBeTruthy();
+    // The active project (from context) renders as static text — no
+    // in-screen picker button exists anymore.
+    expect(screen.getByText("alpha")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /choose project|select project/i })).toBeNull();
     expect(screen.queryByRole("button", { name: /^run$/i })).toBeNull();
 
     await waitFor(() => expect(screen.getByRole("alert")).toBeTruthy());
@@ -178,7 +184,18 @@ describe("OrchestrateScreen", () => {
     expect(screen.getByText(/executing model provider/i)).toBeTruthy();
   });
 
-  it("builds the harness for a selected project, streams build progress, then opens the task chat", async () => {
+  it("renders 'No project selected' when there is no active project in context", async () => {
+    useProjectMock.mockReturnValue({ activeProjectDir: null });
+    render(<OrchestrateScreen />);
+
+    expect(screen.getByText(/no project selected/i)).toBeTruthy();
+    expect(screen.getByText(/select a project to check its harness/i)).toBeTruthy();
+    // No harness/wiki check should have fired without an active project.
+    expect(wikiStatusMock).not.toHaveBeenCalled();
+    expect(harnessStatusMock).not.toHaveBeenCalled();
+  });
+
+  it("checks the active project's harness on mount, streams build progress, then opens the task chat", async () => {
     harnessStatusMock.mockReset();
     harnessStatusMock
       .mockResolvedValueOnce(harnessStatusFixture({ present: false, structural: null, evals: null, headSha: null }))
@@ -194,19 +211,17 @@ describe("OrchestrateScreen", () => {
         }),
     );
 
-    openMock.mockResolvedValueOnce("/Users/test/project");
     render(<OrchestrateScreen />);
 
-    fireEvent.click(screen.getByRole("button", { name: /select project/i }));
     await waitFor(() => expect(screen.getByText(/no harness yet/i)).toBeTruthy());
     await waitFor(() => {
       expect((screen.getByRole("button", { name: /build harness/i }) as HTMLButtonElement).disabled).toBe(false);
     });
 
     fireEvent.click(screen.getByRole("button", { name: /build harness/i }));
-    expect(harnessGenerateMock).toHaveBeenCalledWith("/Users/test/project", expect.any(Function));
+    expect(harnessGenerateMock).toHaveBeenCalledWith("/r/alpha", expect.any(Function));
 
-    act(() => onProgress({ projectDir: "/Users/test/project", stage: "overview", detail: "exploring repository" }));
+    act(() => onProgress({ projectDir: "/r/alpha", stage: "overview", detail: "exploring repository" }));
     await waitFor(() => expect(screen.getByText(/exploring repository/i)).toBeTruthy());
 
     act(() => resolveGenerate(generateHarnessFixture({ agents: 4 })));
@@ -215,7 +230,7 @@ describe("OrchestrateScreen", () => {
   });
 
   it("Run calls runOrchestrate with {projectDir, task}, streams progress, and renders the routed model", async () => {
-    const { path, task } = await chooseProjectAndFillTask();
+    const { path, task } = await openChatAndFillTask();
     const controllable = makeControllableRun();
     runOrchestrateMock.mockReturnValueOnce(controllable);
 
@@ -235,7 +250,7 @@ describe("OrchestrateScreen", () => {
   });
 
   it("renders the diff, verdict (decision+reasons+severity), outcome, and cost split on resolve", async () => {
-    await chooseProjectAndFillTask();
+    await openChatAndFillTask();
     const controllable = makeControllableRun();
     runOrchestrateMock.mockReturnValueOnce(controllable);
     fireEvent.click(screen.getByRole("button", { name: /^run$/i }));
@@ -256,7 +271,7 @@ describe("OrchestrateScreen", () => {
   });
 
   it("Cancel calls the run's cancel(), disables the button while cancelling (no second cancel call), then shows Cancelled — not Failed — on RunCancelledError", async () => {
-    await chooseProjectAndFillTask();
+    await openChatAndFillTask();
     const controllable = makeControllableRun();
     runOrchestrateMock.mockReturnValueOnce(controllable);
     fireEvent.click(screen.getByRole("button", { name: /^run$/i }));
@@ -278,7 +293,7 @@ describe("OrchestrateScreen", () => {
   });
 
   it("renders a friendly message (not a crash) for a genuine EngineError, distinct from Cancelled", async () => {
-    await chooseProjectAndFillTask();
+    await openChatAndFillTask();
     const controllable = makeControllableRun();
     runOrchestrateMock.mockReturnValueOnce(controllable);
     fireEvent.click(screen.getByRole("button", { name: /^run$/i }));
@@ -293,7 +308,7 @@ describe("OrchestrateScreen", () => {
   });
 
   it("Apply calls engine.orchestrate.apply with {projectDir, diff}, disables while applying, and shows Applied", async () => {
-    const { path } = await chooseProjectAndFillTask();
+    const { path } = await openChatAndFillTask();
     const controllable = makeControllableRun();
     runOrchestrateMock.mockReturnValueOnce(controllable);
     fireEvent.click(screen.getByRole("button", { name: /^run$/i }));
@@ -317,7 +332,7 @@ describe("OrchestrateScreen", () => {
   });
 
   it("shows a friendly Apply-failed state on rejection", async () => {
-    await chooseProjectAndFillTask();
+    await openChatAndFillTask();
     const controllable = makeControllableRun();
     runOrchestrateMock.mockReturnValueOnce(controllable);
     fireEvent.click(screen.getByRole("button", { name: /^run$/i }));
@@ -332,7 +347,7 @@ describe("OrchestrateScreen", () => {
   });
 
   it("does not show an Apply button for a failed outcome with an empty diff", async () => {
-    await chooseProjectAndFillTask();
+    await openChatAndFillTask();
     const controllable = makeControllableRun();
     runOrchestrateMock.mockReturnValueOnce(controllable);
     fireEvent.click(screen.getByRole("button", { name: /^run$/i }));
@@ -364,7 +379,7 @@ describe("OrchestrateScreen", () => {
     const consoleSpy = vi.spyOn(console, "log").mockImplementation(() => {});
     const consoleErrorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
     try {
-      await chooseProjectAndFillTask("a very specific secret-looking task string");
+      await openChatAndFillTask("a very specific secret-looking task string");
       const controllable = makeControllableRun();
       runOrchestrateMock.mockReturnValueOnce(controllable);
       fireEvent.click(screen.getByRole("button", { name: /^run$/i }));
@@ -386,8 +401,12 @@ describe("OrchestrateScreen", () => {
     }
   });
 
-  it("changing projects after a result returns to setup and removes the old Apply action", async () => {
-    await chooseProjectAndFillTask("fix something", "/proj/A");
+  it("changing the active project (Rail 1) after a result returns to setup and removes the old Apply action", async () => {
+    useProjectMock.mockReturnValue({ activeProjectDir: "/proj/A" });
+    const { rerender } = render(<OrchestrateScreen />);
+    await waitFor(() => expect(screen.getByRole("button", { name: /open task chat/i })).toBeTruthy());
+    fireEvent.click(screen.getByRole("button", { name: /open task chat/i }));
+    fireEvent.change(screen.getByLabelText(/task/i), { target: { value: "fix something" } });
 
     const controllable = makeControllableRun();
     runOrchestrateMock.mockReturnValueOnce(controllable);
@@ -397,10 +416,11 @@ describe("OrchestrateScreen", () => {
     act(() => controllable.resolve(fixture));
     await waitFor(() => expect(screen.getByRole("button", { name: /apply diff/i })).toBeTruthy());
 
-    // User re-picks a different directory AFTER the run resolves
-    openMock.mockResolvedValueOnce("/proj/B");
-    fireEvent.click(screen.getByRole("button", { name: /choose project/i }));
-    // Give the picker time to update the displayed path
+    // The active project changes — as Rail 1 (ProjectContext) would drive it,
+    // not an in-screen picker.
+    useProjectMock.mockReturnValue({ activeProjectDir: "/proj/B" });
+    rerender(<OrchestrateScreen />);
+
     await waitFor(() => {
       const code = screen.getAllByText(/^\/proj\//)[0];
       expect(code?.textContent).toBe("/proj/B");
@@ -410,14 +430,12 @@ describe("OrchestrateScreen", () => {
     expect(callMock).not.toHaveBeenCalledWith("engine.orchestrate.apply", { projectDir: "/proj/B", diff: fixture.diff });
   });
 
-  it("shows the chosen project's wiki reading in the head and builds it on demand (absorbed from the former Project screen)", async () => {
+  it("shows the active project's wiki reading in the head and builds it on demand (absorbed from the former Project screen)", async () => {
     wikiStatusMock.mockReset(); // drop the beforeEach default so the ordered Once values below apply
-    // First status (on choose): not built. Second (after a build): up to date.
+    // First status (on mount): not built. Second (after a build): up to date.
     wikiStatusMock.mockResolvedValueOnce(wikiStatusFixture({ built: false }));
-    openMock.mockResolvedValueOnce("/Users/test/project");
     render(<OrchestrateScreen />);
 
-    fireEvent.click(screen.getByRole("button", { name: /select project/i }));
     await waitFor(() => expect(screen.getByRole("button", { name: /open task chat/i })).toBeTruthy());
     fireEvent.click(screen.getByRole("button", { name: /open task chat/i }));
     await waitFor(() => expect(screen.getByText(/wiki: not built/i)).toBeTruthy());
@@ -432,7 +450,7 @@ describe("OrchestrateScreen", () => {
 
     fireEvent.click(screen.getByRole("button", { name: /^build$/i }));
     await waitFor(() => expect(screen.getByText(/wiki: building/i)).toBeTruthy());
-    expect(wikiBuildMock).toHaveBeenCalledWith("/Users/test/project");
+    expect(wikiBuildMock).toHaveBeenCalledWith("/r/alpha");
 
     act(() =>
       resolveBuild({
@@ -452,10 +470,8 @@ describe("OrchestrateScreen", () => {
   it("surfaces a friendly wiki error in the head (not a crash) when the wiki check rejects", async () => {
     wikiStatusMock.mockReset();
     wikiStatusMock.mockRejectedValueOnce(new EngineError(-32001, "not a git repository", undefined));
-    openMock.mockResolvedValueOnce("/Users/test/not-a-repo");
     render(<OrchestrateScreen />);
 
-    fireEvent.click(screen.getByRole("button", { name: /select project/i }));
     await waitFor(() => expect(screen.getByRole("alert")).toBeTruthy());
     expect(screen.getByRole("alert").textContent).toMatch(/not a git repository/i);
     // A wiki failure must not read as a run failure.
@@ -463,7 +479,7 @@ describe("OrchestrateScreen", () => {
   });
 
   it("renders the routed model from result.resolution in the final outcome view (structural routed-model test)", async () => {
-    await chooseProjectAndFillTask();
+    await openChatAndFillTask();
     const controllable = makeControllableRun();
     runOrchestrateMock.mockReturnValueOnce(controllable);
     fireEvent.click(screen.getByRole("button", { name: /^run$/i }));

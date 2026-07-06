@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { open } from "@tauri-apps/plugin-dialog";
+import { useProject } from "../ProjectContext";
 import {
   EngineError,
   RunCancelledError,
@@ -19,8 +19,8 @@ import {
 /** Renders a rejection as a short, user-facing sentence — never a stack
  * trace. Same posture as EvalsScreen/KeysScreen's own `friendlyMessage`: an
  * `EngineError` carries the engine's JSON-RPC `code` alongside its
- * `message`; anything else (a plain string/`Error`, e.g. the Tauri dialog
- * plugin's own rejections) is passed through as-is. */
+ * `message`; anything else (a plain string/`Error`) is passed through
+ * as-is. */
 function friendlyMessage(err: unknown): string {
   if (err instanceof EngineError) return `[${err.code}] ${err.message}`;
   if (typeof err === "string" && err.trim().length > 0) return err;
@@ -140,7 +140,7 @@ function setupWarnings(state: SetupState): string[] {
 }
 
 function harnessStatusText(state: HarnessState): string {
-  if (state.status === "idle") return "Choose a project to check its harness.";
+  if (state.status === "idle") return "Select a project to check its harness.";
   if (state.status === "checking") return "Checking project harness…";
   if (state.status === "building") return "Building harness…";
   if (state.status === "missing") return "No harness yet.";
@@ -204,9 +204,9 @@ interface OrchestrateScreenProps {
 }
 
 export function OrchestrateScreen({ onOpenSettings }: OrchestrateScreenProps = {}) {
-  const [projectDir, setProjectDir] = useState<string | null>(null);
+  const { activeProjectDir } = useProject();
+  const projectDir = activeProjectDir;
   const [runProjectDir, setRunProjectDir] = useState<string | null>(null);
-  const [pickerError, setPickerError] = useState<string | null>(null);
   const [task, setTask] = useState("");
   const [chatOpen, setChatOpen] = useState(false);
   // The task text as it was when Run was pressed — shown as the "You" turn in
@@ -286,19 +286,17 @@ export function OrchestrateScreen({ onOpenSettings }: OrchestrateScreenProps = {
       });
   }, []);
 
-  const handleChooseProject = useCallback(() => {
-    setPickerError(null);
-    open({ directory: true })
-      .then((selected) => {
-        if (typeof selected !== "string") return; // user cancelled the dialog
-        setChatOpen(false);
-        resetRunState();
-        projectDirRef.current = selected;
-        setProjectDir(selected);
-        refreshHarnessState(selected);
-      })
-      .catch((err: unknown) => setPickerError(friendlyMessage(err)));
-  }, [refreshHarnessState, resetRunState]);
+  // Reacts to the active project changing (picked in Rail 1, via
+  // ProjectContext) — mirrors what the former in-screen picker did
+  // inline on a successful pick: drop back out of the task chat, clear
+  // the prior run's state, and re-check the new project's harness/wiki.
+  useEffect(() => {
+    if (projectDir === null) return;
+    projectDirRef.current = projectDir;
+    setChatOpen(false);
+    resetRunState();
+    refreshHarnessState(projectDir);
+  }, [projectDir, refreshHarnessState, resetRunState]);
 
   const handleBuildWiki = useCallback(() => {
     const dir = projectDir;
@@ -457,19 +455,13 @@ export function OrchestrateScreen({ onOpenSettings }: OrchestrateScreenProps = {
         onChange={(e) => setTask(e.target.value)}
         rows={2}
         disabled={isBusy}
-        placeholder={projectDir ? "Describe a task…" : "Choose a project, then describe a task…"}
+        placeholder={projectDir ? "Describe a task…" : "Select a project, then describe a task…"}
       />
       <div className="composer-bar">
-        <button
-          type="button"
-          className="composer-chip"
-          onClick={handleChooseProject}
-          disabled={isBusy}
-          aria-label={projectName ? `Choose project — current: ${projectName}` : "Choose project"}
-        >
+        <span className="composer-chip composer-chip-static">
           <FolderGlyph />
-          <span>{projectName ?? "Choose a project"}</span>
-        </button>
+          <span>{projectName ?? "No project selected"}</span>
+        </span>
         <div className="composer-bar-right">
           <span className="composer-hint" title="Models are routed automatically: cheap worker first, frontier review after">
             auto-route
@@ -542,16 +534,10 @@ export function OrchestrateScreen({ onOpenSettings }: OrchestrateScreenProps = {
         )}
 
         <div className="harness-panel">
-          <button
-            type="button"
-            className="harness-project-button"
-            onClick={handleChooseProject}
-            disabled={isBusy}
-            aria-label={projectName ? `Change project — current: ${projectName}` : "Select project"}
-          >
+          <div className="harness-project-static">
             <FolderGlyph />
-            <span>{projectName ?? "Select project"}</span>
-          </button>
+            <span>{projectName ?? "No project selected"}</span>
+          </div>
 
           {projectDir && <code className="harness-project-path">{projectDir}</code>}
 
@@ -564,11 +550,6 @@ export function OrchestrateScreen({ onOpenSettings }: OrchestrateScreenProps = {
             )}
           </div>
 
-          {pickerError && (
-            <p role="alert" className="error-text">
-              {pickerError}
-            </p>
-          )}
           {wikiState.status === "error" && (
             <p role="alert" className="error-text">
               {wikiState.message}
@@ -637,11 +618,6 @@ export function OrchestrateScreen({ onOpenSettings }: OrchestrateScreenProps = {
           </div>
         )}
       </header>
-      {chatOpen && pickerError && (
-        <p role="alert" className="error-text chat-head-alert">
-          {pickerError}
-        </p>
-      )}
       {chatOpen && wikiState.status === "error" && (
         <p role="alert" className="error-text chat-head-alert">
           wiki: {wikiState.message}

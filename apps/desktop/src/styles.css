@@ -931,7 +931,7 @@ input[type="checkbox"] {
   border-radius: var(--radius);
   background: var(--panel);
 }
-.content button.harness-project-button {
+.content .harness-project-static {
   width: 100%;
   display: flex;
   align-items: center;
@@ -941,10 +941,7 @@ input[type="checkbox"] {
   border-radius: var(--radius);
   background: var(--sunk);
 }
-.content button.harness-project-button:hover:not(:disabled) {
-  background: var(--panel);
-}
-.content button.harness-project-button span {
+.content .harness-project-static span {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -1104,8 +1101,11 @@ input[type="checkbox"] {
   gap: 12px;
 }
 
-/* the project chip — where a session gets its workspace */
-.content button.composer-chip {
+/* the project chip — where a session gets its workspace. Read-only: the
+ * project itself is chosen in Rail 1 (ProjectContext), not here — so this
+ * is a <span>, not a <button>, and `-static` drops the old hover affordance
+ * (nothing happens on hover/click anymore). */
+.content .composer-chip {
   display: inline-flex;
   align-items: center;
   gap: 6px;
@@ -1118,17 +1118,12 @@ input[type="checkbox"] {
   font-size: 12.5px;
   font-weight: 550;
 }
-.content button.composer-chip:hover:not(:disabled) {
-  background: var(--sunk);
-  border-color: transparent;
-  color: var(--ink);
-}
-.content button.composer-chip span {
+.content .composer-chip span {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.content button.composer-chip svg {
+.content .composer-chip svg {
   flex-shrink: 0;
 }
 
