@@ -125,11 +125,15 @@ pub fn frontier_logout(engine: String) -> Result<(), String> {
     let Some((program, args)) = program_and_logout_args(&engine) else {
         return Err(format!("unknown frontier engine: {engine}"));
     };
-    std::process::Command::new(program)
+    let output = std::process::Command::new(program)
         .args(args)
         .output()
-        .map(|_| ())
-        .map_err(|err| format!("could not run {program} logout: {err}"))
+        .map_err(|err| format!("could not run {program} logout: {err}"))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(format!("{program} logout exited with status {}", output.status.code().unwrap_or(-1)))
+    }
 }
 
 #[cfg(test)]
