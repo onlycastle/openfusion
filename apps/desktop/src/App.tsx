@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import { ErrorBoundary } from "./components/ErrorBoundary";
 import { Nav } from "./components/Nav";
 import { SettingsDialog } from "./components/SettingsDialog";
-import { engineClient, type EngineNotification } from "./engineClient";
+import { engineClient, reconfigureProvidersOnLaunch, type EngineNotification } from "./engineClient";
 import { useHashRoute } from "./router";
 import { EvalsScreen } from "./screens/EvalsScreen";
 import { OrchestrateScreen } from "./screens/OrchestrateScreen";
@@ -25,6 +25,12 @@ export function App() {
       setNotificationCount((count) => count + 1);
     });
     return unsubscribe;
+  }, []);
+
+  useEffect(() => {
+    // Best-effort: re-register persisted BYOK providers with the fresh engine
+    // registry. A failure here must never block the shell from rendering.
+    void reconfigureProvidersOnLaunch().catch(() => {});
   }, []);
 
   return (

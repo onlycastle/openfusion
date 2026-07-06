@@ -716,6 +716,22 @@ export function deleteProviderConfig(id: string): Promise<void> {
   return invoke("delete_provider_config", { id });
 }
 
+/** On launch, re-register every persisted provider with the engine (whose
+ * registry starts empty each run) by pairing its saved metadata with its
+ * Keychain key. The key value is read into a local and passed straight to
+ * `modelsConfigure` — never rendered, never logged. A provider whose key is
+ * missing (e.g. a Keychain entry was removed out-of-band) is skipped. */
+export async function reconfigureProvidersOnLaunch(): Promise<void> {
+  const metas = await listProviderConfigs();
+  await Promise.all(
+    metas.map(async (meta) => {
+      const apiKey = await getSecret(meta.id);
+      if (apiKey === null) return;
+      await engineClient.modelsConfigure({ id: meta.id, kind: meta.kind, apiKey, baseURL: meta.baseURL });
+    }),
+  );
+}
+
 // ---------------------------------------------------------------------------
 // Frontier CLI-auth commands — Rust host. No token ever crosses this surface.
 // ---------------------------------------------------------------------------
