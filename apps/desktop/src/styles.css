@@ -1557,3 +1557,14 @@ input[type="checkbox"] {
 .orchestrator-action {
   margin-left: auto;
 }
+
+.harness-panel-screen { padding: 24px 28px; max-width: 720px; }
+.harness-tree-title { margin: 0 0 16px; }
+.harness-tree-root { font-weight: 600; margin-bottom: 8px; }
+.harness-tree { list-style: none; margin: 0 0 20px; padding: 0 0 0 12px; border-left: 1px solid var(--hairline, #333); }
+.harness-tree-row { display: grid; grid-template-columns: 1fr auto minmax(200px, 260px); gap: 12px; align-items: center; padding: 8px 0; }
+.harness-agent-name { font-weight: 500; }
+.harness-agent-classes { display: flex; gap: 4px; flex-wrap: wrap; }
+.harness-class-chip { font-size: 11px; padding: 1px 6px; border-radius: 4px; background: var(--chip-bg, #222); color: var(--muted, #999); }
+.harness-escalation { display: block; margin-top: 8px; }
+.harness-tree-caption { margin-top: 12px; }
