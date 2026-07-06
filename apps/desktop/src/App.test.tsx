@@ -32,6 +32,8 @@ beforeEach(() => {
   invokeMock.mockImplementation((cmd: string) => {
     if (cmd === "engine_call") return Promise.resolve({ providers: [] });
     if (cmd === "list_secret_ids") return Promise.resolve([]);
+    if (cmd === "frontier_login_status") return Promise.resolve({ state: "disconnected" });
+    if (cmd === "list_provider_configs") return Promise.resolve([]);
     return Promise.resolve(undefined);
   });
   // Reset route state between tests — jsdom's `window` persists across
@@ -81,7 +83,7 @@ describe("App shell", () => {
     expect(screen.getByRole("heading", { level: 1, name: "Orchestrate" })).toBeTruthy();
   });
 
-  it("opens API keys (BYOK) and the model-providers readout in the Settings dialog — neither is a nav route — and closes it again", async () => {
+  it("opens the Orchestrators + Model providers (BYOK) groups in the Settings dialog — neither is a nav route — and closes it again", async () => {
     const App = await freshApp();
     render(<App />);
 
@@ -92,10 +94,10 @@ describe("App shell", () => {
     fireEvent.click(screen.getByRole("button", { name: "Settings" }));
     const dialog = screen.getByRole("dialog", { name: "Settings" });
     expect(dialog).toBeTruthy();
-    await waitFor(() => expect(screen.getByText(/No keys set yet/)).toBeTruthy());
-    // The model-providers list moved out of the deleted Project screen and
-    // into Settings, alongside the keys pane.
-    await waitFor(() => expect(screen.getByText(/No providers configured/)).toBeTruthy());
+    await waitFor(() => expect(screen.getByText(/No model providers yet/)).toBeTruthy());
+    // The Orchestrators group (frontier connect) sits alongside the merged
+    // BYOK model-providers pane — both render inside Settings, not as routes.
+    expect(screen.getByRole("heading", { name: /orchestrators/i })).toBeTruthy();
 
     fireEvent.click(screen.getByRole("button", { name: /close settings/i }));
     expect(screen.queryByRole("dialog")).toBeNull();
@@ -111,7 +113,7 @@ describe("App shell", () => {
     expect(screen.getByRole("dialog", { name: "Settings" })).toBeTruthy();
     // Let the dialog's own async panes settle before dismissing, so no
     // state update lands after unmount.
-    await waitFor(() => expect(screen.getByText(/No keys set yet/)).toBeTruthy());
+    await waitFor(() => expect(screen.getByText(/No model providers yet/)).toBeTruthy());
 
     fireEvent.keyDown(window, { key: "Escape" });
     expect(screen.queryByRole("dialog")).toBeNull();
