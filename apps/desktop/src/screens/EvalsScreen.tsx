@@ -11,7 +11,7 @@ import {
 } from "../engineClient";
 
 /** Renders a rejection as a short, user-facing sentence — never a stack
- * trace. Same posture as Orchestrate/Project/Keys screens' own
+ * trace. Same posture as Orchestrate/Keys screens' own
  * `friendlyMessage`. */
 function friendlyMessage(err: unknown): string {
   if (err instanceof EngineError) return `[${err.code}] ${err.message}`;
@@ -37,8 +37,8 @@ function formatPct(value: number | null): string {
   return `${(value * 100).toFixed(1)}%`;
 }
 
-// Monotonic key for progress list entries — same rationale as Orchestrate/
-// Project screens' own `progressKeySeq` (append-only list, no reordering).
+// Monotonic key for progress list entries — same rationale as
+// OrchestrateScreen's own `progressKeySeq` (append-only list, no reordering).
 let progressKeySeq = 0;
 
 interface ProgressEntry {

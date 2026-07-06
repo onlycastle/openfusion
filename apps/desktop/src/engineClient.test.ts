@@ -38,6 +38,12 @@ import {
   deleteSecret,
   listSecretIds,
   loadPersistedSecrets,
+  saveProviderConfig,
+  deleteProviderConfig,
+  frontierLoginStatus,
+  frontierLogin,
+  frontierLogout,
+  reconfigureProvidersOnLaunch,
   type OrchestrateResult,
   type EvalsReportCard,
 } from "./engineClient";
@@ -181,6 +187,23 @@ describe("typed method wrappers", () => {
     expect(invokeMock).toHaveBeenCalledWith("engine_call", {
       method: "engine.wiki.build",
       params: { projectDir: "/home/me/project" },
+      timeoutMs: undefined,
+    });
+  });
+
+  it("modelsConfigure calls engine.models.configure with the provider config", async () => {
+    invokeMock.mockResolvedValueOnce({ configured: true });
+    const client = new EngineClient();
+    const result = await client.modelsConfigure({
+      id: "deepseek",
+      kind: "deepseek",
+      apiKey: "sk-test",
+      baseURL: undefined,
+    });
+    expect(result).toEqual({ configured: true });
+    expect(invokeMock).toHaveBeenCalledWith("engine_call", {
+      method: "engine.models.configure",
+      params: { id: "deepseek", kind: "deepseek", apiKey: "sk-test", baseURL: undefined },
       timeoutMs: undefined,
     });
   });
@@ -520,5 +543,61 @@ describe("secret command wrappers (Rust commands, not engine_call)", () => {
     await loadPersistedSecrets();
 
     expect(invokeMock).toHaveBeenCalledWith("load_persisted_secrets");
+  });
+});
+
+describe("reconfigureProvidersOnLaunch", () => {
+  it("reconfigureProvidersOnLaunch re-registers each persisted provider from its stored key", async () => {
+    invokeMock.mockImplementation((cmd: string, args?: any) => {
+      if (cmd === "list_provider_configs") return Promise.resolve([
+        { id: "deepseek", kind: "deepseek", model: "deepseek-v4-flash" },
+        { id: "openai-compatible", kind: "openai-compatible", baseURL: "https://h/v1", model: "qwen3-coder" },
+      ]);
+      if (cmd === "get_secret") return Promise.resolve(args.id === "deepseek" ? "sk-ds" : "sk-oai");
+      if (cmd === "engine_call") return Promise.resolve({ configured: true });
+      return Promise.resolve(undefined);
+    });
+
+    await reconfigureProvidersOnLaunch();
+
+    expect(invokeMock).toHaveBeenCalledWith("engine_call", {
+      method: "engine.models.configure",
+      params: { id: "deepseek", kind: "deepseek", apiKey: "sk-ds", baseURL: undefined },
+      timeoutMs: undefined,
+    });
+    expect(invokeMock).toHaveBeenCalledWith("engine_call", {
+      method: "engine.models.configure",
+      params: { id: "openai-compatible", kind: "openai-compatible", apiKey: "sk-oai", baseURL: "https://h/v1" },
+      timeoutMs: undefined,
+    });
+  });
+
+  it("reconfigureProvidersOnLaunch skips a provider whose key is missing", async () => {
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === "list_provider_configs") return Promise.resolve([{ id: "deepseek", kind: "deepseek", model: "deepseek-v4-flash" }]);
+      if (cmd === "get_secret") return Promise.resolve(null);
+      return Promise.resolve(undefined);
+    });
+    await reconfigureProvidersOnLaunch();
+    const configureCalls = invokeMock.mock.calls.filter(([c, a]) => c === "engine_call" && a?.method === "engine.models.configure");
+    expect(configureCalls).toHaveLength(0);
+  });
+});
+
+describe("host-command wrappers", () => {
+  it("host-command wrappers call the right Tauri commands", async () => {
+    invokeMock.mockResolvedValue(undefined);
+    await saveProviderConfig({ id: "deepseek", kind: "deepseek", model: "deepseek-v4-flash" });
+    expect(invokeMock).toHaveBeenCalledWith("save_provider_config", {
+      meta: { id: "deepseek", kind: "deepseek", model: "deepseek-v4-flash" },
+    });
+    await deleteProviderConfig("deepseek");
+    expect(invokeMock).toHaveBeenCalledWith("delete_provider_config", { id: "deepseek" });
+    await frontierLoginStatus("claude-code");
+    expect(invokeMock).toHaveBeenCalledWith("frontier_login_status", { engine: "claude-code" });
+    await frontierLogin("claude-code");
+    expect(invokeMock).toHaveBeenCalledWith("frontier_login", { engine: "claude-code" });
+    await frontierLogout("claude-code");
+    expect(invokeMock).toHaveBeenCalledWith("frontier_logout", { engine: "claude-code" });
   });
 });

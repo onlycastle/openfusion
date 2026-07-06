@@ -12,11 +12,21 @@
   },
   "app": {
     "withGlobalTauri": true,
+    "macOSPrivateApi": true,
     "windows": [
       {
         "title": "OpenFusion",
         "width": 1024,
-        "height": 720
+        "height": 720,
+        "minWidth": 860,
+        "minHeight": 600,
+        "transparent": true,
+        "titleBarStyle": "Overlay",
+        "hiddenTitle": true,
+        "windowEffects": {
+          "effects": ["sidebar"],
+          "state": "followsWindowActiveState"
+        }
       }
     ],
     "security": {

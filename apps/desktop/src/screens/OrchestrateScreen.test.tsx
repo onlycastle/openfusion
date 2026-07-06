@@ -3,12 +3,12 @@ import { act, render, screen, fireEvent, waitFor, cleanup } from "@testing-libra
 
 // `test.globals` is `false` (see vite.config.ts) so RTL's auto-registered
 // `afterEach(cleanup)` never fires — do it explicitly, same as
-// ProjectScreen.test.tsx/KeysScreen.test.tsx.
+// EvalsScreen.test.tsx/KeysScreen.test.tsx.
 afterEach(cleanup);
 
 // The Tauri dialog plugin's `open()` — mocked so tests drive the project
 // directory picker without a real native dialog (same pattern as
-// ProjectScreen.test.tsx).
+// EvalsScreen.test.tsx).
 const { openMock } = vi.hoisted(() => ({ openMock: vi.fn() }));
 vi.mock("@tauri-apps/plugin-dialog", () => ({ open: openMock }));
 
@@ -16,9 +16,11 @@ vi.mock("@tauri-apps/plugin-dialog", () => ({ open: openMock }));
 // for `runOrchestrate`/`call`. `importOriginal` keeps `EngineError`/
 // `RunCancelledError` real so `instanceof` checks inside the component work
 // against the same classes these tests construct.
-const { runOrchestrateMock, callMock } = vi.hoisted(() => ({
+const { runOrchestrateMock, callMock, wikiStatusMock, wikiBuildMock } = vi.hoisted(() => ({
   runOrchestrateMock: vi.fn(),
   callMock: vi.fn(),
+  wikiStatusMock: vi.fn(),
+  wikiBuildMock: vi.fn(),
 }));
 
 vi.mock("../engineClient", async (importOriginal) => {
@@ -28,12 +30,26 @@ vi.mock("../engineClient", async (importOriginal) => {
     engineClient: {
       runOrchestrate: runOrchestrateMock,
       call: callMock,
+      // Choosing a project now checks its wiki index (absorbed from the
+      // former Project screen), so the mocked client must answer these too.
+      wikiStatus: wikiStatusMock,
+      wikiBuild: wikiBuildMock,
     },
   };
 });
 
 import { OrchestrateScreen } from "./OrchestrateScreen";
-import { EngineError, RunCancelledError, type OrchestrateResult } from "../engineClient";
+import {
+  EngineError,
+  RunCancelledError,
+  type OrchestrateResult,
+  type WikiBuildStats,
+  type WikiStatus,
+} from "../engineClient";
+
+function wikiStatusFixture(overrides: Partial<WikiStatus> = {}): WikiStatus {
+  return { built: false, headSha: null, currentSha: "abc123", stale: false, files: 0, symbols: 0, refs: 0, ...overrides };
+}
 
 function orchestrateResultFixture(overrides: Partial<OrchestrateResult> = {}): OrchestrateResult {
   return {
@@ -83,6 +99,11 @@ beforeEach(() => {
   openMock.mockReset();
   runOrchestrateMock.mockReset();
   callMock.mockReset();
+  wikiStatusMock.mockReset();
+  wikiBuildMock.mockReset();
+  // A benign default so tests that only exercise the run loop aren't forced
+  // to stub the wiki check that choosing a project fires.
+  wikiStatusMock.mockResolvedValue(wikiStatusFixture());
 });
 
 async function chooseProjectAndFillTask(
@@ -295,6 +316,56 @@ describe("OrchestrateScreen", () => {
 
     // CORRECTNESS: Apply must send the RUN's project (/proj/A), not the live picker (/proj/B)
     expect(callMock).toHaveBeenCalledWith("engine.orchestrate.apply", { projectDir: "/proj/A", diff: fixture.diff });
+  });
+
+  it("shows the chosen project's wiki reading in the head and builds it on demand (absorbed from the former Project screen)", async () => {
+    wikiStatusMock.mockReset(); // drop the beforeEach default so the ordered Once values below apply
+    // First status (on choose): not built. Second (after a build): up to date.
+    wikiStatusMock.mockResolvedValueOnce(wikiStatusFixture({ built: false }));
+    openMock.mockResolvedValueOnce("/Users/test/project");
+    render(<OrchestrateScreen />);
+
+    fireEvent.click(screen.getByRole("button", { name: /choose project/i }));
+    await waitFor(() => expect(screen.getByText(/wiki: not built/i)).toBeTruthy());
+
+    let resolveBuild!: (stats: WikiBuildStats) => void;
+    wikiBuildMock.mockReturnValueOnce(
+      new Promise<WikiBuildStats>((resolve) => {
+        resolveBuild = resolve;
+      }),
+    );
+    wikiStatusMock.mockResolvedValueOnce(wikiStatusFixture({ built: true, headSha: "abc123", symbols: 12, refs: 4, files: 3 }));
+
+    fireEvent.click(screen.getByRole("button", { name: /^build$/i }));
+    await waitFor(() => expect(screen.getByText(/wiki: building/i)).toBeTruthy());
+    expect(wikiBuildMock).toHaveBeenCalledWith("/Users/test/project");
+
+    act(() =>
+      resolveBuild({
+        filesSeen: 3,
+        filesIndexed: 3,
+        filesSkipped: 0,
+        filesFailed: 0,
+        filesRemoved: 0,
+        symbols: 12,
+        refs: 4,
+        headSha: "abc123",
+      }),
+    );
+    await waitFor(() => expect(screen.getByText(/wiki: up to date/i)).toBeTruthy());
+  });
+
+  it("surfaces a friendly wiki error in the head (not a crash) when the wiki check rejects", async () => {
+    wikiStatusMock.mockReset();
+    wikiStatusMock.mockRejectedValueOnce(new EngineError(-32001, "not a git repository", undefined));
+    openMock.mockResolvedValueOnce("/Users/test/not-a-repo");
+    render(<OrchestrateScreen />);
+
+    fireEvent.click(screen.getByRole("button", { name: /choose project/i }));
+    await waitFor(() => expect(screen.getByRole("alert")).toBeTruthy());
+    expect(screen.getByRole("alert").textContent).toMatch(/not a git repository/i);
+    // A wiki failure must not read as a run failure.
+    expect(screen.queryByText(/^failed$/i)).toBeNull();
   });
 
   it("renders the routed model from result.resolution in the final outcome view (structural routed-model test)", async () => {

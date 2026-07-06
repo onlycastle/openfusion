@@ -213,9 +213,19 @@ export interface CancellableRun<T> {
 // side (`IndexStats`, `ProviderRegistry.list()`, `engine.wiki.status`'s
 // inline return) has no compile-time link to these interfaces; only a
 // runtime shape mismatch would catch drift.
+
+export type ProviderKind = "moonshot" | "zai" | "deepseek" | "openai-compatible";
+
+export interface ProviderConfigInput {
+  id: string;
+  kind: ProviderKind;
+  apiKey: string;
+  baseURL?: string;
+}
+
 export interface ModelProviderSummary {
   id: string;
-  kind: "moonshot" | "zai" | "deepseek" | "openai-compatible";
+  kind: ProviderKind;
   baseURL?: string;
 }
 
@@ -476,6 +486,13 @@ export class EngineClient {
     return this.call<ModelsListResult>("engine.models.list", {}, opts);
   }
 
+  /** `engine.models.configure` — registers (or overwrites) a provider in the
+   * engine's in-memory registry so routing can resolve to it. The engine keeps
+   * the apiKey memory-only per its own contract; this call carries it once. */
+  modelsConfigure(config: ProviderConfigInput, opts?: CallOptions): Promise<{ configured: boolean }> {
+    return this.call<{ configured: boolean }>("engine.models.configure", config, opts);
+  }
+
   wikiBuild(projectDir: string, opts?: CallOptions): Promise<WikiBuildStats> {
     return this.call<WikiBuildStats>("engine.wiki.build", { projectDir }, opts);
   }
@@ -669,4 +686,75 @@ export function listSecretIds(): Promise<string[]> {
  * once at app startup; exposed here for completeness/tests). */
 export function loadPersistedSecrets(): Promise<void> {
   return invoke("load_persisted_secrets");
+}
+
+// ---------------------------------------------------------------------------
+// Provider metadata commands (non-secret) — Rust host, NOT engine RPC.
+// ---------------------------------------------------------------------------
+
+/** Non-secret provider metadata (never an API key). Mirrors `providers.rs`'s
+ * `ProviderMeta`. */
+export interface ProviderMeta {
+  id: string;
+  kind: ProviderKind;
+  baseURL?: string;
+  model: string;
+}
+
+/** `invoke('list_provider_configs')`. */
+export function listProviderConfigs(): Promise<ProviderMeta[]> {
+  return invoke<ProviderMeta[]>("list_provider_configs");
+}
+
+/** `invoke('save_provider_config', { meta })`. */
+export function saveProviderConfig(meta: ProviderMeta): Promise<void> {
+  return invoke("save_provider_config", { meta });
+}
+
+/** `invoke('delete_provider_config', { id })`. */
+export function deleteProviderConfig(id: string): Promise<void> {
+  return invoke("delete_provider_config", { id });
+}
+
+/** On launch, re-register every persisted provider with the engine (whose
+ * registry starts empty each run) by pairing its saved metadata with its
+ * Keychain key. The key value is read into a local and passed straight to
+ * `modelsConfigure` — never rendered, never logged. A provider whose key is
+ * missing (e.g. a Keychain entry was removed out-of-band) is skipped. */
+export async function reconfigureProvidersOnLaunch(): Promise<void> {
+  const metas = await listProviderConfigs();
+  await Promise.all(
+    metas.map(async (meta) => {
+      const apiKey = await getSecret(meta.id);
+      if (apiKey === null) return;
+      await engineClient.modelsConfigure({ id: meta.id, kind: meta.kind, apiKey, baseURL: meta.baseURL });
+    }),
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Frontier CLI-auth commands — Rust host. No token ever crosses this surface.
+// ---------------------------------------------------------------------------
+
+export type FrontierEngineKind = "claude-code" | "codex";
+
+/** Mirrors `frontier.rs`'s `FrontierAuthStatus`. */
+export interface FrontierAuthStatus {
+  state: "connected" | "disconnected" | "not-installed";
+  detail?: string;
+}
+
+/** `invoke('frontier_login_status', { engine })`. */
+export function frontierLoginStatus(engine: FrontierEngineKind): Promise<FrontierAuthStatus> {
+  return invoke<FrontierAuthStatus>("frontier_login_status", { engine });
+}
+
+/** `invoke('frontier_login', { engine })` — launches the official CLI login. */
+export function frontierLogin(engine: FrontierEngineKind): Promise<void> {
+  return invoke("frontier_login", { engine });
+}
+
+/** `invoke('frontier_logout', { engine })`. */
+export function frontierLogout(engine: FrontierEngineKind): Promise<void> {
+  return invoke("frontier_logout", { engine });
 }
