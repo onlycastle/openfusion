@@ -55,32 +55,33 @@ async function freshApp() {
 }
 
 describe("App shell", () => {
-  it("renders the nav and the default Orchestrate route, using the mocked engine client", async () => {
+  it("renders the nav and the default Studio route, using the mocked engine client", async () => {
     const App = await freshApp();
     render(<App />);
 
     expect(screen.getByRole("navigation")).toBeTruthy();
-    // Orchestrate is the default route now — Project is gone (its picker
-    // lives inside the Orchestrate composer), so the empty-session hero and
-    // its Run control are what greets the user.
-    expect(screen.getByRole("heading", { level: 1, name: "Orchestrate" })).toBeTruthy();
-    expect(screen.getByRole("button", { name: /^run$/i })).toBeTruthy();
+    // Studio is the default route. The first screen is the harness setup
+    // phase, so the task composer/run control are not visible yet.
+    expect(screen.getByRole("heading", { level: 1, name: "Studio" })).toBeTruthy();
+    expect(screen.getByText(/building harness/i)).toBeTruthy();
+    expect(screen.getByRole("button", { name: /select project/i })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /^run$/i })).toBeNull();
     expect(screen.queryByRole("button", { name: "Project" })).toBeNull();
   });
 
-  it("switches routes on nav click: Evals is a real cockpit screen; Orchestrate is the default", async () => {
+  it("switches routes on nav click: Evals is a real cockpit screen; Studio is the default", async () => {
     const App = await freshApp();
     render(<App />);
 
-    // Default is Orchestrate.
-    expect(screen.getByRole("heading", { level: 1, name: "Orchestrate" })).toBeTruthy();
+    // Default is Studio.
+    expect(screen.getByRole("heading", { level: 1, name: "Studio" })).toBeTruthy();
 
     fireEvent.click(screen.getByRole("button", { name: "Evals" }));
     expect(screen.getByRole("heading", { level: 1, name: "Evals" })).toBeTruthy();
     expect(screen.getByRole("button", { name: /run evals/i })).toBeTruthy();
 
-    fireEvent.click(screen.getByRole("button", { name: "Orchestrate" }));
-    expect(screen.getByRole("heading", { level: 1, name: "Orchestrate" })).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Studio" }));
+    expect(screen.getByRole("heading", { level: 1, name: "Studio" })).toBeTruthy();
   });
 
   it("opens the Orchestrators + Model providers (BYOK) groups in the Settings dialog — neither is a nav route — and closes it again", async () => {
@@ -101,8 +102,8 @@ describe("App shell", () => {
 
     fireEvent.click(screen.getByRole("button", { name: /close settings/i }));
     expect(screen.queryByRole("dialog")).toBeNull();
-    // The route underneath never changed — Orchestrate is still on screen.
-    expect(screen.getByRole("heading", { level: 1, name: "Orchestrate" })).toBeTruthy();
+    // The route underneath never changed — Studio is still on screen.
+    expect(screen.getByRole("heading", { level: 1, name: "Studio" })).toBeTruthy();
   });
 
   it("closes the Settings dialog on Escape", async () => {

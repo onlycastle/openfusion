@@ -2,15 +2,21 @@
 // react-router — this is ~30 lines instead of a dependency. (Keys/BYOK is
 // no longer a route: it lives in the Settings dialog, which is plain
 // component state in App, not navigation. Project is no longer a route
-// either: the project is chosen inside Orchestrate, and its wiki tooling
+// either: the project is chosen inside the Studio, and its wiki tooling
 // lives there too; a stale `#/project` deep-link falls back to the default
 // route via `parseHash`.)
+//
+// Route vocabulary is the UI layer's ("studio", the destination the user
+// navigates to); the engine's own process keeps its name ("orchestrate" —
+// the RPC methods and result types the Studio screen drives). Studio is the
+// room; orchestrate is the machinery inside it. A stale `#/orchestrate`
+// deep-link falls back to the default route via `parseHash`.
 import { useCallback, useEffect, useState } from "react";
 
-export const ROUTES = ["orchestrate", "evals"] as const;
+export const ROUTES = ["studio", "evals"] as const;
 export type Route = (typeof ROUTES)[number];
 
-export const DEFAULT_ROUTE: Route = "orchestrate";
+export const DEFAULT_ROUTE: Route = "studio";
 
 function isRoute(value: string): value is Route {
   return (ROUTES as readonly string[]).includes(value);

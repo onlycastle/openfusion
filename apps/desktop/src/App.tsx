@@ -38,7 +38,7 @@ export function App() {
       <div className="shell">
         <Nav current={route} onNavigate={navigate} onOpenSettings={() => setSettingsOpen(true)} />
         <main className="content">
-          {route === "orchestrate" && <OrchestrateScreen />}
+          {route === "studio" && <OrchestrateScreen onOpenSettings={() => setSettingsOpen(true)} />}
           {route === "evals" && <EvalsScreen />}
         </main>
       </div>

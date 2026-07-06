@@ -40,9 +40,10 @@ interface NavItem {
 }
 
 /* The workspace — where work happens. The project itself is chosen inside
- * Orchestrate (the composer's project chip), so there is no separate
- * Project destination anymore. */
-const WORKSPACE_ITEMS: NavItem[] = [{ route: "orchestrate", label: "Orchestrate", icon: <RouteIcon /> }];
+ * the Studio (the composer's project chip), so there is no separate Project
+ * destination anymore. ("Studio" is the user-facing name for the screen that
+ * drives the engine's orchestrate loop — see router.ts on the vocabulary.) */
+const WORKSPACE_ITEMS: NavItem[] = [{ route: "studio", label: "Studio", icon: <RouteIcon /> }];
 
 /* Instruments — readouts you consult, not places you work. Evals measures
  * the harness's honesty; it never produces work of its own. */

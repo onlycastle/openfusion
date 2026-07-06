@@ -16,24 +16,41 @@ vi.mock("@tauri-apps/plugin-dialog", () => ({ open: openMock }));
 // for `runOrchestrate`/`call`. `importOriginal` keeps `EngineError`/
 // `RunCancelledError` real so `instanceof` checks inside the component work
 // against the same classes these tests construct.
-const { runOrchestrateMock, callMock, wikiStatusMock, wikiBuildMock } = vi.hoisted(() => ({
+const {
+  runOrchestrateMock,
+  callMock,
+  modelsListMock,
+  wikiStatusMock,
+  wikiBuildMock,
+  harnessStatusMock,
+  harnessGenerateMock,
+  frontierLoginStatusMock,
+} = vi.hoisted(() => ({
   runOrchestrateMock: vi.fn(),
   callMock: vi.fn(),
+  modelsListMock: vi.fn(),
   wikiStatusMock: vi.fn(),
   wikiBuildMock: vi.fn(),
+  harnessStatusMock: vi.fn(),
+  harnessGenerateMock: vi.fn(),
+  frontierLoginStatusMock: vi.fn(),
 }));
 
 vi.mock("../engineClient", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../engineClient")>();
   return {
     ...actual,
+    frontierLoginStatus: frontierLoginStatusMock,
     engineClient: {
       runOrchestrate: runOrchestrateMock,
       call: callMock,
+      modelsList: modelsListMock,
       // Choosing a project now checks its wiki index (absorbed from the
       // former Project screen), so the mocked client must answer these too.
       wikiStatus: wikiStatusMock,
       wikiBuild: wikiBuildMock,
+      harnessStatus: harnessStatusMock,
+      harnessGenerate: harnessGenerateMock,
     },
   };
 });
@@ -42,6 +59,8 @@ import { OrchestrateScreen } from "./OrchestrateScreen";
 import {
   EngineError,
   RunCancelledError,
+  type GenerateHarnessResult,
+  type HarnessStatus,
   type OrchestrateResult,
   type WikiBuildStats,
   type WikiStatus,
@@ -49,6 +68,22 @@ import {
 
 function wikiStatusFixture(overrides: Partial<WikiStatus> = {}): WikiStatus {
   return { built: false, headSha: null, currentSha: "abc123", stale: false, files: 0, symbols: 0, refs: 0, ...overrides };
+}
+
+function harnessStatusFixture(overrides: Partial<HarnessStatus> = {}): HarnessStatus {
+  return { present: true, structural: "pass", evals: "pending", headSha: "abc123", ...overrides };
+}
+
+function generateHarnessFixture(overrides: Partial<GenerateHarnessResult> = {}): GenerateHarnessResult {
+  return {
+    files: [".openfusion/manifest.json"],
+    reportCard: { structural: "pass", evals: "pending" },
+    estimatedCostUsd: 0.05,
+    pages: 4,
+    agents: 3,
+    note: "harness is UNVERIFIED until evals run (M6)",
+    ...overrides,
+  };
 }
 
 function orchestrateResultFixture(overrides: Partial<OrchestrateResult> = {}): OrchestrateResult {
@@ -99,11 +134,19 @@ beforeEach(() => {
   openMock.mockReset();
   runOrchestrateMock.mockReset();
   callMock.mockReset();
+  modelsListMock.mockReset();
   wikiStatusMock.mockReset();
   wikiBuildMock.mockReset();
+  harnessStatusMock.mockReset();
+  harnessGenerateMock.mockReset();
+  frontierLoginStatusMock.mockReset();
+  frontierLoginStatusMock.mockResolvedValue({ state: "connected" });
+  modelsListMock.mockResolvedValue({ providers: [{ id: "deepseek", kind: "deepseek" }] });
   // A benign default so tests that only exercise the run loop aren't forced
   // to stub the wiki check that choosing a project fires.
   wikiStatusMock.mockResolvedValue(wikiStatusFixture());
+  harnessStatusMock.mockResolvedValue(harnessStatusFixture());
+  harnessGenerateMock.mockResolvedValue(generateHarnessFixture());
 });
 
 async function chooseProjectAndFillTask(
@@ -112,13 +155,65 @@ async function chooseProjectAndFillTask(
 ): Promise<{ path: string; task: string }> {
   openMock.mockResolvedValueOnce(path);
   render(<OrchestrateScreen />);
-  fireEvent.click(screen.getByRole("button", { name: /choose project/i }));
+  fireEvent.click(screen.getByRole("button", { name: /select project/i }));
   await waitFor(() => expect(screen.getByText(path)).toBeTruthy());
+  await waitFor(() => expect(screen.getByRole("button", { name: /open task chat/i })).toBeTruthy());
+  fireEvent.click(screen.getByRole("button", { name: /open task chat/i }));
   fireEvent.change(screen.getByLabelText(/task/i), { target: { value: task } });
   return { path, task };
 }
 
 describe("OrchestrateScreen", () => {
+  it("starts in harness setup and warns when orchestrator or executing models are missing", async () => {
+    frontierLoginStatusMock.mockResolvedValueOnce({ state: "disconnected" });
+    modelsListMock.mockResolvedValueOnce({ providers: [] });
+    render(<OrchestrateScreen />);
+
+    expect(screen.getByText(/building harness/i)).toBeTruthy();
+    expect(screen.getByRole("button", { name: /select project/i })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /^run$/i })).toBeNull();
+
+    await waitFor(() => expect(screen.getByRole("alert")).toBeTruthy());
+    expect(screen.getByText(/connect an orchestrator/i)).toBeTruthy();
+    expect(screen.getByText(/executing model provider/i)).toBeTruthy();
+  });
+
+  it("builds the harness for a selected project, streams build progress, then opens the task chat", async () => {
+    harnessStatusMock.mockReset();
+    harnessStatusMock
+      .mockResolvedValueOnce(harnessStatusFixture({ present: false, structural: null, evals: null, headSha: null }))
+      .mockResolvedValueOnce(harnessStatusFixture());
+
+    let onProgress!: (event: { projectDir: string; stage: string; detail: string }) => void;
+    let resolveGenerate!: (result: GenerateHarnessResult) => void;
+    harnessGenerateMock.mockImplementationOnce(
+      (_projectDir: string, progress: typeof onProgress) =>
+        new Promise<GenerateHarnessResult>((resolve) => {
+          onProgress = progress;
+          resolveGenerate = resolve;
+        }),
+    );
+
+    openMock.mockResolvedValueOnce("/Users/test/project");
+    render(<OrchestrateScreen />);
+
+    fireEvent.click(screen.getByRole("button", { name: /select project/i }));
+    await waitFor(() => expect(screen.getByText(/no harness yet/i)).toBeTruthy());
+    await waitFor(() => {
+      expect((screen.getByRole("button", { name: /build harness/i }) as HTMLButtonElement).disabled).toBe(false);
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: /build harness/i }));
+    expect(harnessGenerateMock).toHaveBeenCalledWith("/Users/test/project", expect.any(Function));
+
+    act(() => onProgress({ projectDir: "/Users/test/project", stage: "overview", detail: "exploring repository" }));
+    await waitFor(() => expect(screen.getByText(/exploring repository/i)).toBeTruthy());
+
+    act(() => resolveGenerate(generateHarnessFixture({ agents: 4 })));
+    await waitFor(() => expect(screen.getByText(/what should we work on/i)).toBeTruthy());
+    expect(screen.getByRole("button", { name: /^run$/i })).toBeTruthy();
+  });
+
   it("Run calls runOrchestrate with {projectDir, task}, streams progress, and renders the routed model", async () => {
     const { path, task } = await chooseProjectAndFillTask();
     const controllable = makeControllableRun();
@@ -291,7 +386,7 @@ describe("OrchestrateScreen", () => {
     }
   });
 
-  it("Apply uses the RUN's project directory, not the live picker value (wrong-project safety test)", async () => {
+  it("changing projects after a result returns to setup and removes the old Apply action", async () => {
     await chooseProjectAndFillTask("fix something", "/proj/A");
 
     const controllable = makeControllableRun();
@@ -311,11 +406,8 @@ describe("OrchestrateScreen", () => {
       expect(code?.textContent).toBe("/proj/B");
     });
 
-    callMock.mockResolvedValueOnce(undefined);
-    fireEvent.click(screen.getByRole("button", { name: /apply diff/i }));
-
-    // CORRECTNESS: Apply must send the RUN's project (/proj/A), not the live picker (/proj/B)
-    expect(callMock).toHaveBeenCalledWith("engine.orchestrate.apply", { projectDir: "/proj/A", diff: fixture.diff });
+    expect(screen.queryByRole("button", { name: /apply diff/i })).toBeNull();
+    expect(callMock).not.toHaveBeenCalledWith("engine.orchestrate.apply", { projectDir: "/proj/B", diff: fixture.diff });
   });
 
   it("shows the chosen project's wiki reading in the head and builds it on demand (absorbed from the former Project screen)", async () => {
@@ -325,7 +417,9 @@ describe("OrchestrateScreen", () => {
     openMock.mockResolvedValueOnce("/Users/test/project");
     render(<OrchestrateScreen />);
 
-    fireEvent.click(screen.getByRole("button", { name: /choose project/i }));
+    fireEvent.click(screen.getByRole("button", { name: /select project/i }));
+    await waitFor(() => expect(screen.getByRole("button", { name: /open task chat/i })).toBeTruthy());
+    fireEvent.click(screen.getByRole("button", { name: /open task chat/i }));
     await waitFor(() => expect(screen.getByText(/wiki: not built/i)).toBeTruthy());
 
     let resolveBuild!: (stats: WikiBuildStats) => void;
@@ -361,7 +455,7 @@ describe("OrchestrateScreen", () => {
     openMock.mockResolvedValueOnce("/Users/test/not-a-repo");
     render(<OrchestrateScreen />);
 
-    fireEvent.click(screen.getByRole("button", { name: /choose project/i }));
+    fireEvent.click(screen.getByRole("button", { name: /select project/i }));
     await waitFor(() => expect(screen.getByRole("alert")).toBeTruthy());
     expect(screen.getByRole("alert").textContent).toMatch(/not a git repository/i);
     // A wiki failure must not read as a run failure.

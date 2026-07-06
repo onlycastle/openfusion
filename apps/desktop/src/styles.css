@@ -422,13 +422,15 @@ input[type="checkbox"] {
   border-color: var(--ink-3);
 }
 .content button[type="submit"],
-.dialog button[type="submit"] {
+.dialog button[type="submit"],
+.content button.primary-action {
   background: var(--ink);
   border-color: var(--ink);
   color: var(--paper);
 }
 .content button[type="submit"]:hover:not(:disabled),
-.dialog button[type="submit"]:hover:not(:disabled) {
+.dialog button[type="submit"]:hover:not(:disabled),
+.content button.primary-action:hover:not(:disabled) {
   opacity: 0.88;
   background: var(--ink);
 }
@@ -758,12 +760,12 @@ input[type="checkbox"] {
 }
 
 /* ============================================================================
-   Orchestrate — session-first layout.
-   An empty session opens on a centered prompt with the composer card mid-
-   screen; once a run starts, the transcript takes over and the same card
-   docks at the bottom. A slim top bar carries the screen eyebrow and the
-   project's absolute path (machine truth — the composer chip shows only
-   the directory name).
+   Studio — setup-first layout.
+   A new session opens on harness setup (project selection, readiness
+   warnings, build progress). Once the harness is ready, the task chat opens
+   with the composer card mid-screen; once a run starts, the transcript takes
+   over and the same card docks at the bottom. A slim top bar carries the
+   screen eyebrow and, during chat, the project's absolute path.
 
    Scoped to the chat screen via :has() so no other screen's layout changes —
    the chat screen owns its own scroll (transcript scrolls; composer stays put).
@@ -858,6 +860,167 @@ input[type="checkbox"] {
 .content button.wiki-action:hover:not(:disabled) {
   background: var(--accent-soft);
   border-color: transparent;
+}
+
+/* --------------------------------------------------------- harness setup -- */
+
+.harness-setup {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 28px;
+}
+.harness-setup-inner {
+  width: min(660px, 100%);
+}
+.harness-kicker {
+  margin: 0 0 8px;
+  font-family: var(--mono);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+  text-align: center;
+}
+.harness-setup h2 {
+  margin: 0;
+  font-size: 25px;
+  font-weight: 650;
+  letter-spacing: -0.01em;
+  line-height: 1.2;
+  text-align: center;
+  text-wrap: balance;
+}
+.harness-setup-status {
+  margin: 10px 0 18px;
+  color: var(--ink-2);
+  font-size: 12.5px;
+  text-align: center;
+}
+.setup-warning {
+  margin: 18px 0;
+  padding: 12px 14px;
+  border: 1px solid var(--caveat-line);
+  border-left: 3px solid var(--caveat-fg);
+  border-radius: var(--radius);
+  background: var(--caveat-bg);
+  color: var(--caveat-fg);
+}
+.setup-warning ul {
+  margin: 6px 0 0;
+  padding-left: 18px;
+  color: var(--ink);
+}
+.setup-warning li {
+  margin: 3px 0;
+}
+.setup-warning-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.harness-panel {
+  margin-top: 22px;
+  padding: 18px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--panel);
+}
+.content button.harness-project-button {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 12px 14px;
+  border-radius: var(--radius);
+  background: var(--sunk);
+}
+.content button.harness-project-button:hover:not(:disabled) {
+  background: var(--panel);
+}
+.content button.harness-project-button span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.harness-project-path {
+  display: block;
+  margin: 12px 0 0;
+  padding: 7px 9px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: var(--ink-2);
+  background: var(--sunk);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+}
+.harness-state {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 14px;
+  padding-top: 14px;
+  border-top: 1px solid var(--line);
+  color: var(--ink);
+  font-weight: 600;
+}
+.harness-state-detail {
+  flex-shrink: 0;
+  font-family: var(--mono);
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--ink-3);
+}
+.harness-state-missing,
+.harness-state-stale,
+.harness-state-invalid,
+.harness-state-error {
+  color: var(--caveat-fg);
+}
+.harness-state-ready {
+  color: var(--pass-fg);
+}
+.harness-progress-list {
+  margin: 14px 0 0;
+  padding: 10px 12px;
+  max-height: 190px;
+  overflow-y: auto;
+  list-style: none;
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: var(--ink-2);
+  background: var(--sunk);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+}
+.harness-progress-list li {
+  display: grid;
+  grid-template-columns: minmax(88px, max-content) 1fr;
+  gap: 10px;
+  margin: 0 0 4px;
+}
+.harness-progress-list li:last-child {
+  margin-bottom: 0;
+}
+.harness-progress-list span {
+  color: var(--accent);
+  font-weight: 600;
+}
+.harness-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 16px;
 }
 
 /* ----------------------------------------------------------------- hero -- */

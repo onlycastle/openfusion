@@ -261,6 +261,28 @@ export interface WikiStatus {
   refs: number;
 }
 
+/** Mirrors `packages/engine/src/harness/store.ts`'s `harnessStatus` return:
+ * a cheap manifest-only read of whether `.openfusion` has a generated
+ * harness, whether its structure passed, and which git HEAD it targets. */
+export interface HarnessStatus {
+  present: boolean;
+  structural: "pass" | "fail" | null;
+  evals: string | null;
+  headSha: string | null;
+}
+
+/** Mirrors `packages/engine/src/harness/generate.ts`'s
+ * `GenerateHarnessResult`: the one-time build result after the frontier
+ * session writes the harness bundle. */
+export interface GenerateHarnessResult {
+  files: string[];
+  reportCard: { structural: "pass"; evals: "pending" };
+  estimatedCostUsd: number | null;
+  pages: number;
+  agents: number;
+  note: string;
+}
+
 // M7c Task 2: the `engine.orchestrate`/`engine.evals.run` result shapes the
 // Orchestrate/Eval-report-card cockpit screens need — same hand-mirror
 // posture and drift caveat as `WikiBuildStats`/`WikiStatus` above (checked
@@ -429,6 +451,14 @@ export interface EvalsProgressEvent {
   taskId?: string;
 }
 
+/** Mirrors `harness.progress` notifications emitted while
+ * `engine.harness.generate` builds the project harness. */
+export interface HarnessProgressEvent {
+  projectDir: string;
+  stage: string;
+  detail: string;
+}
+
 /** The engine-RPC half of the client (`call` + typed method wrappers) plus
  * the single-subscription notification pub/sub. Construct your own instance
  * in tests; the app itself imports the `engineClient` singleton below. */
@@ -505,6 +535,37 @@ export class EngineClient {
    * non-git directory. */
   wikiStatus(projectDir: string, opts?: CallOptions): Promise<WikiStatus> {
     return this.call<WikiStatus>("engine.wiki.status", { projectDir }, opts);
+  }
+
+  harnessStatus(projectDir: string, opts?: CallOptions): Promise<HarnessStatus> {
+    return this.call<HarnessStatus>("engine.harness.status", { projectDir }, opts);
+  }
+
+  /** `engine.harness.generate` is long-running and currently not
+   * cancellable. Progress is streamed through `harness.progress` and filtered
+   * by projectDir so a stale in-flight notification cannot land in a newly
+   * selected project. */
+  harnessGenerate(
+    projectDir: string,
+    onProgress?: (event: HarnessProgressEvent) => void,
+    opts?: CallOptions,
+  ): Promise<GenerateHarnessResult> {
+    const unsubscribe =
+      onProgress === undefined
+        ? undefined
+        : this.onEngineEvent((notification) => {
+            if (notification.method !== "harness.progress") return;
+            if (typeof notification.params !== "object" || notification.params === null) return;
+            const event = notification.params as Partial<HarnessProgressEvent>;
+            if (event.projectDir !== projectDir || typeof event.stage !== "string" || typeof event.detail !== "string") {
+              return;
+            }
+            onProgress(event as HarnessProgressEvent);
+          });
+
+    return this.call<GenerateHarnessResult>("engine.harness.generate", { projectDir }, opts).finally(() => {
+      unsubscribe?.();
+    });
   }
 
   // -- cancellable long runs (M7c Task 2) ----------------------------------

@@ -191,6 +191,63 @@ describe("typed method wrappers", () => {
     });
   });
 
+  it("harnessStatus(projectDir) calls engine_call with engine.harness.status and the project dir", async () => {
+    invokeMock.mockResolvedValueOnce({ present: false, structural: null, evals: null, headSha: null });
+    const client = new EngineClient();
+
+    await client.harnessStatus("/home/me/project");
+
+    expect(invokeMock).toHaveBeenCalledWith("engine_call", {
+      method: "engine.harness.status",
+      params: { projectDir: "/home/me/project" },
+      timeoutMs: undefined,
+    });
+  });
+
+  it("harnessGenerate(projectDir) calls engine.harness.generate and filters progress by project dir", async () => {
+    let resolveGenerate!: (value: unknown) => void;
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === "engine_events") return Promise.resolve(undefined);
+      if (cmd === "engine_call") {
+        return new Promise((resolve) => {
+          resolveGenerate = resolve;
+        });
+      }
+      return Promise.resolve(undefined);
+    });
+
+    const client = new EngineClient();
+    const received: unknown[] = [];
+    const promise = client.harnessGenerate("/home/me/project", (event) => received.push(event));
+
+    const channel = channelInstances[0]!;
+    channel.onmessage?.({
+      method: "harness.progress",
+      params: { projectDir: "/other", stage: "overview", detail: "ignored" },
+    });
+    channel.onmessage?.({
+      method: "harness.progress",
+      params: { projectDir: "/home/me/project", stage: "overview", detail: "exploring" },
+    });
+
+    resolveGenerate({
+      files: [],
+      reportCard: { structural: "pass", evals: "pending" },
+      estimatedCostUsd: null,
+      pages: 4,
+      agents: 2,
+      note: "harness is UNVERIFIED until evals run (M6)",
+    });
+    await promise;
+
+    expect(invokeMock).toHaveBeenCalledWith("engine_call", {
+      method: "engine.harness.generate",
+      params: { projectDir: "/home/me/project" },
+      timeoutMs: undefined,
+    });
+    expect(received).toEqual([{ projectDir: "/home/me/project", stage: "overview", detail: "exploring" }]);
+  });
+
   it("modelsConfigure calls engine.models.configure with the provider config", async () => {
     invokeMock.mockResolvedValueOnce({ configured: true });
     const client = new EngineClient();
