@@ -106,4 +106,35 @@ export function registerHarnessMethods(engine: Engine): void {
     engine.log(`harness.export ${projectDir} (${format}): ${result.files.length} files`);
     return result;
   });
+
+  registerMethod(engine.dispatcher, "engine.harness.read", ProjectParamsSchema, ({ projectDir }) => {
+    let bundle;
+    try {
+      bundle = loadHarness(projectDir);
+    } catch (err) {
+      if (err instanceof HarnessValidationError) {
+        throw new RpcMethodError(RpcErrorCodes.SERVER_ERROR, err.message, { issues: err.issues });
+      }
+      throw err;
+    }
+    if (bundle === null) {
+      throw new RpcMethodError(RpcErrorCodes.SERVER_ERROR, "no valid harness; run engine.harness.generate first");
+    }
+    const structuralIssues = validateHarness(bundle);
+    if (structuralIssues.length > 0) {
+      throw new RpcMethodError(RpcErrorCodes.SERVER_ERROR, "no valid harness; run engine.harness.generate first", {
+        issues: structuralIssues,
+      });
+    }
+    return {
+      agents: bundle.agents.map((a) => ({
+        name: a.name,
+        role: a.role,
+        taskClasses: a.taskClasses,
+        model: a.model,
+      })),
+      defaultAgent: bundle.routing.defaults.agent,
+      escalation: bundle.routing.escalation.failuresBeforeFrontier,
+    };
+  });
 }
