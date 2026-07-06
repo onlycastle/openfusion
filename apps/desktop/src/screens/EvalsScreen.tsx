@@ -1,5 +1,5 @@
 import { useCallback, useRef, useState } from "react";
-import { open } from "@tauri-apps/plugin-dialog";
+import { useProject } from "../ProjectContext";
 import {
   EngineError,
   RunCancelledError,
@@ -168,8 +168,8 @@ function SavingsDisplay({ report }: { report: EvalsReportCard }) {
 }
 
 /** The Evals cockpit screen: the M6 baseline-vs-harness report card, live.
- * Picks a project directory (a minimal, self-contained picker — same
- * posture as OrchestrateScreen's own), takes a list of golden-commit SHAs
+ * Reads the active project from `ProjectContext` (Rail 1's concern now —
+ * this screen no longer owns a picker), takes a list of golden-commit SHAs
  * plus one shared test command, runs `engineClient.runEvals` as a
  * `CancellableRun`, and renders its streamed `evals.progress` stages, then
  * the full report card: the verdict (with the ETH-hazard fail treatment),
@@ -179,9 +179,8 @@ function SavingsDisplay({ report }: { report: EvalsReportCard }) {
  * Cancelling/Cancelled state (not Failed), matching OrchestrateScreen's own
  * cancel semantics exactly. */
 export function EvalsScreen() {
-  const [projectDir, setProjectDir] = useState<string | null>(null);
+  const { activeProjectDir: projectDir } = useProject();
   const [runProjectDir, setRunProjectDir] = useState<string | null>(null);
-  const [pickerError, setPickerError] = useState<string | null>(null);
   const [commitShasText, setCommitShasText] = useState("");
   const [testCommandText, setTestCommandText] = useState("");
   const [phase, setPhase] = useState<Phase>("idle");
@@ -195,16 +194,6 @@ export function EvalsScreen() {
   const tasks = parseTasks(commitShasText, testCommandText);
   const canRun =
     Boolean(projectDir) && tasks.length > 0 && tasks.every((t) => t.testCommand.length > 0) && !isBusy;
-
-  const handleChooseProject = useCallback(() => {
-    setPickerError(null);
-    open({ directory: true })
-      .then((selected) => {
-        if (typeof selected !== "string") return; // user cancelled the dialog
-        setProjectDir(selected);
-      })
-      .catch((err: unknown) => setPickerError(friendlyMessage(err)));
-  }, []);
 
   const handleRun = useCallback(() => {
     if (!projectDir || isBusy) return;
@@ -258,18 +247,12 @@ export function EvalsScreen() {
       </p>
 
       <h2>Project</h2>
-      <button type="button" onClick={handleChooseProject}>
-        Choose project…
-      </button>
-      {pickerError && (
-        <p role="alert" className="error-text">
-          {pickerError}
-        </p>
-      )}
-      {projectDir && (
+      {projectDir ? (
         <p>
           <code>{projectDir}</code>
         </p>
+      ) : (
+        <p className="muted-text">No project selected</p>
       )}
 
       <h2>Eval tasks</h2>
