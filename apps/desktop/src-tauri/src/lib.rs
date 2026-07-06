@@ -15,6 +15,7 @@
 // how this realizes the spec's shell architecture.
 pub mod commands;
 pub mod engine_bridge;
+pub mod frontier;
 pub mod providers;
 pub mod secrets;
 
@@ -123,6 +124,9 @@ pub fn run() {
             providers::list_provider_configs,
             providers::save_provider_config,
             providers::delete_provider_config,
+            frontier::frontier_login_status,
+            frontier::frontier_login,
+            frontier::frontier_logout,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application");
