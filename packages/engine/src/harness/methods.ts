@@ -35,6 +35,16 @@ const UpdateEscalationParamsSchema = z.object({
 export class HarnessService {
   #generating = new Map<string, Promise<GenerateHarnessResult>>();
 
+  // Per-project write queue: chains each mutateHarness call onto the tail of
+  // the previous one for the SAME project, so the RPC dispatcher's natural
+  // concurrency (nothing serializes two near-simultaneous
+  // engine.harness.updateAgentModel calls upstream of here) can't let a
+  // second call's loadHarness read stale disk state before the first call's
+  // writeHarness lands — the classic read-mutate-write race that silently
+  // clobbers whichever write lands first. Keyed by resolveProjectKey so
+  // distinct spellings/symlinks of the same project share one queue.
+  #writeChain = new Map<string, Promise<unknown>>();
+
   generate(engine: Engine, projectDir: string): Promise<GenerateHarnessResult> {
     const key = resolveProjectKey(projectDir);
     const inFlight = this.#generating.get(key);
@@ -45,6 +55,27 @@ export class HarnessService {
     });
     this.#generating.set(key, promise);
     return promise;
+  }
+
+  // Queues fn to run only after every previously-queued write for this
+  // project has settled (success OR failure — a `.then(fn, fn)`-style
+  // neutralization, so one failed mutation can never wedge later queued
+  // writes behind a permanently-rejected tail). Clears the map entry once
+  // this call is the last one queued, so a quiet project doesn't leak an
+  // ever-growing settled-promise chain.
+  serializeWrite<T>(projectDir: string, fn: () => Promise<T>): Promise<T> {
+    const key = resolveProjectKey(projectDir);
+    const tail = this.#writeChain.get(key) ?? Promise.resolve();
+    const settled = tail.then(fn, fn);
+    const cleared = settled.then(
+      () => undefined,
+      () => undefined,
+    );
+    this.#writeChain.set(key, cleared);
+    cleared.finally(() => {
+      if (this.#writeChain.get(key) === cleared) this.#writeChain.delete(key);
+    });
+    return settled;
   }
 }
 
@@ -176,20 +207,24 @@ export function registerHarnessMethods(engine: Engine): void {
   }
 
   registerMethod(engine.dispatcher, "engine.harness.updateAgentModel", UpdateAgentModelParamsSchema, async ({ projectDir, agentName, model }) => {
-    await mutateHarness(projectDir, (bundle) => {
-      const agent = bundle.agents.find((a) => a.name === agentName);
-      if (agent === undefined) {
-        throw new RpcMethodError(RpcErrorCodes.SERVER_ERROR, `unknown agent "${agentName}"`);
-      }
-      agent.model = model;
-    });
+    await engine.harness.serializeWrite(projectDir, () =>
+      mutateHarness(projectDir, (bundle) => {
+        const agent = bundle.agents.find((a) => a.name === agentName);
+        if (agent === undefined) {
+          throw new RpcMethodError(RpcErrorCodes.SERVER_ERROR, `unknown agent "${agentName}"`);
+        }
+        agent.model = model;
+      }),
+    );
     return { updated: true };
   });
 
   registerMethod(engine.dispatcher, "engine.harness.updateEscalation", UpdateEscalationParamsSchema, async ({ projectDir, failuresBeforeFrontier }) => {
-    await mutateHarness(projectDir, (bundle) => {
-      bundle.routing.escalation.failuresBeforeFrontier = failuresBeforeFrontier;
-    });
+    await engine.harness.serializeWrite(projectDir, () =>
+      mutateHarness(projectDir, (bundle) => {
+        bundle.routing.escalation.failuresBeforeFrontier = failuresBeforeFrontier;
+      }),
+    );
     return { updated: true };
   });
 }

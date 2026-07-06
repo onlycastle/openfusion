@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { engineClient, listProviderConfigs, type AgentModel, type HarnessAgentView, type HarnessTeam } from "../engineClient";
 import { useProject } from "../ProjectContext";
 
@@ -31,10 +31,20 @@ export function HarnessSettingPanel() {
   const [state, setState] = useState<PanelState>({ status: "loading" });
   const [options, setOptions] = useState<ModelOption[]>([]);
 
+  // The status/configs/read calls below resolve against whichever project is
+  // CURRENT when they settle, not whichever was current when they started —
+  // re-picking a project mid-flight must not let a slower, stale response
+  // (e.g. A's harnessRead landing after B's, once activeProjectDir has moved
+  // on to B) overwrite the panel with the wrong project's team. Mirrors
+  // OrchestrateScreen's projectDirRef guard.
+  const activeProjectDirRef = useRef<string | null>(null);
+  activeProjectDirRef.current = activeProjectDir;
+
   const load = useCallback((dir: string) => {
     setState({ status: "loading" });
     Promise.all([engineClient.harnessStatus(dir), listProviderConfigs()])
       .then(([status, configs]) => {
+        if (activeProjectDirRef.current !== dir) return;
         setOptions([
           { value: "frontier", label: "frontier", model: "frontier" },
           ...configs.map((c) => ({
@@ -47,9 +57,15 @@ export function HarnessSettingPanel() {
           setState({ status: "missing" });
           return;
         }
-        return engineClient.harnessRead(dir).then((team) => setState({ status: "ready", team }));
+        return engineClient.harnessRead(dir).then((team) => {
+          if (activeProjectDirRef.current !== dir) return;
+          setState({ status: "ready", team });
+        });
       })
-      .catch((err: unknown) => setState({ status: "error", message: friendlyMessage(err) }));
+      .catch((err: unknown) => {
+        if (activeProjectDirRef.current !== dir) return;
+        setState({ status: "error", message: friendlyMessage(err) });
+      });
   }, []);
 
   useEffect(() => {

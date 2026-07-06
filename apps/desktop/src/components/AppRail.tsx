@@ -8,7 +8,7 @@ export function AppRail({ onOpenSettings }: { onOpenSettings: () => void }) {
   const onAdd = (): void => {
     open({ directory: true })
       .then((selected) => {
-        if (typeof selected === "string") void addProjectByPath(selected);
+        if (typeof selected === "string") return addProjectByPath(selected);
       })
       .catch(() => {});
   };
@@ -35,7 +35,7 @@ export function AppRail({ onOpenSettings }: { onOpenSettings: () => void }) {
               type="button"
               className="project-remove"
               aria-label={`Remove ${project.name}`}
-              onClick={() => void removeProjectByPath(project.path)}
+              onClick={() => void removeProjectByPath(project.path).catch(() => {})}
             >
               ×
             </button>
