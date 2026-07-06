@@ -16,6 +16,7 @@
 pub mod commands;
 pub mod engine_bridge;
 pub mod frontier;
+pub mod projects;
 pub mod providers;
 pub mod secrets;
 
@@ -111,6 +112,16 @@ pub fn run() {
                 .join("providers.json");
             app.manage(Arc::new(ProviderConfigStore::new(Arc::new(FileMetaBackend::new(providers_path)))));
 
+            // Host-owned project registry (see `projects.rs`). MRU list of opened repos.
+            let projects_path = app
+                .path()
+                .app_config_dir()
+                .map_err(|err| std::io::Error::other(format!("no app config dir: {err}")))?
+                .join("projects.json");
+            app.manage(Arc::new(projects::ProjectRegistryStore::new(Arc::new(
+                projects::FileProjectBackend::new(projects_path),
+            ))));
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -124,6 +135,9 @@ pub fn run() {
             providers::list_provider_configs,
             providers::save_provider_config,
             providers::delete_provider_config,
+            projects::list_projects,
+            projects::add_project,
+            projects::remove_project,
             frontier::frontier_login_status,
             frontier::frontier_login,
             frontier::frontier_logout,
