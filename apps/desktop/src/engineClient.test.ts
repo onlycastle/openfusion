@@ -184,6 +184,23 @@ describe("typed method wrappers", () => {
       timeoutMs: undefined,
     });
   });
+
+  it("modelsConfigure calls engine.models.configure with the provider config", async () => {
+    invokeMock.mockResolvedValueOnce({ configured: true });
+    const client = new EngineClient();
+    const result = await client.modelsConfigure({
+      id: "deepseek",
+      kind: "deepseek",
+      apiKey: "sk-test",
+      baseURL: undefined,
+    });
+    expect(result).toEqual({ configured: true });
+    expect(invokeMock).toHaveBeenCalledWith("engine_call", {
+      method: "engine.models.configure",
+      params: { id: "deepseek", kind: "deepseek", apiKey: "sk-test", baseURL: undefined },
+      timeoutMs: undefined,
+    });
+  });
 });
 
 // A minimal but shape-accurate OrchestrateResult fixture (mirrors

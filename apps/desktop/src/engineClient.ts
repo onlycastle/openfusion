@@ -213,9 +213,19 @@ export interface CancellableRun<T> {
 // side (`IndexStats`, `ProviderRegistry.list()`, `engine.wiki.status`'s
 // inline return) has no compile-time link to these interfaces; only a
 // runtime shape mismatch would catch drift.
+
+export type ProviderKind = "moonshot" | "zai" | "deepseek" | "openai-compatible";
+
+export interface ProviderConfigInput {
+  id: string;
+  kind: ProviderKind;
+  apiKey: string;
+  baseURL?: string;
+}
+
 export interface ModelProviderSummary {
   id: string;
-  kind: "moonshot" | "zai" | "deepseek" | "openai-compatible";
+  kind: ProviderKind;
   baseURL?: string;
 }
 
@@ -474,6 +484,13 @@ export class EngineClient {
 
   modelsList(opts?: CallOptions): Promise<ModelsListResult> {
     return this.call<ModelsListResult>("engine.models.list", {}, opts);
+  }
+
+  /** `engine.models.configure` — registers (or overwrites) a provider in the
+   * engine's in-memory registry so routing can resolve to it. The engine keeps
+   * the apiKey memory-only per its own contract; this call carries it once. */
+  modelsConfigure(config: ProviderConfigInput, opts?: CallOptions): Promise<{ configured: boolean }> {
+    return this.call<{ configured: boolean }>("engine.models.configure", config, opts);
   }
 
   wikiBuild(projectDir: string, opts?: CallOptions): Promise<WikiBuildStats> {
