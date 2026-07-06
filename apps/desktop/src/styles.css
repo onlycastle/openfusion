@@ -1583,3 +1583,11 @@ input[type="checkbox"] {
 .project-list-item:hover .project-remove { opacity: 1; }
 .project-add { text-align: left; padding: 6px 8px; background: none; border: none; color: var(--muted, #999); cursor: pointer; }
 .app-rail-foot { margin-top: auto; }
+
+/* ---------------------------------------------------------------- project-rail -- */
+.project-rail { display: flex; flex-direction: column; gap: 4px; padding: 12px 10px; width: 200px; min-width: 200px; border-left: 1px solid var(--hairline, #2a2a2e); }
+.project-rail-empty { color: var(--muted, #999); padding: 16px 12px; }
+.project-rail-head { font-weight: 600; padding: 8px 6px 10px; }
+.section-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 2px; }
+.section-item { width: 100%; text-align: left; padding: 6px 8px; border-radius: 6px; background: none; border: none; color: inherit; cursor: pointer; }
+.section-item-active { background: var(--active-bg, #26262b); }
