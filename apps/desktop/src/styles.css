@@ -1568,3 +1568,18 @@ input[type="checkbox"] {
 .harness-class-chip { font-size: 11px; padding: 1px 6px; border-radius: 4px; background: var(--chip-bg, #222); color: var(--muted, #999); }
 .harness-escalation { display: block; margin-top: 8px; }
 .harness-tree-caption { margin-top: 12px; }
+
+/* ---------------------------------------------------------------- app-rail -- */
+.app-rail { display: flex; flex-direction: column; gap: 6px; padding: 12px 10px; width: 200px; min-width: 200px; }
+.app-rail-head { display: flex; align-items: center; gap: 8px; padding: 8px 6px; }
+.app-rail-head > * { pointer-events: none; }
+.app-rail-word { font-weight: 600; }
+.app-rail-label { font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em; color: var(--muted, #999); padding: 8px 6px 2px; }
+.project-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 2px; }
+.project-list-item { display: flex; align-items: center; }
+.project-item { flex: 1; text-align: left; padding: 6px 8px; border-radius: 6px; background: none; border: none; color: inherit; cursor: pointer; }
+.project-item-active { background: var(--active-bg, #26262b); }
+.project-remove { opacity: 0; background: none; border: none; color: var(--muted, #999); cursor: pointer; padding: 0 6px; }
+.project-list-item:hover .project-remove { opacity: 1; }
+.project-add { text-align: left; padding: 6px 8px; background: none; border: none; color: var(--muted, #999); cursor: pointer; }
+.app-rail-foot { margin-top: auto; }
