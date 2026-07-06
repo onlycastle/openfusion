@@ -687,3 +687,58 @@ export function listSecretIds(): Promise<string[]> {
 export function loadPersistedSecrets(): Promise<void> {
   return invoke("load_persisted_secrets");
 }
+
+// ---------------------------------------------------------------------------
+// Provider metadata commands (non-secret) — Rust host, NOT engine RPC.
+// ---------------------------------------------------------------------------
+
+/** Non-secret provider metadata (never an API key). Mirrors `providers.rs`'s
+ * `ProviderMeta`. */
+export interface ProviderMeta {
+  id: string;
+  kind: ProviderKind;
+  baseURL?: string;
+  model: string;
+}
+
+/** `invoke('list_provider_configs')`. */
+export function listProviderConfigs(): Promise<ProviderMeta[]> {
+  return invoke<ProviderMeta[]>("list_provider_configs");
+}
+
+/** `invoke('save_provider_config', { meta })`. */
+export function saveProviderConfig(meta: ProviderMeta): Promise<void> {
+  return invoke("save_provider_config", { meta });
+}
+
+/** `invoke('delete_provider_config', { id })`. */
+export function deleteProviderConfig(id: string): Promise<void> {
+  return invoke("delete_provider_config", { id });
+}
+
+// ---------------------------------------------------------------------------
+// Frontier CLI-auth commands — Rust host. No token ever crosses this surface.
+// ---------------------------------------------------------------------------
+
+export type FrontierEngineKind = "claude-code" | "codex";
+
+/** Mirrors `frontier.rs`'s `FrontierAuthStatus`. */
+export interface FrontierAuthStatus {
+  state: "connected" | "disconnected" | "not-installed";
+  detail?: string;
+}
+
+/** `invoke('frontier_login_status', { engine })`. */
+export function frontierLoginStatus(engine: FrontierEngineKind): Promise<FrontierAuthStatus> {
+  return invoke<FrontierAuthStatus>("frontier_login_status", { engine });
+}
+
+/** `invoke('frontier_login', { engine })` — launches the official CLI login. */
+export function frontierLogin(engine: FrontierEngineKind): Promise<void> {
+  return invoke("frontier_login", { engine });
+}
+
+/** `invoke('frontier_logout', { engine })`. */
+export function frontierLogout(engine: FrontierEngineKind): Promise<void> {
+  return invoke("frontier_logout", { engine });
+}

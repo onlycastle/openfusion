@@ -38,6 +38,11 @@ import {
   deleteSecret,
   listSecretIds,
   loadPersistedSecrets,
+  saveProviderConfig,
+  deleteProviderConfig,
+  frontierLoginStatus,
+  frontierLogin,
+  frontierLogout,
   type OrchestrateResult,
   type EvalsReportCard,
 } from "./engineClient";
@@ -537,5 +542,23 @@ describe("secret command wrappers (Rust commands, not engine_call)", () => {
     await loadPersistedSecrets();
 
     expect(invokeMock).toHaveBeenCalledWith("load_persisted_secrets");
+  });
+});
+
+describe("host-command wrappers", () => {
+  it("host-command wrappers call the right Tauri commands", async () => {
+    invokeMock.mockResolvedValue(undefined);
+    await saveProviderConfig({ id: "deepseek", kind: "deepseek", model: "deepseek-v4-flash" });
+    expect(invokeMock).toHaveBeenCalledWith("save_provider_config", {
+      meta: { id: "deepseek", kind: "deepseek", model: "deepseek-v4-flash" },
+    });
+    await deleteProviderConfig("deepseek");
+    expect(invokeMock).toHaveBeenCalledWith("delete_provider_config", { id: "deepseek" });
+    await frontierLoginStatus("claude-code");
+    expect(invokeMock).toHaveBeenCalledWith("frontier_login_status", { engine: "claude-code" });
+    await frontierLogin("claude-code");
+    expect(invokeMock).toHaveBeenCalledWith("frontier_login", { engine: "claude-code" });
+    await frontierLogout("claude-code");
+    expect(invokeMock).toHaveBeenCalledWith("frontier_logout", { engine: "claude-code" });
   });
 });
