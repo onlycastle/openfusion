@@ -271,6 +271,24 @@ export interface HarnessStatus {
   headSha: string | null;
 }
 
+/** Mirrors the engine's `AgentModel` (harness/schema.ts). */
+export type AgentModel = "frontier" | { kind: string; model: string; providerId?: string };
+
+/** One row of the harness team, as `engine.harness.read` returns it. */
+export interface HarnessAgentView {
+  name: string;
+  role: string;
+  taskClasses: string[];
+  model: AgentModel;
+}
+
+/** `engine.harness.read` result — the trimmed, editable team view. */
+export interface HarnessTeam {
+  agents: HarnessAgentView[];
+  defaultAgent: string;
+  escalation: number;
+}
+
 /** Mirrors `packages/engine/src/harness/generate.ts`'s
  * `GenerateHarnessResult`: the one-time build result after the frontier
  * session writes the harness bundle. */
@@ -566,6 +584,23 @@ export class EngineClient {
     return this.call<GenerateHarnessResult>("engine.harness.generate", { projectDir }, opts).finally(() => {
       unsubscribe?.();
     });
+  }
+
+  /** `engine.harness.read` — the team view for a READY harness. Throws an
+   * `EngineError` when the harness is absent/invalid; gate on `harnessStatus`
+   * first for the missing/stale/invalid distinction. */
+  harnessRead(projectDir: string, opts?: CallOptions): Promise<HarnessTeam> {
+    return this.call<HarnessTeam>("engine.harness.read", { projectDir }, opts);
+  }
+
+  /** `engine.harness.updateAgentModel` — reassign one agent's model. */
+  harnessUpdateAgentModel(projectDir: string, agentName: string, model: AgentModel, opts?: CallOptions): Promise<{ updated: boolean }> {
+    return this.call<{ updated: boolean }>("engine.harness.updateAgentModel", { projectDir, agentName, model }, opts);
+  }
+
+  /** `engine.harness.updateEscalation` — set failuresBeforeFrontier (1–3). */
+  harnessUpdateEscalation(projectDir: string, failuresBeforeFrontier: number, opts?: CallOptions): Promise<{ updated: boolean }> {
+    return this.call<{ updated: boolean }>("engine.harness.updateEscalation", { projectDir, failuresBeforeFrontier }, opts);
   }
 
   // -- cancellable long runs (M7c Task 2) ----------------------------------
