@@ -53,35 +53,68 @@ async function freshApp() {
 }
 
 describe("App shell", () => {
-  it("renders the nav and the default Project route, using the mocked engine client", async () => {
+  it("renders the nav and the default Orchestrate route, using the mocked engine client", async () => {
     const App = await freshApp();
     render(<App />);
 
     expect(screen.getByRole("navigation")).toBeTruthy();
-    expect(screen.getByRole("heading", { level: 1, name: "Project" })).toBeTruthy();
-
-    // ProjectScreen's engineClient.modelsList() call resolves asynchronously
-    // (mocked invoke); wait for the ready state so this test doesn't leave
-    // a dangling unresolved effect behind it.
-    await waitFor(() => expect(screen.getByText(/No providers configured/)).toBeTruthy());
-  });
-
-  it("switches routes on nav click: Orchestrate (M7c Task 3) and Evals (M7c Task 4) are both now real cockpit screens", async () => {
-    const App = await freshApp();
-    render(<App />);
-    await waitFor(() => expect(screen.getByText(/No providers configured/)).toBeTruthy());
-
-    fireEvent.click(screen.getByRole("button", { name: "Keys" }));
-    expect(screen.getByRole("heading", { level: 1, name: "Keys" })).toBeTruthy();
-    await waitFor(() => expect(screen.getByText(/No keys set yet/)).toBeTruthy());
-
-    fireEvent.click(screen.getByRole("button", { name: "Orchestrate" }));
+    // Orchestrate is the default route now — Project is gone (its picker
+    // lives inside the Orchestrate composer), so the empty-session hero and
+    // its Run control are what greets the user.
     expect(screen.getByRole("heading", { level: 1, name: "Orchestrate" })).toBeTruthy();
     expect(screen.getByRole("button", { name: /^run$/i })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Project" })).toBeNull();
+  });
+
+  it("switches routes on nav click: Evals is a real cockpit screen; Orchestrate is the default", async () => {
+    const App = await freshApp();
+    render(<App />);
+
+    // Default is Orchestrate.
+    expect(screen.getByRole("heading", { level: 1, name: "Orchestrate" })).toBeTruthy();
 
     fireEvent.click(screen.getByRole("button", { name: "Evals" }));
     expect(screen.getByRole("heading", { level: 1, name: "Evals" })).toBeTruthy();
     expect(screen.getByRole("button", { name: /run evals/i })).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: "Orchestrate" }));
+    expect(screen.getByRole("heading", { level: 1, name: "Orchestrate" })).toBeTruthy();
+  });
+
+  it("opens API keys (BYOK) and the model-providers readout in the Settings dialog — neither is a nav route — and closes it again", async () => {
+    const App = await freshApp();
+    render(<App />);
+
+    // Neither Keys nor Project is navigation anymore.
+    expect(screen.queryByRole("button", { name: "Keys" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Project" })).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: "Settings" }));
+    const dialog = screen.getByRole("dialog", { name: "Settings" });
+    expect(dialog).toBeTruthy();
+    await waitFor(() => expect(screen.getByText(/No keys set yet/)).toBeTruthy());
+    // The model-providers list moved out of the deleted Project screen and
+    // into Settings, alongside the keys pane.
+    await waitFor(() => expect(screen.getByText(/No providers configured/)).toBeTruthy());
+
+    fireEvent.click(screen.getByRole("button", { name: /close settings/i }));
+    expect(screen.queryByRole("dialog")).toBeNull();
+    // The route underneath never changed — Orchestrate is still on screen.
+    expect(screen.getByRole("heading", { level: 1, name: "Orchestrate" })).toBeTruthy();
+  });
+
+  it("closes the Settings dialog on Escape", async () => {
+    const App = await freshApp();
+    render(<App />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Settings" }));
+    expect(screen.getByRole("dialog", { name: "Settings" })).toBeTruthy();
+    // Let the dialog's own async panes settle before dismissing, so no
+    // state update lands after unmount.
+    await waitFor(() => expect(screen.getByText(/No keys set yet/)).toBeTruthy());
+
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(screen.queryByRole("dialog")).toBeNull();
   });
 
   it("establishes exactly one engine_events subscription for the whole app on mount", async () => {

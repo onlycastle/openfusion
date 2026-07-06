@@ -1,23 +1,115 @@
+/* ============================================================================
+   OpenFusion cockpit — "Instrument panel"
+   A calm, near-monochrome workspace for a developer cost-instrument.
+
+   Two ideas run through the whole sheet:
+   1. Human chrome is system-sans; machine truth (costs, diffs, model ids,
+      verdicts, counts) is monospace with tabular figures. Mono means
+      "a value the machine measured."
+   2. Colour is rationed to meaning. The interactive accent (indigo) is the
+      only decorative hue and appears only on focus / links / active state.
+      Green / red / amber appear ONLY as verdicts — and a bad (ETH-hazard)
+      verdict is louder than a good one, because the prominence IS the
+      honesty gate.
+
+   The shell follows the session-first grammar of modern agent apps
+   (sidebar → hero prompt → composer), but the boldness budget is spent on
+   exactly ONE object: the composer card — the only raised, large-radius
+   surface, whose Run circle is the only accent-filled element anywhere.
+
+   System fonts only (strict local-only CSP — no remote fonts/CDNs).
+   ============================================================================ */
+
 :root {
-  --bg: #ffffff;
-  --fg: #1a1a1a;
-  --muted: #6b6b6b;
-  --border: #d8d8d8;
-  --nav-bg: #f5f5f5;
-  --accent: #3060c0;
-  --error: #b3261e;
   color-scheme: light dark;
+
+  /* surfaces & ink (light) */
+  --paper: #fcfcfd;   /* app background — cool near-white, not cream */
+  --panel: #ffffff;   /* cards, inputs, raised readouts */
+  --sunk: #f5f5f7;    /* recessed fills: diff view, table stripes */
+  --ink: #18181b;     /* primary text, active fills */
+  --ink-2: #71717a;   /* secondary / muted */
+  --ink-3: #a1a1aa;   /* faintest labels */
+  --line: #e9e9ee;    /* hairlines */
+
+  /* rationed interactive accent — never used to signal "good/bad" */
+  --accent: #4338ca;
+  --accent-soft: #eeecfb;
+
+  /* sidebar selection fills — translucent grey, not a solid pill, so they
+     read as tinted glass over the macOS vibrancy AND as a soft grey over the
+     opaque browser fallback. One set of values serves both shells. */
+  --nav-hover: rgba(60, 60, 70, 0.06);
+  --nav-active: rgba(60, 60, 70, 0.11);
+
+  /* semantic verdict colours (the ONLY other hues) */
+  --pass-fg: #157347;
+  --pass-bg: #f0f7f2;
+  --pass-line: #bcded0;
+  --fail-fg: #b42318;
+  --fail-bg: #fdf3f1;
+  --fail-line: #eab9b1;
+  --fail-bar: #d64a3b;
+  --caveat-fg: #b54708;
+  --caveat-bg: #fdf6ee;
+  --caveat-line: #f0d5ae;
+
+  /* type */
+  --sans: -apple-system, system-ui, "SF Pro Text", "Segoe UI", sans-serif;
+  --mono: ui-monospace, "SF Mono", "SFMono-Regular", Menlo, "Cascadia Mono", monospace;
+
+  --radius: 6px;
+  --radius-sm: 4px;
+  --radius-lg: 16px; /* floating objects only: composer, dialog */
+
+  /* elevation — reserved for the two floating surfaces */
+  --shadow-float: 0 1px 2px rgba(16, 16, 20, 0.05), 0 10px 30px rgba(16, 16, 20, 0.07);
+  --shadow-float-lg: 0 24px 60px rgba(16, 16, 20, 0.22);
+  --scrim: rgba(24, 24, 27, 0.35);
+
+  /* Two veils laid over the macOS vibrancy (mac shell only). The sidebar veil
+     is lighter — the source list reads as frosted glass, wallpaper colour
+     bleeding through — while the content veil is heavier so dense instrument
+     readouts stay crisp. The gap between them is the Finder-like depth: a
+     translucent rail beside a near-solid working surface. Both keep a light
+     base so text never depends on the wallpaper for contrast. */
+  --veil: rgba(252, 252, 253, 0.72);
+  --veil-rail: rgba(255, 255, 255, 0.5);
 }
 
 @media (prefers-color-scheme: dark) {
   :root {
-    --bg: #1a1a1a;
-    --fg: #eaeaea;
-    --muted: #9a9a9a;
-    --border: #3a3a3a;
-    --nav-bg: #232323;
-    --accent: #7fa8ff;
-    --error: #ff8983;
+    --paper: #0e0e11;
+    --panel: #161619;
+    --sunk: #1c1c20;
+    --ink: #ededf0;
+    --ink-2: #9a9aa3;
+    --ink-3: #6b6b73;
+    --line: #262629;
+
+    --accent: #8f8bf7;
+    --accent-soft: #1e1c34;
+
+    --nav-hover: rgba(255, 255, 255, 0.05);
+    --nav-active: rgba(255, 255, 255, 0.09);
+
+    --pass-fg: #5fd08a;
+    --pass-bg: #11241a;
+    --pass-line: #24513a;
+    --fail-fg: #ff8b7e;
+    --fail-bg: #281411;
+    --fail-line: #6f2a23;
+    --fail-bar: #c0463a;
+    --caveat-fg: #f0b265;
+    --caveat-bg: #23190d;
+    --caveat-line: #533e1c;
+
+    --shadow-float: 0 1px 2px rgba(0, 0, 0, 0.5), 0 12px 34px rgba(0, 0, 0, 0.45);
+    --shadow-float-lg: 0 24px 70px rgba(0, 0, 0, 0.6);
+    --scrim: rgba(0, 0, 0, 0.55);
+
+    --veil: rgba(16, 16, 20, 0.55);
+    --veil-rail: rgba(28, 28, 34, 0.4);
   }
 }
 
@@ -33,31 +125,101 @@ body,
 }
 
 body {
-  background: var(--bg);
-  color: var(--fg);
-  font-family:
-    system-ui,
-    -apple-system,
-    "Segoe UI",
-    sans-serif;
+  background: var(--paper);
+  color: var(--ink);
+  font-family: var(--sans);
+  font-size: 14px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
 }
+
+/* keyboard focus — visible everywhere, accent-keyed */
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: var(--radius-sm);
+}
+:focus:not(:focus-visible) {
+  outline: none;
+}
+
+/* visually hidden, still read by assistive tech (composer's task label) */
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
+}
+
+/* ------------------------------------------------------------------ shell -- */
 
 .shell {
   display: flex;
-  height: calc(100vh - 2rem);
+  height: calc(100vh - 26px); /* leave the telemetry strip below */
+}
+
+/* ============================================================ macOS shell ==
+   Set only inside the real Tauri webview on macOS (main.tsx stamps
+   data-shell="mac"). The window is transparent with a `sidebar` vibrancy
+   material behind it (tauri.conf.json windowEffects); here we let it show
+   through. The sidebar becomes pure frosted glass (a native source list);
+   the content pane keeps a paper veil so its dense readouts stay legible.
+   The browser fallback (`pnpm dev`) and jsdom never get these rules, so they
+   render fully opaque — there is no NSVisualEffectView behind them.
+   ========================================================================== */
+
+:root[data-shell="mac"] body {
+  background: transparent;
+}
+:root[data-shell="mac"] .sidenav {
+  background: var(--veil-rail);
+  /* the traffic lights float over the top-left of the webview (hidden title
+     bar); clear them so the identity row sits below, like a native app */
+  padding-top: 40px;
+}
+:root[data-shell="mac"] .content {
+  background: var(--veil);
+}
+:root[data-shell="mac"] .status-bar {
+  background: transparent;
 }
 
 .sidenav {
-  width: 200px;
+  width: 216px;
   flex-shrink: 0;
-  background: var(--nav-bg);
-  border-right: 1px solid var(--border);
-  padding: 1rem 0.5rem;
+  background: var(--panel);
+  border-right: 1px solid var(--line);
+  padding: 18px 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
 }
 
-.sidenav-brand {
+/* the identity row: mark + wordmark. The wordmark is SANS, not mono — the
+   app's own name is human chrome, and the system's rule is that human chrome
+   is sans while only machine truth is mono. The whole row is the window's
+   drag handle on macOS (see Nav.tsx), so its children take no pointer events. */
+.sidenav-head {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 4px 10px 18px;
+  color: var(--ink);
+}
+.sidenav-head > * {
+  pointer-events: none;
+}
+.sidenav-wordmark {
+  font-family: var(--sans);
+  font-size: 14px;
   font-weight: 600;
-  padding: 0 0.5rem 1rem;
+  letter-spacing: -0.01em;
 }
 
 .sidenav ul {
@@ -66,280 +228,1125 @@ body {
   padding: 0;
   display: flex;
   flex-direction: column;
-  gap: 0.25rem;
+  gap: 2px;
 }
 
 .nav-link {
-  display: block;
+  display: flex;
+  align-items: center;
+  gap: 9px;
   width: 100%;
   text-align: left;
-  padding: 0.5rem 0.75rem;
+  padding: 7px 10px;
   border: none;
-  border-radius: 6px;
+  border-radius: 8px;
   background: transparent;
-  color: var(--fg);
-  font-size: 0.95rem;
+  color: var(--ink-2);
+  font: inherit;
+  font-size: 13.5px;
   cursor: pointer;
+  transition: background 120ms ease, color 120ms ease;
 }
-
+.nav-link svg {
+  flex-shrink: 0;
+  opacity: 0.85;
+}
 .nav-link:hover {
-  background: var(--border);
+  background: var(--nav-hover);
+  color: var(--ink);
+}
+.nav-link-active,
+.nav-link[aria-current="page"] {
+  background: var(--nav-active);
+  color: var(--ink);
+  font-weight: 600;
 }
 
-.nav-link-active {
-  background: var(--accent);
-  color: #fff;
+/* a labeled instrument group — readouts you consult, set apart from the
+   workspace above by air and an eyebrow, not a hard rule (the border-top
+   device belongs to the foot alone) */
+.sidenav-section-label {
+  margin-top: 18px;
+  padding: 0 10px 2px;
+  font-family: var(--mono);
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--ink-3);
+}
+
+/* settings lives at the bottom, below the day-to-day navigation */
+.sidenav-foot {
+  margin-top: auto;
+  padding-top: 10px;
+  border-top: 1px solid var(--line);
 }
 
 .content {
   flex: 1;
   overflow-y: auto;
-  padding: 1.5rem 2rem;
+  padding: 28px 36px 40px;
 }
+/* a comfortable reading measure for a dense instrument */
+.screen {
+  max-width: 860px;
+}
+
+/* --------------------------------------------------------------- typography */
 
 .screen h1 {
-  margin-top: 0;
+  margin: 0 0 4px;
+  font-size: 20px;
+  font-weight: 650;
+  letter-spacing: -0.01em;
 }
-
-.error-text {
-  color: var(--error);
+.screen h2 {
+  font-size: 14px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  margin: 26px 0 8px;
+}
+.screen h3 {
+  font-size: 12px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--ink-2);
+  margin: 20px 0 8px;
+}
+.screen p {
+  margin: 8px 0;
 }
 
 .muted-text {
-  color: var(--muted);
-  font-size: 0.85rem;
+  color: var(--ink-2);
+  font-size: 12.5px;
+}
+.error-text {
+  color: var(--fail-fg);
 }
 
-.error-boundary {
-  padding: 2rem;
-  color: var(--error);
-}
+/* ------------------------------------------------------------ form controls */
 
-.status-bar {
-  height: 2rem;
-  display: flex;
-  align-items: center;
-  gap: 1rem;
-  padding: 0 1rem;
-  font-size: 0.8rem;
-  color: var(--muted);
-  border-top: 1px solid var(--border);
-}
-
-form label {
+form label,
+label {
   display: block;
-  margin-bottom: 0.5rem;
+  margin-bottom: 12px;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--ink-2);
 }
 
-form input {
-  display: block;
-  margin-top: 0.25rem;
-}
-
-.actions {
-  display: flex;
-  gap: 0.5rem;
-  margin: 0.75rem 0;
-}
-
+input[type="text"],
+input[type="password"],
+input:not([type]),
+select,
 textarea {
   display: block;
   width: 100%;
-  max-width: 640px;
-  margin-top: 0.25rem;
-  font-family: inherit;
+  max-width: 560px;
+  margin-top: 5px;
+  padding: 8px 10px;
+  background: var(--panel);
+  color: var(--ink);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  font: inherit;
+  font-size: 13px;
+  transition: border-color 120ms ease, box-shadow 120ms ease;
+}
+input:hover,
+select:hover,
+textarea:hover {
+  border-color: var(--ink-3);
+}
+input:focus,
+select:focus,
+textarea:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+textarea {
+  min-height: 92px;
+  resize: vertical;
+  line-height: 1.5;
+}
+/* a directory / commit / path field reads as machine input */
+input[type="text"],
+input[type="password"] {
+  font-family: var(--mono);
+  font-size: 12.5px;
 }
 
-.routed-callout {
-  font-weight: 600;
-}
-
-.progress-list {
-  font-size: 0.9rem;
-}
-
-.progress-list li {
-  margin-bottom: 0.15rem;
-}
-
-.outcome-badge {
+/* checkbox (the "save to Keychain" persist toggle) sits inline */
+input[type="checkbox"] {
+  width: auto;
+  max-width: none;
+  margin: 0 8px 0 0;
   display: inline-block;
-  padding: 0.15rem 0.6rem;
-  border-radius: 999px;
+  vertical-align: middle;
+  accent-color: var(--accent);
+}
+
+/* ---------------------------------------------------------------- buttons -- */
+
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 16px 0;
+}
+
+/* content + dialog buttons (nav buttons are excluded — they live in
+   .sidenav). One quiet, consistent button; the primary action carries a
+   little weight. */
+.content button,
+.dialog button {
+  appearance: none;
+  padding: 7px 14px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: var(--panel);
+  color: var(--ink);
+  font: inherit;
+  font-size: 13px;
+  font-weight: 550;
+  cursor: pointer;
+  transition: background 120ms ease, border-color 120ms ease, color 120ms ease, opacity 120ms ease;
+}
+.content button:hover:not(:disabled),
+.dialog button:hover:not(:disabled) {
+  background: var(--sunk);
+  border-color: var(--ink-3);
+}
+.content button[type="submit"],
+.dialog button[type="submit"] {
+  background: var(--ink);
+  border-color: var(--ink);
+  color: var(--paper);
+}
+.content button[type="submit"]:hover:not(:disabled),
+.dialog button[type="submit"]:hover:not(:disabled) {
+  opacity: 0.88;
+  background: var(--ink);
+}
+.content button:disabled,
+.dialog button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+/* ----------------------------------------------------- machine-truth readouts */
+
+/* the routed cheap model — the thesis in one line */
+.routed-callout {
+  font-family: var(--mono);
+  font-size: 13px;
   font-weight: 600;
-  font-size: 0.85rem;
+  color: var(--ink);
+  background: var(--sunk);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  padding: 8px 12px;
+  display: inline-block;
+  margin: 6px 0;
 }
 
-.outcome-success {
-  background: #1e7a34;
-  color: #fff;
-}
-
-.outcome-warning {
-  background: #b8860b;
-  color: #fff;
-}
-
-.outcome-failure {
-  background: var(--error);
-  color: #fff;
-}
-
-.outcome-cancelled {
-  background: var(--muted);
-  color: #fff;
-}
-
-.verdict {
-  margin-top: 0.25rem;
-}
-
-.verdict-decision {
-  font-weight: 600;
-}
-
-.verdict-approve {
-  color: #1e7a34;
-}
-
-.verdict-request-changes {
-  color: var(--error);
-}
-
-.verdict-severity {
-  color: var(--muted);
-  font-size: 0.85rem;
-}
-
-.attempts-list li {
-  margin-bottom: 0.75rem;
-}
-
-.diff-view {
-  background: var(--nav-bg);
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  padding: 0.75rem;
-  overflow-x: auto;
-  font-size: 0.85rem;
-  line-height: 1.4;
-  max-height: 400px;
+/* engine stage stream — a quiet telemetry log */
+.progress-list {
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--ink-2);
+  list-style: none;
+  margin: 8px 0;
+  padding: 10px 12px;
+  background: var(--sunk);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  max-height: 220px;
   overflow-y: auto;
 }
-
-.diff-line-add {
-  color: #1e7a34;
+.progress-list li {
+  margin: 0 0 3px;
+  padding-left: 14px;
+  position: relative;
 }
-
-.diff-line-remove {
-  color: var(--error);
-}
-
-.diff-line-hunk {
+.progress-list li::before {
+  content: "›";
+  position: absolute;
+  left: 2px;
   color: var(--accent);
 }
 
-.diff-line-meta {
-  color: var(--muted);
+/* status pills → compact mono instrument labels */
+.outcome-badge {
+  display: inline-block;
+  font-family: var(--mono);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  padding: 3px 8px;
+  border-radius: var(--radius-sm);
+  border: 1px solid transparent;
+}
+.outcome-success {
+  background: var(--pass-bg);
+  color: var(--pass-fg);
+  border-color: var(--pass-line);
+}
+.outcome-warning {
+  background: var(--caveat-bg);
+  color: var(--caveat-fg);
+  border-color: var(--caveat-line);
+}
+.outcome-failure {
+  background: var(--fail-bg);
+  color: var(--fail-fg);
+  border-color: var(--fail-line);
+}
+.outcome-cancelled {
+  background: var(--sunk);
+  color: var(--ink-2);
+  border-color: var(--line);
 }
 
-.cost-split {
+/* per-attempt review verdicts */
+.attempts-list {
+  list-style: none;
+  margin: 8px 0;
+  padding: 0;
+}
+/* direct children only — a verdict's nested reason list must NOT inherit
+   the attempt card's box */
+.attempts-list > li {
+  margin-bottom: 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: var(--panel);
+}
+.verdict {
+  margin-top: 4px;
+  font-family: var(--mono);
+  font-size: 12.5px;
+}
+.verdict ul {
+  margin: 4px 0 0;
+  padding-left: 18px;
+  color: var(--ink-2);
+}
+.verdict ul li {
+  margin: 2px 0;
+}
+.verdict-decision {
+  font-weight: 700;
+}
+.verdict-approve {
+  color: var(--pass-fg);
+}
+.verdict-request-changes {
+  color: var(--fail-fg);
+}
+.verdict-severity {
+  color: var(--ink-2);
+  font-size: 11.5px;
+}
+
+/* diff — machine output, monospace, semantic add/remove */
+.diff-view {
+  background: var(--sunk);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 12px 14px;
+  overflow: auto;
+  font-family: var(--mono);
+  font-size: 12px;
+  line-height: 1.55;
+  max-height: 420px;
+}
+.diff-line-add {
+  color: var(--pass-fg);
+}
+.diff-line-remove {
+  color: var(--fail-fg);
+}
+.diff-line-hunk {
+  color: var(--accent);
+}
+.diff-line-meta {
+  color: var(--ink-3);
+}
+
+/* cost ledger — sans labels, mono tabular figures */
+.cost-split,
+.clean-subset {
   display: grid;
   grid-template-columns: max-content max-content;
-  column-gap: 1rem;
-  row-gap: 0.25rem;
+  column-gap: 20px;
+  row-gap: 5px;
+  margin: 8px 0;
+  padding: 12px 14px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--panel);
 }
-
-.cost-split dt {
-  font-weight: 600;
+.cost-split dt,
+.clean-subset dt {
+  font-size: 12.5px;
+  color: var(--ink-2);
+  font-weight: 500;
 }
-
-.cost-split dd {
+.cost-split dd,
+.clean-subset dd {
   margin: 0;
+  font-family: var(--mono);
+  font-size: 12.5px;
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+  color: var(--ink);
 }
+
+/* ================================================================ SIGNATURE ==
+   The eval report card — the honest readout, rendered as an instrument gauge.
+   A "pass" is the calmest reading; a quality-degraded (ETH-hazard) "fail" is
+   the loudest. That prominence hierarchy is the honesty gate made visual.
+   ============================================================================ */
 
 .verdict-banner {
-  padding: 0.75rem 1rem;
-  border-radius: 8px;
+  position: relative;
+  margin: 16px 0;
+  padding: 14px 16px 14px 18px;
+  border: 1px solid var(--line);
+  border-left-width: 3px;
+  border-radius: var(--radius);
   font-weight: 600;
-  margin: 0.75rem 0;
 }
-
+/* status dot, drawn from the same hue as the verdict */
+.verdict-banner::before {
+  content: "";
+  position: absolute;
+  top: 19px;
+  left: 8px; /* sits on the coloured left border */
+  width: 7px;
+  height: 7px;
+  border-radius: 999px;
+  background: currentColor;
+  opacity: 0.55;
+}
 .verdict-banner-pass {
-  background: #1e7a34;
-  color: #fff;
+  background: var(--pass-bg);
+  border-color: var(--pass-line);
+  border-left-color: var(--pass-fg);
+  color: var(--pass-fg);
 }
-
-.verdict-banner-fail {
-  background: var(--error);
-  color: #fff;
-  border: 2px solid #7a1410;
-}
-
 .verdict-banner-inconclusive {
-  background: #b8860b;
-  color: #fff;
+  background: var(--caveat-bg);
+  border-color: var(--caveat-line);
+  border-left-color: var(--caveat-fg);
+  color: var(--caveat-fg);
+}
+/* the fault light: heaviest weight, a solid red rail, unmistakable */
+.verdict-banner-fail {
+  background: var(--fail-bg);
+  border-color: var(--fail-line);
+  border-left: 4px solid var(--fail-bar);
+  color: var(--fail-fg);
+  font-weight: 700;
+  box-shadow: 0 1px 0 var(--fail-line), 0 0 0 1px var(--fail-line) inset;
+}
+/* [role="alert"] is the ETH-hazard banner — belt-and-suspenders emphasis */
+[role="alert"] {
+  font-weight: 700;
 }
 
+/* the savings figure — the gauge reading */
 .savings-figure {
-  font-weight: 600;
-  font-size: 1.05rem;
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+  font-size: 22px;
+  font-weight: 650;
+  letter-spacing: -0.01em;
+  color: var(--ink);
 }
-
-/* A savings figure sitting on a "fail" (ETH-hazard) verdict — the number
-   itself is real, but the verdict above already supersedes it as a claim, so
-   it's visually de-emphasized (muted color, struck through) rather than
-   reading like a normal win. Shared by the main Savings line (SavingsDisplay)
-   and the Clean savings line in the clean-subset table — both qualify the
-   same way on a fail verdict. */
+/* superseded by a fail verdict: real number, but struck — never a "win" */
 .savings-figure-disregarded {
-  color: var(--muted);
+  color: var(--ink-2);
   text-decoration: line-through;
   font-weight: 400;
 }
-
 .disregarded-note {
-  color: var(--muted);
+  font-family: var(--sans);
+  font-size: 12px;
+  color: var(--ink-2);
   text-decoration: none;
   font-weight: 400;
   font-style: italic;
 }
 
+/* pricing-confidence, as an instrument "tolerance" caption */
 .caveat-badge {
   display: inline-block;
-  padding: 0.15rem 0.6rem;
-  border-radius: 999px;
-  background: var(--border);
-  color: var(--fg);
-  font-size: 0.8rem;
+  font-family: var(--mono);
+  font-size: 11px;
   font-weight: 600;
+  letter-spacing: 0.03em;
+  padding: 3px 8px;
+  border-radius: var(--radius-sm);
+  background: var(--caveat-bg);
+  color: var(--caveat-fg);
+  border: 1px solid var(--caveat-line);
 }
 
+/* per-task results table */
 .eval-per-task-table {
   border-collapse: collapse;
   width: 100%;
-  font-size: 0.85rem;
-  margin: 0.5rem 0;
+  margin: 10px 0;
+  font-family: var(--mono);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
 }
-
-.eval-per-task-table th,
-.eval-per-task-table td {
-  border: 1px solid var(--border);
-  padding: 0.35rem 0.5rem;
+.eval-per-task-table th {
   text-align: left;
+  font-family: var(--sans);
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--ink-2);
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--line);
+}
+.eval-per-task-table td {
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--line);
+  color: var(--ink);
+}
+.eval-per-task-table tr:last-child td {
+  border-bottom: none;
+}
+.eval-per-task-table tbody tr:hover td {
+  background: var(--sunk);
 }
 
-.clean-subset {
-  display: grid;
-  grid-template-columns: max-content max-content;
-  column-gap: 1rem;
-  row-gap: 0.25rem;
+/* --------------------------------------------------------- telemetry strip -- */
+
+.status-bar {
+  height: 26px;
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 0 16px;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--ink-2);
+  background: var(--panel);
+  border-top: 1px solid var(--line);
+}
+.status-bar-detail {
+  color: var(--ink-3);
 }
 
-.clean-subset dt {
+/* ------------------------------------------------------------ error boundary */
+
+.error-boundary {
+  padding: 40px;
+  color: var(--fail-fg);
+}
+
+/* ============================================================================
+   Orchestrate — session-first layout.
+   An empty session opens on a centered prompt with the composer card mid-
+   screen; once a run starts, the transcript takes over and the same card
+   docks at the bottom. A slim top bar carries the screen eyebrow and the
+   project's absolute path (machine truth — the composer chip shows only
+   the directory name).
+
+   Scoped to the chat screen via :has() so no other screen's layout changes —
+   the chat screen owns its own scroll (transcript scrolls; composer stays put).
+   ============================================================================ */
+
+.content:has(.chat-screen) {
+  display: flex;
+  flex-direction: column;
+  padding: 0;
+  overflow: hidden;
+}
+
+.chat-screen {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+  max-width: none;
+  width: 100%;
+}
+
+/* slim top bar: eyebrow + absolute project path */
+.chat-head {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 13px 20px;
+}
+.chat-screen-active .chat-head {
+  border-bottom: 1px solid var(--line);
+}
+.chat-screen .chat-head h1 {
+  margin: 0;
+  font-family: var(--mono);
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--ink-3);
+}
+/* the project cluster on the head's right: absolute path + wiki reading */
+.chat-head-project {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+}
+.chat-project-path {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: var(--ink-2);
+  background: var(--sunk);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  padding: 3px 8px;
+  max-width: 360px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.chat-head-alert {
+  margin: 0;
+  padding: 0 20px 8px;
+}
+
+/* the wiki index reading — machine truth in the measurement voice, with its
+   one action as a quiet accent verb (accent = interactive, never a verdict) */
+.wiki-readout {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  flex-shrink: 0;
+}
+.wiki-reading {
+  font-family: var(--mono);
+  font-size: 11px;
+  letter-spacing: 0.03em;
+  color: var(--ink-3);
+  white-space: nowrap;
+}
+.content button.wiki-action {
+  padding: 2px 8px;
+  border: none;
+  background: transparent;
+  color: var(--accent);
+  font-family: var(--mono);
+  font-size: 11px;
   font-weight: 600;
 }
+.content button.wiki-action:hover:not(:disabled) {
+  background: var(--accent-soft);
+  border-color: transparent;
+}
 
-.clean-subset dd {
+/* ----------------------------------------------------------------- hero -- */
+
+.chat-hero {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 26px;
+  padding: 0 28px 9vh;
+}
+.hero-title {
   margin: 0;
+  font-size: 27px;
+  font-weight: 650;
+  letter-spacing: -0.02em;
+  text-align: center;
+  text-wrap: balance;
+}
+.chat-hero .composer-card {
+  width: min(640px, 100%);
+}
+/* the loop, stated truthfully, in the machine's voice */
+.hero-caption {
+  margin: 0;
+  font-family: var(--mono);
+  font-size: 11px;
+  letter-spacing: 0.05em;
+  color: var(--ink-3);
+}
+
+/* ------------------------------------------------------------- composer -- */
+/* THE signature object: the only raised, large-radius surface in the app. */
+
+.composer-card {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-float);
+  padding: 4px;
+  transition: border-color 120ms ease, box-shadow 120ms ease;
+}
+.composer-card:focus-within {
+  border-color: var(--accent);
+  box-shadow: var(--shadow-float), 0 0 0 3px var(--accent-soft);
+}
+
+.composer-card textarea.composer-input {
+  border: none;
+  background: transparent;
+  box-shadow: none;
+  width: 100%;
+  max-width: none;
+  margin: 0;
+  padding: 11px 14px 4px;
+  min-height: 56px;
+  max-height: 240px;
+  resize: none;
+  font-size: 14px;
+  line-height: 1.5;
+}
+.composer-card textarea.composer-input:hover,
+.composer-card textarea.composer-input:focus {
+  border: none;
+  box-shadow: none;
+}
+
+.composer-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 2px 6px 4px;
+}
+.composer-bar-right {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+/* the project chip — where a session gets its workspace */
+.content button.composer-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 260px;
+  padding: 5px 12px;
+  border: none;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--ink-2);
+  font-size: 12.5px;
+  font-weight: 550;
+}
+.content button.composer-chip:hover:not(:disabled) {
+  background: var(--sunk);
+  border-color: transparent;
+  color: var(--ink);
+}
+.content button.composer-chip span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.content button.composer-chip svg {
+  flex-shrink: 0;
+}
+
+/* routing is automatic — say so, in the measurement voice */
+.composer-hint {
+  font-family: var(--mono);
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  color: var(--ink-3);
+}
+
+/* the run circle — the ONLY accent-filled element in the app */
+.content button.run-button {
+  width: 34px;
+  height: 34px;
+  padding: 0;
+  border: none;
+  border-radius: 999px;
+  background: var(--accent);
+  color: var(--paper);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+.content button.run-button:hover:not(:disabled) {
+  background: var(--accent);
+  border-color: transparent;
+  opacity: 0.88;
+}
+.content button.run-button:disabled {
+  opacity: 0.35;
+}
+/* while a run is in flight the circle becomes the stop control */
+.content button.run-button-stop {
+  background: var(--ink);
+}
+.content button.run-button-stop:hover:not(:disabled) {
+  background: var(--ink);
+}
+
+/* docked composer under a live transcript */
+.chat-dock {
+  flex-shrink: 0;
+  padding: 10px 28px 18px;
+}
+.chat-dock .composer-card {
+  max-width: 760px;
+  margin-inline: auto;
+}
+
+/* ------------------------------------------------------------ transcript -- */
+
+.chat-transcript {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 16px 28px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+/* keep the reading column centered, like the composer beneath it */
+.chat-transcript > * {
+  width: 100%;
+  max-width: 760px;
+  margin-inline: auto;
+}
+
+/* a turn: a role gutter + the body */
+.turn {
+  display: grid;
+  grid-template-columns: 68px 1fr;
+  gap: 14px;
+  padding: 11px 0;
+  align-items: start;
+}
+.turn-role {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--ink-3);
+  text-align: right;
+  padding-top: 3px;
+}
+.turn-role-step {
+  color: var(--accent);
+}
+.turn-role-error {
+  color: var(--fail-fg);
+}
+.turn-role-working {
+  color: var(--ink-3);
+}
+.turn-body {
+  min-width: 0;
+  font-size: 13.5px;
+  line-height: 1.55;
+}
+
+/* your task — a quiet panel, the one thing you authored */
+.turn-you .turn-body {
+  background: var(--sunk);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 10px 13px;
+  color: var(--ink);
+}
+
+/* an agent step — reads like a tool-call line */
+.turn-step .turn-body {
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--ink-2);
+  padding-top: 2px;
+}
+.turn-step .routed-callout {
+  margin: 0;
+}
+
+/* the result turn holds the review/diff/cost sub-sections */
+.turn-result .turn-body > h3:first-child {
+  margin-top: 4px;
+}
+.turn-result h3 {
+  font-size: 12px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--ink-2);
+  margin: 20px 0 8px;
+}
+.result-headline {
+  margin: 0 0 4px;
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.result-apply {
+  margin-top: 14px;
+  padding-top: 14px;
+  border-top: 1px solid var(--line);
+}
+
+/* ============================================================================
+   Settings dialog — an interruption you dismiss, not a place you navigate to.
+   ============================================================================ */
+
+.dialog-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  display: grid;
+  place-items: center;
+  padding: 28px;
+  background: var(--scrim);
+}
+
+.dialog {
+  width: min(560px, 100%);
+  max-height: min(680px, calc(100vh - 56px));
+  overflow-y: auto;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-float-lg);
+}
+.dialog:focus {
+  outline: none;
+}
+
+.dialog-head {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 14px 20px;
+  background: var(--panel);
+  border-bottom: 1px solid var(--line);
+}
+.dialog-head h1 {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 650;
+}
+.dialog button.dialog-close {
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--ink-2);
+}
+.dialog button.dialog-close:hover:not(:disabled) {
+  background: var(--sunk);
+  border-color: transparent;
+  color: var(--ink);
+}
+
+.dialog-body {
+  padding: 18px 20px 22px;
+}
+
+/* ------------------------------------------------------------ settings pane */
+
+.settings-section-title {
+  margin: 0 0 4px;
+  font-size: 13px;
+  font-weight: 650;
+}
+.settings-subsection-title {
+  margin: 0 0 10px;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--ink-2);
+}
+.settings-lede {
+  margin: 0 0 16px;
+  color: var(--ink-2);
+  font-size: 12.5px;
+}
+.settings-empty {
+  margin: 0 0 18px;
+  padding: 16px;
+  border: 1px dashed var(--line);
+  border-radius: var(--radius);
+  color: var(--ink-2);
+  font-size: 12.5px;
+  text-align: center;
+}
+
+/* configured keys — id is machine truth; state is a quiet tag, not a verdict */
+.key-list {
+  list-style: none;
+  margin: 0 0 18px;
+  padding: 0;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  overflow: hidden;
+}
+.key-list li {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 12px;
+  background: var(--panel);
+}
+.key-list li + li {
+  border-top: 1px solid var(--line);
+}
+.key-id {
+  font-family: var(--mono);
+  font-size: 12.5px;
+  color: var(--ink);
+}
+.key-status {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--ink-2);
+  background: var(--sunk);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 2px 8px;
+}
+.dialog button.key-delete {
+  margin-left: auto;
+  padding: 4px 10px;
+  font-size: 12px;
+  border-color: transparent;
+  background: transparent;
+  color: var(--ink-2);
+}
+.dialog button.key-delete:hover:not(:disabled) {
+  background: var(--fail-bg);
+  border-color: var(--fail-line);
+  color: var(--fail-fg);
+}
+
+.key-form {
+  padding-top: 16px;
+  border-top: 1px solid var(--line);
+}
+.key-persist {
+  font-weight: 500;
+}
+
+/* a second settings pane below the first (the model-providers readout) */
+.settings-pane-divided {
+  margin-top: 22px;
+  padding-top: 18px;
+  border-top: 1px solid var(--line);
+}
+
+/* ---------------------------------------------------------------- responsive */
+
+@media (max-width: 680px) {
+  .shell {
+    flex-direction: column;
+    height: auto;
+    min-height: calc(100vh - 26px);
+  }
+  .sidenav {
+    width: 100%;
+    flex-direction: row;
+    flex-wrap: wrap;
+    align-items: center;
+    border-right: none;
+    border-bottom: 1px solid var(--line);
+    padding: 10px 12px;
+    gap: 2px;
+  }
+  .sidenav-head {
+    width: 100%;
+    padding: 2px 4px 8px;
+  }
+  .sidenav ul {
+    flex-direction: row;
+    flex-wrap: wrap;
+  }
+  /* in the single-row layout the groups flow inline; the eyebrow would
+     wrap awkwardly, so the grouping goes quiet here */
+  .sidenav-section-label {
+    display: none;
+  }
+  .nav-link {
+    width: auto;
+    padding: 6px 10px;
+  }
+  .sidenav-foot {
+    margin-top: 0;
+    margin-left: auto;
+    padding-top: 0;
+    border-top: none;
+  }
+  .content {
+    padding: 20px 18px 32px;
+  }
+  .content:has(.chat-screen) {
+    overflow: visible;
+  }
+  .chat-head,
+  .chat-transcript {
+    padding-left: 16px;
+    padding-right: 16px;
+  }
+  .chat-hero {
+    padding: 24px 16px 48px;
+  }
+  .chat-dock {
+    padding: 8px 16px 14px;
+  }
+  .turn {
+    grid-template-columns: 1fr;
+    gap: 4px;
+  }
+  .turn-role {
+    text-align: left;
+  }
+  .dialog-backdrop {
+    padding: 12px;
+  }
+}
+
+/* ---------------------------------------------------------- reduced motion -- */
+
+@media (prefers-reduced-motion: reduce) {
+  * {
+    transition: none !important;
+    animation: none !important;
+  }
 }

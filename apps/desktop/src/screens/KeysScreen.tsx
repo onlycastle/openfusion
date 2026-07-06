@@ -24,10 +24,10 @@ function friendlyMessage(err: unknown): string {
   return "Something went wrong. Please try again.";
 }
 
-/** The Keys (BYOK) screen: list configured provider secret ids (ids only,
- * NEVER a value — this component never calls `getSecret` at all, so there
- * is no value to accidentally render), add/edit a key via a write-only
- * value field, and delete a key.
+/** The API-keys (BYOK) pane, hosted inside the Settings dialog: list
+ * configured provider secret ids (ids only, NEVER a value — this component
+ * never calls `getSecret` at all, so there is no value to accidentally
+ * render), add/edit a key via a write-only value field, and delete a key.
  *
  * The persist toggle DEFAULTS TO OFF (memory-only for this process's
  * lifetime) on every render of the add form, including right after a
@@ -83,11 +83,12 @@ export function KeysScreen() {
   );
 
   return (
-    <section className="screen">
-      <h1>Keys</h1>
-      <p>Bring-your-own-key provider credentials, held in memory by default (opt in to save them to the OS Keychain).</p>
+    <section className="settings-pane">
+      <h2 className="settings-section-title">API keys</h2>
+      <p className="settings-lede">
+        Bring-your-own-key provider credentials. Keys stay in memory unless you save them to the macOS Keychain.
+      </p>
 
-      <h2>Saved keys</h2>
       {state.status === "loading" && <p role="status">Loading…</p>}
       {state.status === "error" && (
         <p role="alert" className="error-text">
@@ -101,13 +102,14 @@ export function KeysScreen() {
       )}
       {state.status === "ready" &&
         (state.ids.length === 0 ? (
-          <p>No keys set yet.</p>
+          <p className="settings-empty">No keys set yet.</p>
         ) : (
-          <ul>
+          <ul className="key-list">
             {state.ids.map((id) => (
               <li key={id}>
-                <strong>{id}</strong> <span className="muted-text">configured</span>{" "}
-                <button type="button" onClick={() => handleDelete(id)}>
+                <code className="key-id">{id}</code>
+                <span className="key-status">configured</span>
+                <button type="button" className="key-delete" onClick={() => handleDelete(id)}>
                   Delete
                 </button>
               </li>
@@ -115,8 +117,8 @@ export function KeysScreen() {
           </ul>
         ))}
 
-      <h2>Add a key</h2>
-      <form onSubmit={handleAdd}>
+      <form className="key-form" onSubmit={handleAdd}>
+        <h3 className="settings-subsection-title">Add a key</h3>
         <label>
           Provider id
           <input
@@ -138,9 +140,9 @@ export function KeysScreen() {
            * cleared immediately on every successful submit below. */}
           <input type="password" value={newValue} onChange={(e) => setNewValue(e.target.value)} autoComplete="off" />
         </label>
-        <label>
+        <label className="key-persist">
           <input type="checkbox" checked={persist} onChange={(e) => setPersist(e.target.checked)} />
-          Remember this key in the macOS Keychain (off = memory-only for this session)
+          Save this key in the macOS Keychain (off: memory-only for this session)
         </label>
         {formError && (
           <p role="alert" className="error-text">

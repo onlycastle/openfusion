@@ -3,7 +3,7 @@ import { act, render, screen, fireEvent, waitFor, cleanup } from "@testing-libra
 
 // `test.globals` is `false` (see vite.config.ts) so RTL's auto-registered
 // `afterEach(cleanup)` never fires — do it explicitly, same as
-// OrchestrateScreen.test.tsx/ProjectScreen.test.tsx/KeysScreen.test.tsx.
+// OrchestrateScreen.test.tsx/KeysScreen.test.tsx.
 afterEach(cleanup);
 
 // The Tauri dialog plugin's `open()` — mocked so tests drive the project

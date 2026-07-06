@@ -1,12 +1,16 @@
-// A tiny hash-based router. Four routes total (two real, two M7c stubs)
-// don't warrant pulling in react-router — this is ~30 lines instead of a
-// dependency.
+// A tiny hash-based router. Two routes total don't warrant pulling in
+// react-router — this is ~30 lines instead of a dependency. (Keys/BYOK is
+// no longer a route: it lives in the Settings dialog, which is plain
+// component state in App, not navigation. Project is no longer a route
+// either: the project is chosen inside Orchestrate, and its wiki tooling
+// lives there too; a stale `#/project` deep-link falls back to the default
+// route via `parseHash`.)
 import { useCallback, useEffect, useState } from "react";
 
-export const ROUTES = ["project", "keys", "orchestrate", "evals"] as const;
+export const ROUTES = ["orchestrate", "evals"] as const;
 export type Route = (typeof ROUTES)[number];
 
-export const DEFAULT_ROUTE: Route = "project";
+export const DEFAULT_ROUTE: Route = "orchestrate";
 
 function isRoute(value: string): value is Route {
   return (ROUTES as readonly string[]).includes(value);
