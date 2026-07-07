@@ -640,7 +640,13 @@ describe("runEvals — cost-regression hazard (two-dimensional verdict, research
     expect(report.savingsPct!).toBeLessThan(0);
     expect(report.verdict).toBe("fail");
     expect(harnessStatus(dir).evals).toBe("fail");
-    expect(report.note.toLowerCase()).toContain("cost");
+    // Non-vacuous: every report note contains the boilerplate "Cost figures
+    // are estimate-class..." sentence, so asserting just "cost" would pass
+    // regardless of which branch fired. This substring is unique to the
+    // cost-hazard branch's OWN note text (run.ts's extraNotes.push inside the
+    // `cleanSavingsPct <= -COST_REGRESSION_FAIL_FRACTION` branch) and does
+    // NOT appear in the always-present boilerplate.
+    expect(report.note.toLowerCase()).toContain("cost-regression threshold");
   }, 120_000);
 
   it("quality held, harness only MILDLY more expensive (<10%) -> inconclusive, never a fail", async () => {
@@ -662,6 +668,51 @@ describe("runEvals — cost-regression hazard (two-dimensional verdict, research
     expect(report.savingsPct!).toBeLessThan(0);
     expect(report.verdict).toBe("inconclusive");
     expect(harnessStatus(dir).evals).toBe("pending");
+  }, 120_000);
+});
+
+describe("runEvals — cross-change interactions", () => {
+  it("within-noise quality gap AND a material cost regression -> cost-hazard fail wins", async () => {
+    dir = await makeHarnessFixture();
+    engine = createEngine();
+    engine.frontier.registerAdapter(
+      makePartialFailFrontierAdapter({
+        harnessFailCount: 1, // 1/20 = 5pp, within the 0.05 noise band -> quality treated as held
+        baselineCostUsd: 0.05,
+        harnessCostUsd: 0.5, // harness 10x the baseline cost -> a material cost regression
+        meter: engine.models.meter,
+      }),
+    );
+    const tasks: EvalTask[] = Array.from({ length: 20 }, (_, i) => synthEvalTask({ id: `t${i + 1}` }));
+    const report = await runEvals(engine, { projectDir: dir, tasks });
+
+    // Within-noise -> quality treated as held -> held-quality + material cost
+    // regression -> cost-hazard fail. Pins the most important cross-change
+    // interaction between the significance gate and the cost-hazard gate.
+    expect(report.qualityGapWithinNoise).toBe(true);
+    expect(report.verdict).toBe("fail");
+    expect(harnessStatus(dir).evals).toBe("fail");
+  }, 120_000);
+
+  it("small-suite quality gap of 1-of-2 (50pp) still fails (noise band must not weaken small-N flagging)", async () => {
+    dir = await makeHarnessFixture();
+    engine = createEngine();
+    engine.frontier.registerAdapter(
+      makePartialFailFrontierAdapter({
+        harnessFailCount: 1, // 1/2 = 50pp, well above the 0.05 noise band
+        baselineCostUsd: 0.5,
+        harnessCostUsd: 0.05, // harness CHEAPER -- no cost-hazard confound
+        meter: engine.models.meter,
+      }),
+    );
+    const tasks: EvalTask[] = Array.from({ length: 2 }, (_, i) => synthEvalTask({ id: `t${i + 1}` }));
+    const report = await runEvals(engine, { projectDir: dir, tasks });
+
+    // Pins the plan's own "1-of-2 = 50pp must still fail" invariant: a tiny
+    // suite's large fractional gap must never be absorbed by the noise band.
+    expect(report.qualityGapWithinNoise).toBe(false);
+    expect(report.verdict).toBe("fail");
+    expect(harnessStatus(dir).evals).toBe("fail");
   }, 120_000);
 });
 

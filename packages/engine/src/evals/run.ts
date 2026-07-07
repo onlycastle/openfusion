@@ -241,10 +241,12 @@ const FRONTIER_KIND = "claude-code";
 const DEFAULT_BASELINE_TIMEOUT_MS = 600_000;
 
 // Anthropic eval guidance (docs/research/2026-07-04-m6-pricing-eval-
-// verification.md, "Sample size"): a 5-task run is a demo, not a claim — a
-// credible savings claim wants 20-50 paired tasks. Below this threshold the
-// verdict is always "inconclusive" regardless of how good the numbers look,
-// so a quick CI/demo run can never be mistaken for a real measurement.
+// verification.md, "Sample size"): the LOW floor -- below it, no
+// consequential verdict is grounded, full stop; a run this small is a demo,
+// not a claim. Post-M6.1 (see MIN_TASK_COUNT_FOR_SAVINGS_PASS just below),
+// this constant no longer gates a savings PASS by itself -- it now gates
+// only the cost-hazard FAIL flag (a harm signal, flagged readily at the low
+// floor), while a savings PASS must clear the separate, higher 20-task floor.
 const MIN_TASK_COUNT_FOR_VERDICT = 5;
 
 // Research 2026-07-07 (docs/research/2026-07-07-harness-composition.md §4.2,
