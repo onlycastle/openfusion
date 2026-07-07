@@ -620,6 +620,51 @@ describe("runEvals — quality-gap significance (noise band, research 2026-07-07
   }, 120_000);
 });
 
+describe("runEvals — cost-regression hazard (two-dimensional verdict, research 2026-07-07 §4.3)", () => {
+  it("quality held but harness materially MORE expensive (>=10%) -> ETH cost-hazard fail (fires at the low floor)", async () => {
+    dir = await makeHarnessFixture();
+    engine = createEngine();
+    engine.frontier.registerAdapter(
+      makeFakeEvalsFrontierAdapter({
+        baselineCorrect: true,
+        harnessCorrect: true,
+        baselineCostUsd: 0.05,
+        harnessCostUsd: 0.5, // harness 10x the baseline cost -> savings ~ -9.0
+        meter: engine.models.meter,
+      }),
+    );
+    const tasks: EvalTask[] = Array.from({ length: 5 }, (_, i) => synthEvalTask({ id: `t${i + 1}` }));
+    const report = await runEvals(engine, { projectDir: dir, tasks });
+
+    expect(report.qualityHeld).toBe(true);
+    expect(report.savingsPct!).toBeLessThan(0);
+    expect(report.verdict).toBe("fail");
+    expect(harnessStatus(dir).evals).toBe("fail");
+    expect(report.note.toLowerCase()).toContain("cost");
+  }, 120_000);
+
+  it("quality held, harness only MILDLY more expensive (<10%) -> inconclusive, never a fail", async () => {
+    dir = await makeHarnessFixture();
+    engine = createEngine();
+    engine.frontier.registerAdapter(
+      makeFakeEvalsFrontierAdapter({
+        baselineCorrect: true,
+        harnessCorrect: true,
+        baselineCostUsd: 0.1,
+        harnessCostUsd: 0.103, // +3% -> savings -0.03, within the -0.10 band
+        meter: engine.models.meter,
+      }),
+    );
+    const tasks: EvalTask[] = Array.from({ length: 20 }, (_, i) => synthEvalTask({ id: `t${i + 1}` }));
+    const report = await runEvals(engine, { projectDir: dir, tasks });
+
+    expect(report.qualityHeld).toBe(true);
+    expect(report.savingsPct!).toBeLessThan(0);
+    expect(report.verdict).toBe("inconclusive");
+    expect(harnessStatus(dir).evals).toBe("pending");
+  }, 120_000);
+});
+
 describe("runEvals — base identity (Task 4 Fix 1)", () => {
   it("engine.orchestrate works the harness side from harnessDir, never from the real project directory", async () => {
     dir = await makeHarnessFixture();

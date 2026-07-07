@@ -281,6 +281,18 @@ const MATERIAL_MEASUREMENT_FAILURE_FRACTION = 0.2;
 // buy significance for smaller effects is a deferred follow-up.
 const QUALITY_NOISE_BAND = 0.05;
 
+// Research 2026-07-07 (§0/§4.3, arXiv:2602.11988): the eval gate is
+// two-dimensional. A harness that HOLDS quality but costs materially MORE
+// than the no-harness baseline is an ETH COST hazard (the study's exact
+// failure mode: quality held, cost +~20%), not a neutral result. When the
+// clean-subset savings is at or below -this fraction (i.e. the harness is
+// >=10% MORE expensive) at held quality, priced, and above the low hazard
+// floor, the verdict is "fail". A milder increase (between this and 0) stays
+// "inconclusive" ("quality held but not worth it"). Uses the LOW floor
+// (MIN_TASK_COUNT_FOR_VERDICT) not the savings-PASS floor — a harm signal is
+// flagged readily, asymmetric with the higher bar a positive claim must clear.
+const COST_REGRESSION_FAIL_FRACTION = 0.10;
+
 export interface EvalsRunParams {
   projectDir: string;
   // Full, already-constructed EvalTask objects (setup() closures and all) —
@@ -969,6 +981,24 @@ export async function runEvals(engine: Engine, params: EvalsRunParams): Promise<
     extraNotes.push(
       `${runUnpricedCalls} model call(s) were unpriced -- savings cannot be computed; run with priced models for ` +
         "a savings claim.",
+    );
+  } else if (
+    (qualityHeldClean || qualityGapWithinNoise) &&
+    cleanSavingsPct !== null &&
+    cleanSavingsPct <= -COST_REGRESSION_FAIL_FRACTION &&
+    taskCount >= MIN_TASK_COUNT_FOR_VERDICT
+  ) {
+    // ETH COST HAZARD (research 2026-07-07 §0/§4.3): quality is held (or the
+    // gap is within noise) yet the harness is materially MORE expensive than
+    // the no-harness baseline on the clean subset. The harness is failing its
+    // cost-savings purpose while charging more -> "fail", not a silent
+    // "inconclusive". Fires at the LOW floor (a harm flag), asymmetric with
+    // the savings-PASS floor below.
+    verdict = "fail";
+    extraNotes.push(
+      `The harness held quality but cost ${Math.round(-cleanSavingsPct * 100)}% MORE than the no-harness ` +
+        `baseline on the clean subset (>= the ${Math.round(COST_REGRESSION_FAIL_FRACTION * 100)}% cost-regression ` +
+        `threshold) -- reported as an ETH cost-hazard fail.`,
     );
   } else if (taskCount < MIN_TASK_COUNT_FOR_SAVINGS_PASS || cleanSavingsPct === null) {
     // Too few tasks for a savings CLAIM (a demo, not a claim) or an unpriced
