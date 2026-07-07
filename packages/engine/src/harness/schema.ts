@@ -68,7 +68,7 @@ export const WikiPageSchema = z.object({
 });
 export type WikiPage = z.infer<typeof WikiPageSchema>;
 
-const AgentModelSchema = z.union([
+export const AgentModelSchema = z.union([
   z.object({
     kind: z.string().min(1),
     model: z.string().min(1),
@@ -84,6 +84,7 @@ const AgentModelSchema = z.union([
   }),
   z.literal("frontier"),
 ]);
+export type AgentModel = z.infer<typeof AgentModelSchema>;
 
 export const AgentDefSchema = z.object({
   name: kebabString(),

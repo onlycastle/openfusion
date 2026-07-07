@@ -7,8 +7,8 @@ import { registerMethod } from "../rpc/register.js";
 import { HarnessGenError } from "./driver.js";
 import { exportHarness } from "./exporters.js";
 import { generateHarness, type GenerateHarnessResult } from "./generate.js";
-import { validateHarness } from "./schema.js";
-import { HarnessValidationError, harnessStatus, loadHarness } from "./store.js";
+import { AgentModelSchema, validateHarness, type HarnessBundle } from "./schema.js";
+import { HarnessValidationError, harnessStatus, loadHarness, writeHarness } from "./store.js";
 
 const ProjectParamsSchema = z.object({ projectDir: z.string().min(1) });
 
@@ -17,12 +17,33 @@ const ExportParamsSchema = z.object({
   format: z.enum(["agents-md", "claude-subagents"]),
 });
 
+const UpdateAgentModelParamsSchema = z.object({
+  projectDir: z.string().min(1),
+  agentName: z.string().min(1),
+  model: AgentModelSchema,
+});
+
+const UpdateEscalationParamsSchema = z.object({
+  projectDir: z.string().min(1),
+  failuresBeforeFrontier: z.number().int().min(1).max(3),
+});
+
 // Holds the per-project in-flight generation map. Mirrors WikiService.build's
 // #building coalescing exactly: a second engine.harness.generate call for a
 // project already generating returns the SAME promise instead of racing a
 // second frontier session (and a second writeHarness) against the first.
 export class HarnessService {
   #generating = new Map<string, Promise<GenerateHarnessResult>>();
+
+  // Per-project write queue: chains each mutateHarness call onto the tail of
+  // the previous one for the SAME project, so the RPC dispatcher's natural
+  // concurrency (nothing serializes two near-simultaneous
+  // engine.harness.updateAgentModel calls upstream of here) can't let a
+  // second call's loadHarness read stale disk state before the first call's
+  // writeHarness lands — the classic read-mutate-write race that silently
+  // clobbers whichever write lands first. Keyed by resolveProjectKey so
+  // distinct spellings/symlinks of the same project share one queue.
+  #writeChain = new Map<string, Promise<unknown>>();
 
   generate(engine: Engine, projectDir: string): Promise<GenerateHarnessResult> {
     const key = resolveProjectKey(projectDir);
@@ -34,6 +55,27 @@ export class HarnessService {
     });
     this.#generating.set(key, promise);
     return promise;
+  }
+
+  // Queues fn to run only after every previously-queued write for this
+  // project has settled (success OR failure — a `.then(fn, fn)`-style
+  // neutralization, so one failed mutation can never wedge later queued
+  // writes behind a permanently-rejected tail). Clears the map entry once
+  // this call is the last one queued, so a quiet project doesn't leak an
+  // ever-growing settled-promise chain.
+  serializeWrite<T>(projectDir: string, fn: () => Promise<T>): Promise<T> {
+    const key = resolveProjectKey(projectDir);
+    const tail = this.#writeChain.get(key) ?? Promise.resolve();
+    const settled = tail.then(fn, fn);
+    const cleared = settled.then(
+      () => undefined,
+      () => undefined,
+    );
+    this.#writeChain.set(key, cleared);
+    cleared.finally(() => {
+      if (this.#writeChain.get(key) === cleared) this.#writeChain.delete(key);
+    });
+    return settled;
   }
 }
 
@@ -105,5 +147,84 @@ export function registerHarnessMethods(engine: Engine): void {
     const result = await exportHarness(projectDir, bundle, format);
     engine.log(`harness.export ${projectDir} (${format}): ${result.files.length} files`);
     return result;
+  });
+
+  registerMethod(engine.dispatcher, "engine.harness.read", ProjectParamsSchema, ({ projectDir }) => {
+    let bundle;
+    try {
+      bundle = loadHarness(projectDir);
+    } catch (err) {
+      if (err instanceof HarnessValidationError) {
+        throw new RpcMethodError(RpcErrorCodes.SERVER_ERROR, err.message, { issues: err.issues });
+      }
+      throw err;
+    }
+    if (bundle === null) {
+      throw new RpcMethodError(RpcErrorCodes.SERVER_ERROR, "no valid harness; run engine.harness.generate first");
+    }
+    const structuralIssues = validateHarness(bundle);
+    if (structuralIssues.length > 0) {
+      throw new RpcMethodError(RpcErrorCodes.SERVER_ERROR, "no valid harness; run engine.harness.generate first", {
+        issues: structuralIssues,
+      });
+    }
+    return {
+      agents: bundle.agents.map((a) => ({
+        name: a.name,
+        role: a.role,
+        taskClasses: a.taskClasses,
+        model: a.model,
+      })),
+      defaultAgent: bundle.routing.defaults.agent,
+      escalation: bundle.routing.escalation.failuresBeforeFrontier,
+    };
+  });
+
+  // Load → (caller mutates) → validate → atomic write. Throws the same
+  // "no valid harness" shape as read/export when the bundle is absent, and
+  // carries validateHarness issues when a mutation would break referential
+  // integrity. All persistence goes through writeHarness so manifest
+  // provenance (and the artifacts prune list) is recomputed correctly.
+  async function mutateHarness(projectDir: string, mutate: (b: HarnessBundle) => void): Promise<void> {
+    let bundle;
+    try {
+      bundle = loadHarness(projectDir);
+    } catch (err) {
+      if (err instanceof HarnessValidationError) {
+        throw new RpcMethodError(RpcErrorCodes.SERVER_ERROR, err.message, { issues: err.issues });
+      }
+      throw err;
+    }
+    if (bundle === null) {
+      throw new RpcMethodError(RpcErrorCodes.SERVER_ERROR, "no valid harness; run engine.harness.generate first");
+    }
+    mutate(bundle);
+    const issues = validateHarness(bundle);
+    if (issues.length > 0) {
+      throw new RpcMethodError(RpcErrorCodes.SERVER_ERROR, "edit would break the harness", { issues });
+    }
+    await writeHarness(projectDir, bundle);
+  }
+
+  registerMethod(engine.dispatcher, "engine.harness.updateAgentModel", UpdateAgentModelParamsSchema, async ({ projectDir, agentName, model }) => {
+    await engine.harness.serializeWrite(projectDir, () =>
+      mutateHarness(projectDir, (bundle) => {
+        const agent = bundle.agents.find((a) => a.name === agentName);
+        if (agent === undefined) {
+          throw new RpcMethodError(RpcErrorCodes.SERVER_ERROR, `unknown agent "${agentName}"`);
+        }
+        agent.model = model;
+      }),
+    );
+    return { updated: true };
+  });
+
+  registerMethod(engine.dispatcher, "engine.harness.updateEscalation", UpdateEscalationParamsSchema, async ({ projectDir, failuresBeforeFrontier }) => {
+    await engine.harness.serializeWrite(projectDir, () =>
+      mutateHarness(projectDir, (bundle) => {
+        bundle.routing.escalation.failuresBeforeFrontier = failuresBeforeFrontier;
+      }),
+    );
+    return { updated: true };
   });
 }

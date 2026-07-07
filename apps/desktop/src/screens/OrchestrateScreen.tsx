@@ -1,10 +1,15 @@
-import { useCallback, useRef, useState } from "react";
-import { open } from "@tauri-apps/plugin-dialog";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { useProject } from "../ProjectContext";
 import {
   EngineError,
   RunCancelledError,
   engineClient,
+  frontierLoginStatus,
   type CancellableRun,
+  type FrontierAuthStatus,
+  type GenerateHarnessResult,
+  type HarnessProgressEvent,
+  type HarnessStatus,
   type OrchestrateProgressEvent,
   type OrchestrateResult,
   type WikiBuildStats,
@@ -14,8 +19,8 @@ import {
 /** Renders a rejection as a short, user-facing sentence — never a stack
  * trace. Same posture as EvalsScreen/KeysScreen's own `friendlyMessage`: an
  * `EngineError` carries the engine's JSON-RPC `code` alongside its
- * `message`; anything else (a plain string/`Error`, e.g. the Tauri dialog
- * plugin's own rejections) is passed through as-is. */
+ * `message`; anything else (a plain string/`Error`) is passed through
+ * as-is. */
 function friendlyMessage(err: unknown): string {
   if (err instanceof EngineError) return `[${err.code}] ${err.message}`;
   if (typeof err === "string" && err.trim().length > 0) return err;
@@ -69,6 +74,21 @@ type WikiState =
   | { status: "building" }
   | { status: "error"; message: string };
 
+type SetupState =
+  | { status: "checking" }
+  | { status: "ready"; orchestrator: FrontierAuthStatus; modelProviderCount: number }
+  | { status: "error"; message: string };
+
+type HarnessState =
+  | { status: "idle" }
+  | { status: "checking" }
+  | { status: "missing"; harness: HarnessStatus; wiki: WikiStatus }
+  | { status: "stale"; harness: HarnessStatus; wiki: WikiStatus }
+  | { status: "invalid"; harness: HarnessStatus; wiki: WikiStatus }
+  | { status: "ready"; harness: HarnessStatus; wiki: WikiStatus; result?: GenerateHarnessResult }
+  | { status: "building"; progress: ProgressEntry[] }
+  | { status: "error"; message: string };
+
 /** The wiki reading in the chat head: machine truth in the measurement voice
  * (mono, lowercase), with the one action that changes it. Absorbed from the
  * former Project screen — the project is chosen here now, so its per-project
@@ -98,6 +118,36 @@ function WikiReadout({ state, onBuild }: { state: WikiState; onBuild: () => void
       </button>
     </span>
   );
+}
+
+function classifyHarness(harness: HarnessStatus, wiki: WikiStatus): HarnessState {
+  if (!harness.present) return { status: "missing", harness, wiki };
+  if (harness.structural !== "pass") return { status: "invalid", harness, wiki };
+  if (harness.headSha !== wiki.currentSha) return { status: "stale", harness, wiki };
+  return { status: "ready", harness, wiki };
+}
+
+function setupWarnings(state: SetupState): string[] {
+  if (state.status !== "ready") return [];
+  const warnings: string[] = [];
+  if (state.orchestrator.state !== "connected") {
+    warnings.push("Connect an orchestrator before building a harness.");
+  }
+  if (state.modelProviderCount === 0) {
+    warnings.push("Add at least one executing model provider for cheaper routed work.");
+  }
+  return warnings;
+}
+
+function harnessStatusText(state: HarnessState): string {
+  if (state.status === "idle") return "Select a project to check its harness.";
+  if (state.status === "checking") return "Checking project harness…";
+  if (state.status === "building") return "Building harness…";
+  if (state.status === "missing") return "No harness yet.";
+  if (state.status === "stale") return "Harness needs rebuild for this project version.";
+  if (state.status === "invalid") return "Harness needs rebuild.";
+  if (state.status === "ready") return state.result ? `Harness ready: ${state.result.agents} agents.` : "Harness ready.";
+  return state.message;
 }
 
 function OutcomeBadge({ outcome }: { outcome: OrchestrateResult["outcome"] }) {
@@ -140,23 +190,25 @@ function FolderGlyph() {
   );
 }
 
-/** The Orchestrate cockpit screen: the marquee "route → cheap worker diff →
- * frontier review → escalate → apply" loop, live. An empty session opens on
- * a centered prompt + composer (the composer card is the screen's one
- * raised, signature object); once a run starts, the transcript takes over
- * and the same composer docks at the bottom. The project is chosen from a
- * chip inside the composer (a minimal, self-contained picker — the app has
- * no shared project context today; EvalsScreen's own `projectDir` is
- * component-local too), and the chosen project's wiki status/build tooling
- * lives in the head bar. Runs stream progress, the routed model, diff,
- * review verdict, cost split, and final outcome — with a distinct
- * Cancelling/Cancelled state (not Failed) and a working-tree (not
- * committed) Apply action. */
-export function OrchestrateScreen() {
-  const [projectDir, setProjectDir] = useState<string | null>(null);
+/** The Studio cockpit screen (the "Studio" nav destination; the component
+ * keeps the name `OrchestrateScreen` because it drives the engine's
+ * orchestrate loop — Studio is the room, orchestrate is the machinery).
+ * The first phase is harness setup: choose a project, verify orchestrator
+ * and worker-model setup, then generate or refresh the project's
+ * `.openfusion` harness. Only after that does the task chat open. Runs
+ * stream progress, the routed model, diff, review verdict, cost split, and
+ * final outcome — with a distinct Cancelling/Cancelled state (not Failed)
+ * and a working-tree (not committed) Apply action. */
+interface OrchestrateScreenProps {
+  onOpenSettings?: () => void;
+}
+
+export function OrchestrateScreen({ onOpenSettings }: OrchestrateScreenProps = {}) {
+  const { activeProjectDir } = useProject();
+  const projectDir = activeProjectDir;
   const [runProjectDir, setRunProjectDir] = useState<string | null>(null);
-  const [pickerError, setPickerError] = useState<string | null>(null);
   const [task, setTask] = useState("");
+  const [chatOpen, setChatOpen] = useState(false);
   // The task text as it was when Run was pressed — shown as the "You" turn in
   // the transcript, so it reflects the run in progress, not live typing.
   const [runTask, setRunTask] = useState<string>("");
@@ -166,6 +218,8 @@ export function OrchestrateScreen() {
   const [runError, setRunError] = useState<string | null>(null);
   const [applyState, setApplyState] = useState<ApplyState>({ status: "idle" });
   const [wikiState, setWikiState] = useState<WikiState>({ status: "idle" });
+  const [setupState, setSetupState] = useState<SetupState>({ status: "checking" });
+  const [harnessState, setHarnessState] = useState<HarnessState>({ status: "idle" });
 
   const runRef = useRef<CancellableRun<OrchestrateResult> | null>(null);
 
@@ -175,28 +229,74 @@ export function OrchestrateScreen() {
   const projectDirRef = useRef<string | null>(null);
   projectDirRef.current = projectDir;
 
-  const isBusy = phase === "running" || phase === "cancelling";
+  const harnessBuilding = harnessState.status === "building";
+  const isBusy = phase === "running" || phase === "cancelling" || harnessBuilding;
+  const setupWarningList = setupWarnings(setupState);
+  const setupReady = setupState.status === "ready" && setupWarningList.length === 0;
+  const harnessReady = harnessState.status === "ready";
 
-  const handleChooseProject = useCallback(() => {
-    setPickerError(null);
-    open({ directory: true })
-      .then((selected) => {
-        if (typeof selected !== "string") return; // user cancelled the dialog
-        setProjectDir(selected);
-        setWikiState({ status: "checking" });
-        engineClient
-          .wikiStatus(selected)
-          .then((wiki) => {
-            if (projectDirRef.current !== selected) return;
-            setWikiState({ status: "ready", wiki });
+  const loadSetupStatus = useCallback(() => {
+    setSetupState({ status: "checking" });
+    Promise.all([frontierLoginStatus("claude-code"), engineClient.modelsList()])
+      .then(([orchestrator, models]) => {
+        setSetupState({ status: "ready", orchestrator, modelProviderCount: models.providers.length });
+      })
+      .catch((err: unknown) => setSetupState({ status: "error", message: friendlyMessage(err) }));
+  }, []);
+
+  useEffect(() => {
+    loadSetupStatus();
+  }, [loadSetupStatus]);
+
+  const resetRunState = useCallback(() => {
+    setTask("");
+    setRunTask("");
+    setProgress([]);
+    setResult(null);
+    setRunError(null);
+    setApplyState({ status: "idle" });
+    setRunProjectDir(null);
+    setPhase("idle");
+  }, []);
+
+  const refreshHarnessState = useCallback((dir: string) => {
+    setWikiState({ status: "checking" });
+    setHarnessState({ status: "checking" });
+    engineClient
+      .wikiStatus(dir)
+      .then((wiki) => {
+        if (projectDirRef.current !== dir) return;
+        setWikiState({ status: "ready", wiki });
+        return engineClient
+          .harnessStatus(dir)
+          .then((harness) => {
+            if (projectDirRef.current !== dir) return;
+            setHarnessState(classifyHarness(harness, wiki));
           })
           .catch((err: unknown) => {
-            if (projectDirRef.current !== selected) return;
-            setWikiState({ status: "error", message: friendlyMessage(err) });
+            if (projectDirRef.current !== dir) return;
+            setHarnessState({ status: "error", message: friendlyMessage(err) });
           });
       })
-      .catch((err: unknown) => setPickerError(friendlyMessage(err)));
+      .catch((err: unknown) => {
+        if (projectDirRef.current !== dir) return;
+        const message = friendlyMessage(err);
+        setWikiState({ status: "error", message });
+        setHarnessState({ status: "error", message });
+      });
   }, []);
+
+  // Reacts to the active project changing (picked in Rail 1, via
+  // ProjectContext) — mirrors what the former in-screen picker did
+  // inline on a successful pick: drop back out of the task chat, clear
+  // the prior run's state, and re-check the new project's harness/wiki.
+  useEffect(() => {
+    if (projectDir === null) return;
+    projectDirRef.current = projectDir;
+    setChatOpen(false);
+    resetRunState();
+    refreshHarnessState(projectDir);
+  }, [projectDir, refreshHarnessState, resetRunState]);
 
   const handleBuildWiki = useCallback(() => {
     const dir = projectDir;
@@ -218,8 +318,55 @@ export function OrchestrateScreen() {
       });
   }, [projectDir, wikiState.status]);
 
+  const handleBuildHarness = useCallback(() => {
+    const dir = projectDir;
+    if (!dir || !setupReady || isBusy || harnessBuilding) return;
+
+    setChatOpen(false);
+    resetRunState();
+    setHarnessState({ status: "building", progress: [] });
+    setWikiState((prev) => (prev.status === "ready" ? prev : { status: "checking" }));
+
+    engineClient
+      .harnessGenerate(dir, (event: HarnessProgressEvent) => {
+        progressKeySeq += 1;
+        const entry: ProgressEntry = { key: progressKeySeq, stage: event.stage, detail: event.detail };
+        setHarnessState((prev) =>
+          prev.status === "building" ? { status: "building", progress: [...prev.progress, entry] } : prev,
+        );
+      })
+      .then((buildResult) =>
+        Promise.all([engineClient.wikiStatus(dir), engineClient.harnessStatus(dir)]).then(([wiki, harness]) => ({
+          buildResult,
+          wiki,
+          harness,
+        })),
+      )
+      .then(({ buildResult, wiki, harness }) => {
+        if (projectDirRef.current !== dir) return;
+        setWikiState({ status: "ready", wiki });
+        const nextHarnessState = classifyHarness(harness, wiki);
+        if (nextHarnessState.status === "ready") {
+          setHarnessState({ ...nextHarnessState, result: buildResult });
+          setChatOpen(true);
+          return;
+        }
+        setHarnessState(nextHarnessState);
+        setChatOpen(false);
+      })
+      .catch((err: unknown) => {
+        if (projectDirRef.current !== dir) return;
+        setHarnessState({ status: "error", message: friendlyMessage(err) });
+      });
+  }, [harnessBuilding, isBusy, projectDir, resetRunState, setupReady]);
+
+  const handleOpenChat = useCallback(() => {
+    if (!harnessReady || !setupReady) return;
+    setChatOpen(true);
+  }, [harnessReady, setupReady]);
+
   const handleRun = useCallback(() => {
-    if (!projectDir || !task.trim() || isBusy) return;
+    if (!projectDir || !task.trim() || !chatOpen || !harnessReady || !setupReady || isBusy) return;
 
     setProgress([]);
     setResult(null);
@@ -249,7 +396,7 @@ export function OrchestrateScreen() {
         setRunError(friendlyMessage(err));
         setPhase("error");
       });
-  }, [projectDir, task, isBusy]);
+  }, [chatOpen, harnessReady, isBusy, projectDir, setupReady, task]);
 
   // Guarded on `phase === "running"` (not just the button's `disabled`
   // attribute) so a second Cancel click — even one that somehow reaches
@@ -271,13 +418,23 @@ export function OrchestrateScreen() {
       .catch((err: unknown) => setApplyState({ status: "failed", message: friendlyMessage(err) }));
   }, [runProjectDir, result, applyState.status]);
 
-  const canRun = Boolean(projectDir) && task.trim().length > 0 && !isBusy;
+  const canRun = Boolean(projectDir) && chatOpen && harnessReady && setupReady && task.trim().length > 0 && !isBusy;
   const canApply =
     result !== null &&
     (result.outcome === "worker-approved" || result.outcome === "escalated") &&
     result.diff.trim().length > 0;
 
   const hasTranscript = runTask.length > 0 || progress.length > 0 || result !== null;
+  const canBuildHarness =
+    Boolean(projectDir) &&
+    setupReady &&
+    !isBusy &&
+    wikiState.status === "ready" &&
+    (harnessState.status === "missing" ||
+      harnessState.status === "stale" ||
+      harnessState.status === "invalid" ||
+      harnessState.status === "error");
+  const canOpenChat = harnessReady && setupReady && !isBusy;
 
   const projectName = projectDir ? baseName(projectDir) : null;
 
@@ -298,19 +455,13 @@ export function OrchestrateScreen() {
         onChange={(e) => setTask(e.target.value)}
         rows={2}
         disabled={isBusy}
-        placeholder={projectDir ? "Describe a task…" : "Choose a project, then describe a task…"}
+        placeholder={projectDir ? "Describe a task…" : "Select a project, then describe a task…"}
       />
       <div className="composer-bar">
-        <button
-          type="button"
-          className="composer-chip"
-          onClick={handleChooseProject}
-          disabled={isBusy}
-          aria-label={projectName ? `Choose project — current: ${projectName}` : "Choose project"}
-        >
+        <span className="composer-chip composer-chip-static">
           <FolderGlyph />
-          <span>{projectName ?? "Choose a project"}</span>
-        </button>
+          <span>{projectName ?? "No project selected"}</span>
+        </span>
         <div className="composer-bar-right">
           <span className="composer-hint" title="Models are routed automatically: cheap worker first, frontier review after">
             auto-route
@@ -339,33 +490,143 @@ export function OrchestrateScreen() {
     </div>
   );
 
+  const setupView = (
+    <div className="harness-setup">
+      <div className="harness-setup-inner">
+        <p className="harness-kicker">Building harness</p>
+        <h2>Select your project. OpenFusion will build the harness for you.</h2>
+
+        {setupState.status === "checking" && (
+          <p role="status" className="harness-setup-status">
+            Checking settings…
+          </p>
+        )}
+        {setupState.status === "error" && (
+          <p role="alert" className="error-text harness-setup-status">
+            {setupState.message}
+          </p>
+        )}
+        {setupState.status === "ready" && setupWarningList.length === 0 && (
+          <p className="harness-setup-status">
+            Claude Code connected · {setupState.modelProviderCount} model provider
+            {setupState.modelProviderCount === 1 ? "" : "s"} ready
+          </p>
+        )}
+        {setupWarningList.length > 0 && (
+          <div role="alert" className="setup-warning">
+            <strong>Finish setup before building.</strong>
+            <ul>
+              {setupWarningList.map((warning) => (
+                <li key={warning}>{warning}</li>
+              ))}
+            </ul>
+            <div className="setup-warning-actions">
+              {onOpenSettings && (
+                <button type="button" onClick={onOpenSettings}>
+                  Open Settings
+                </button>
+              )}
+              <button type="button" onClick={loadSetupStatus}>
+                Recheck
+              </button>
+            </div>
+          </div>
+        )}
+
+        <div className="harness-panel">
+          <div className="harness-project-static">
+            <FolderGlyph />
+            <span>{projectName ?? "No project selected"}</span>
+          </div>
+
+          {projectDir && <code className="harness-project-path">{projectDir}</code>}
+
+          <div className={`harness-state harness-state-${harnessState.status}`}>
+            <span>{harnessStatusText(harnessState)}</span>
+            {wikiState.status === "ready" && (
+              <span className="harness-state-detail">
+                {wikiState.wiki.files} files · {wikiState.wiki.symbols} symbols
+              </span>
+            )}
+          </div>
+
+          {wikiState.status === "error" && (
+            <p role="alert" className="error-text">
+              {wikiState.message}
+            </p>
+          )}
+          {harnessState.status === "error" &&
+            !(wikiState.status === "error" && wikiState.message === harnessState.message) && (
+              <p role="alert" className="error-text">
+                {harnessState.message}
+              </p>
+            )}
+
+          {harnessState.status === "building" && harnessState.progress.length > 0 && (
+            <ol className="harness-progress-list" aria-label="Harness build progress">
+              {harnessState.progress.map((entry) => (
+                <li key={entry.key}>
+                  <span>{entry.stage}</span>
+                  {entry.detail}
+                </li>
+              ))}
+            </ol>
+          )}
+
+          <div className="harness-actions">
+            {harnessReady ? (
+              <button type="button" className="primary-action" onClick={handleOpenChat} disabled={!canOpenChat}>
+                Open task chat
+              </button>
+            ) : (
+              <button type="button" className="primary-action" onClick={handleBuildHarness} disabled={!canBuildHarness}>
+                {harnessBuilding ? "Building…" : "Build harness"}
+              </button>
+            )}
+            {projectDir && !harnessBuilding && (
+              <button type="button" onClick={() => refreshHarnessState(projectDir)} disabled={isBusy}>
+                Recheck project
+              </button>
+            )}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+
   return (
-    <section className={hasTranscript ? "screen chat-screen chat-screen-active" : "screen chat-screen"}>
+    <section className={chatOpen && hasTranscript ? "screen chat-screen chat-screen-active" : "screen chat-screen"}>
       {/* Slim top bar: the screen eyebrow plus the full project path (the
         * chip in the composer shows only the directory's name; the machine
         * truth — the absolute path — lives here) and the project's wiki
-        * reading, absorbed from the former Project screen. */}
-      <header className="chat-head">
-        <h1>Orchestrate</h1>
-        {projectDir && (
+        * reading, absorbed from the former Project screen.
+        *
+        * data-tauri-drag-region (bare): with titleBarStyle Overlay the webview
+        * covers the whole frame, so this top strip — the natural place to grab
+        * the window over the content pane — must be granted window-dragging
+        * back, mirroring the sidebar (Nav.tsx). Bare means only a mousedown
+        * whose TARGET is the header itself drags (its empty space), so the
+        * eyebrow, the selectable project path, and the wiki Build button all
+        * keep their own pointer behavior. Requires core:window:allow-start-
+        * dragging in the capability (drag.js's invoke is ACL-gated). */}
+      <header className="chat-head" data-tauri-drag-region>
+        <h1>Studio</h1>
+        {projectDir && chatOpen && (
           <div className="chat-head-project">
             <code className="chat-project-path">{projectDir}</code>
             <WikiReadout state={wikiState} onBuild={handleBuildWiki} />
           </div>
         )}
       </header>
-      {pickerError && (
-        <p role="alert" className="error-text chat-head-alert">
-          {pickerError}
-        </p>
-      )}
-      {wikiState.status === "error" && (
+      {chatOpen && wikiState.status === "error" && (
         <p role="alert" className="error-text chat-head-alert">
           wiki: {wikiState.message}
         </p>
       )}
 
-      {!hasTranscript ? (
+      {!chatOpen ? (
+        setupView
+      ) : !hasTranscript ? (
         <div className="chat-hero">
           <p className="hero-title">
             What should we work on{projectName ? <span className="hero-project"> in {projectName}</span> : null}?

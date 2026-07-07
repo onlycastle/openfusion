@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Capability for the main window. The engine sidecar is spawned from Rust via tokio::process (engine_bridge.rs), not via plugin-shell webview IPC, so no shell:allow-spawn grant is needed here — capabilities only gate webview->plugin calls. `dialog:allow-open` is the Project screen's directory picker (`@tauri-apps/plugin-dialog`'s `open({directory: true})`, wired in lib.rs via `tauri_plugin_dialog::init()`) — the only plugin-shell-style webview->plugin call this app makes.",
+  "description": "Capability for the main window. The engine sidecar is spawned from Rust via tokio::process (engine_bridge.rs), not via plugin-shell webview IPC, so no shell:allow-spawn grant is needed here — capabilities only gate webview->plugin calls. `dialog:allow-open` is the Project screen's directory picker (`@tauri-apps/plugin-dialog`'s `open({directory: true})`, wired in lib.rs via `tauri_plugin_dialog::init()`) — the only plugin-shell-style webview->plugin call this app makes. `core:window:allow-start-dragging` is required for `data-tauri-drag-region` to move the window: with titleBarStyle Overlay the webview covers the whole frame, and Tauri's injected drag.js turns a mousedown on a drag region into an `invoke('plugin:window|start_dragging')` — which the read-only `core:default` window set does NOT grant, so without this the window is un-draggable everywhere (double-click-maximize still works, since core:default DOES include internal-toggle-maximize).",
   "windows": ["main"],
-  "permissions": ["core:default", "dialog:allow-open"]
+  "permissions": ["core:default", "core:window:allow-start-dragging", "dialog:allow-open"]
 }

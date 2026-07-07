@@ -6,11 +6,11 @@ import { act, render, screen, fireEvent, waitFor, cleanup } from "@testing-libra
 // OrchestrateScreen.test.tsx/KeysScreen.test.tsx.
 afterEach(cleanup);
 
-// The Tauri dialog plugin's `open()` — mocked so tests drive the project
-// directory picker without a real native dialog (same pattern as
-// OrchestrateScreen.test.tsx).
-const { openMock } = vi.hoisted(() => ({ openMock: vi.fn() }));
-vi.mock("@tauri-apps/plugin-dialog", () => ({ open: openMock }));
+// The active project now comes from `ProjectContext` (Rail 1 owns picking
+// it) rather than an in-screen folder dialog — mocked so tests can drive
+// `activeProjectDir` directly, same pattern as OrchestrateScreen.test.tsx.
+const { useProjectMock } = vi.hoisted(() => ({ useProjectMock: vi.fn() }));
+vi.mock("../ProjectContext", () => ({ useProject: () => useProjectMock() }));
 
 // `engineClient` (the singleton) is what EvalsScreen calls through for
 // `runEvals`. `importOriginal` keeps `EngineError`/`RunCancelledError` real
@@ -87,25 +87,37 @@ function makeControllableRun() {
 }
 
 beforeEach(() => {
-  openMock.mockReset();
+  useProjectMock.mockReset();
+  useProjectMock.mockReturnValue({ activeProjectDir: "/r/alpha" });
   runEvalsMock.mockReset();
 });
 
+/** The active project is already set via `ProjectContext` (mocked to
+ * `/r/alpha` in `beforeEach`, or a custom `path` here) by the time the
+ * screen mounts — unlike the old in-screen folder dialog, there is nothing
+ * to click to "choose" it. */
 async function setUpRunnableForm(
-  path = "/Users/test/project",
+  path = "/r/alpha",
   commitShas = "abc1234\ndef5678",
   testCommand = "npm test",
-): Promise<{ path: string }> {
-  openMock.mockResolvedValueOnce(path);
-  render(<EvalsScreen />);
-  fireEvent.click(screen.getByRole("button", { name: /choose project/i }));
-  await waitFor(() => expect(screen.getByText(path)).toBeTruthy());
+): Promise<{ path: string; rerender: ReturnType<typeof render>["rerender"] }> {
+  useProjectMock.mockReturnValue({ activeProjectDir: path });
+  const { rerender } = render(<EvalsScreen />);
+  expect(screen.getByText(path)).toBeTruthy();
   fireEvent.change(screen.getByLabelText(/golden commit shas/i), { target: { value: commitShas } });
   fireEvent.change(screen.getByLabelText(/test command/i), { target: { value: testCommand } });
-  return { path };
+  return { path, rerender };
 }
 
 describe("EvalsScreen", () => {
+  it("renders 'No project selected' when there is no active project in context", () => {
+    useProjectMock.mockReturnValue({ activeProjectDir: null });
+    render(<EvalsScreen />);
+
+    expect(screen.getByText(/no project selected/i)).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /choose project|select project/i })).toBeNull();
+  });
+
   it("Run evals calls runEvals with {projectDir, tasks} built from the commit-sha/test-command form, and streams progress", async () => {
     const { path } = await setUpRunnableForm();
     const controllable = makeControllableRun();
@@ -459,8 +471,8 @@ describe("EvalsScreen", () => {
     expect(cleanSection?.textContent).toMatch(/1/);
   });
 
-  it("Report card heading shows the RUN's project directory, not the live picker value (wrong-project safety test)", async () => {
-    await setUpRunnableForm("/proj/A");
+  it("Report card heading shows the RUN's project directory, not the live active project (wrong-project safety test)", async () => {
+    const { rerender } = await setUpRunnableForm("/proj/A");
     const controllable = makeControllableRun();
     runEvalsMock.mockReturnValueOnce(controllable);
     fireEvent.click(screen.getByRole("button", { name: /run evals/i }));
@@ -469,18 +481,19 @@ describe("EvalsScreen", () => {
     await waitFor(() => expect(screen.getByRole("heading", { name: /report card/i })).toBeTruthy());
     expect(screen.getByRole("heading", { name: /report card/i }).textContent).toMatch(/\/proj\/A/);
 
-    // User re-picks a different directory AFTER the run resolves.
-    openMock.mockResolvedValueOnce("/proj/B");
-    fireEvent.click(screen.getByRole("button", { name: /choose project/i }));
+    // The active project changes AFTER the run resolves — as Rail 1
+    // (ProjectContext) would drive it, not an in-screen picker.
+    useProjectMock.mockReturnValue({ activeProjectDir: "/proj/B" });
+    rerender(<EvalsScreen />);
     await waitFor(() => {
       const code = screen.getAllByText(/^\/proj\//)[0];
       expect(code?.textContent).toBe("/proj/B");
     });
 
     // CORRECTNESS: the report card must still show the RUN's project
-    // (/proj/A), not the live picker value (/proj/B) — the same
-    // wrong-project safety property OrchestrateScreen's own "Apply uses the
-    // RUN's project directory" test guards.
+    // (/proj/A), not the live active project (/proj/B) — the same
+    // wrong-project safety property OrchestrateScreen's own analogous test
+    // guards.
     expect(screen.getByRole("heading", { name: /report card/i }).textContent).toMatch(/\/proj\/A/);
     expect(screen.getByRole("heading", { name: /report card/i }).textContent).not.toMatch(/\/proj\/B/);
   });
@@ -545,12 +558,16 @@ describe("EvalsScreen", () => {
   });
 
   it("disables Run evals until a project, at least one commit sha, and a test command are all present", async () => {
-    render(<EvalsScreen />);
+    useProjectMock.mockReturnValue({ activeProjectDir: null });
+    const { rerender } = render(<EvalsScreen />);
     const runButton = () => screen.getByRole("button", { name: /run evals/i }) as HTMLButtonElement;
     expect(runButton().disabled).toBe(true);
+    expect(screen.getByText(/no project selected/i)).toBeTruthy();
 
-    openMock.mockResolvedValueOnce("/Users/test/project");
-    fireEvent.click(screen.getByRole("button", { name: /choose project/i }));
+    // The active project becomes available — as Rail 1 (ProjectContext)
+    // would drive it, not an in-screen picker.
+    useProjectMock.mockReturnValue({ activeProjectDir: "/Users/test/project" });
+    rerender(<EvalsScreen />);
     await waitFor(() => expect(screen.getByText("/Users/test/project")).toBeTruthy());
     expect(runButton().disabled).toBe(true);
 

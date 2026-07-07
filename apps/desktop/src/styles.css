@@ -177,58 +177,11 @@ body {
 :root[data-shell="mac"] body {
   background: transparent;
 }
-:root[data-shell="mac"] .sidenav {
-  background: var(--veil-rail);
-  /* the traffic lights float over the top-left of the webview (hidden title
-     bar); clear them so the identity row sits below, like a native app */
-  padding-top: 40px;
-}
 :root[data-shell="mac"] .content {
   background: var(--veil);
 }
 :root[data-shell="mac"] .status-bar {
   background: transparent;
-}
-
-.sidenav {
-  width: 216px;
-  flex-shrink: 0;
-  background: var(--panel);
-  border-right: 1px solid var(--line);
-  padding: 18px 10px 12px;
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-}
-
-/* the identity row: mark + wordmark. The wordmark is SANS, not mono — the
-   app's own name is human chrome, and the system's rule is that human chrome
-   is sans while only machine truth is mono. The whole row is the window's
-   drag handle on macOS (see Nav.tsx), so its children take no pointer events. */
-.sidenav-head {
-  display: flex;
-  align-items: center;
-  gap: 9px;
-  padding: 4px 10px 18px;
-  color: var(--ink);
-}
-.sidenav-head > * {
-  pointer-events: none;
-}
-.sidenav-wordmark {
-  font-family: var(--sans);
-  font-size: 14px;
-  font-weight: 600;
-  letter-spacing: -0.01em;
-}
-
-.sidenav ul {
-  list-style: none;
-  margin: 0;
-  padding: 0;
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
 }
 
 .nav-link {
@@ -260,27 +213,6 @@ body {
   background: var(--nav-active);
   color: var(--ink);
   font-weight: 600;
-}
-
-/* a labeled instrument group — readouts you consult, set apart from the
-   workspace above by air and an eyebrow, not a hard rule (the border-top
-   device belongs to the foot alone) */
-.sidenav-section-label {
-  margin-top: 18px;
-  padding: 0 10px 2px;
-  font-family: var(--mono);
-  font-size: 10px;
-  font-weight: 600;
-  text-transform: uppercase;
-  letter-spacing: 0.08em;
-  color: var(--ink-3);
-}
-
-/* settings lives at the bottom, below the day-to-day navigation */
-.sidenav-foot {
-  margin-top: auto;
-  padding-top: 10px;
-  border-top: 1px solid var(--line);
 }
 
 .content {
@@ -399,8 +331,8 @@ input[type="checkbox"] {
   margin: 16px 0;
 }
 
-/* content + dialog buttons (nav buttons are excluded — they live in
-   .sidenav). One quiet, consistent button; the primary action carries a
+/* content + dialog buttons (nav buttons are excluded — they use .nav-link
+   in .app-rail). One quiet, consistent button; the primary action carries a
    little weight. */
 .content button,
 .dialog button {
@@ -422,13 +354,15 @@ input[type="checkbox"] {
   border-color: var(--ink-3);
 }
 .content button[type="submit"],
-.dialog button[type="submit"] {
+.dialog button[type="submit"],
+.content button.primary-action {
   background: var(--ink);
   border-color: var(--ink);
   color: var(--paper);
 }
 .content button[type="submit"]:hover:not(:disabled),
-.dialog button[type="submit"]:hover:not(:disabled) {
+.dialog button[type="submit"]:hover:not(:disabled),
+.content button.primary-action:hover:not(:disabled) {
   opacity: 0.88;
   background: var(--ink);
 }
@@ -758,12 +692,12 @@ input[type="checkbox"] {
 }
 
 /* ============================================================================
-   Orchestrate — session-first layout.
-   An empty session opens on a centered prompt with the composer card mid-
-   screen; once a run starts, the transcript takes over and the same card
-   docks at the bottom. A slim top bar carries the screen eyebrow and the
-   project's absolute path (machine truth — the composer chip shows only
-   the directory name).
+   Studio — setup-first layout.
+   A new session opens on harness setup (project selection, readiness
+   warnings, build progress). Once the harness is ready, the task chat opens
+   with the composer card mid-screen; once a run starts, the transcript takes
+   over and the same card docks at the bottom. A slim top bar carries the
+   screen eyebrow and, during chat, the project's absolute path.
 
    Scoped to the chat screen via :has() so no other screen's layout changes —
    the chat screen owns its own scroll (transcript scrolls; composer stays put).
@@ -860,6 +794,164 @@ input[type="checkbox"] {
   border-color: transparent;
 }
 
+/* --------------------------------------------------------- harness setup -- */
+
+.harness-setup {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 28px;
+}
+.harness-setup-inner {
+  width: min(660px, 100%);
+}
+.harness-kicker {
+  margin: 0 0 8px;
+  font-family: var(--mono);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+  text-align: center;
+}
+.harness-setup h2 {
+  margin: 0;
+  font-size: 25px;
+  font-weight: 650;
+  letter-spacing: -0.01em;
+  line-height: 1.2;
+  text-align: center;
+  text-wrap: balance;
+}
+.harness-setup-status {
+  margin: 10px 0 18px;
+  color: var(--ink-2);
+  font-size: 12.5px;
+  text-align: center;
+}
+.setup-warning {
+  margin: 18px 0;
+  padding: 12px 14px;
+  border: 1px solid var(--caveat-line);
+  border-left: 3px solid var(--caveat-fg);
+  border-radius: var(--radius);
+  background: var(--caveat-bg);
+  color: var(--caveat-fg);
+}
+.setup-warning ul {
+  margin: 6px 0 0;
+  padding-left: 18px;
+  color: var(--ink);
+}
+.setup-warning li {
+  margin: 3px 0;
+}
+.setup-warning-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.harness-panel {
+  margin-top: 22px;
+  padding: 18px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--panel);
+}
+.content .harness-project-static {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 12px 14px;
+  border-radius: var(--radius);
+  background: var(--sunk);
+}
+.content .harness-project-static span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.harness-project-path {
+  display: block;
+  margin: 12px 0 0;
+  padding: 7px 9px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: var(--ink-2);
+  background: var(--sunk);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+}
+.harness-state {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 14px;
+  padding-top: 14px;
+  border-top: 1px solid var(--line);
+  color: var(--ink);
+  font-weight: 600;
+}
+.harness-state-detail {
+  flex-shrink: 0;
+  font-family: var(--mono);
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--ink-3);
+}
+.harness-state-missing,
+.harness-state-stale,
+.harness-state-invalid,
+.harness-state-error {
+  color: var(--caveat-fg);
+}
+.harness-state-ready {
+  color: var(--pass-fg);
+}
+.harness-progress-list {
+  margin: 14px 0 0;
+  padding: 10px 12px;
+  max-height: 190px;
+  overflow-y: auto;
+  list-style: none;
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: var(--ink-2);
+  background: var(--sunk);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+}
+.harness-progress-list li {
+  display: grid;
+  grid-template-columns: minmax(88px, max-content) 1fr;
+  gap: 10px;
+  margin: 0 0 4px;
+}
+.harness-progress-list li:last-child {
+  margin-bottom: 0;
+}
+.harness-progress-list span {
+  color: var(--accent);
+  font-weight: 600;
+}
+.harness-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 16px;
+}
+
 /* ----------------------------------------------------------------- hero -- */
 
 .chat-hero {
@@ -941,8 +1033,11 @@ input[type="checkbox"] {
   gap: 12px;
 }
 
-/* the project chip — where a session gets its workspace */
-.content button.composer-chip {
+/* the project chip — where a session gets its workspace. Read-only: the
+ * project itself is chosen in Rail 1 (ProjectContext), not here — so this
+ * is a <span>, not a <button>, and `-static` drops the old hover affordance
+ * (nothing happens on hover/click anymore). */
+.content .composer-chip {
   display: inline-flex;
   align-items: center;
   gap: 6px;
@@ -955,17 +1050,12 @@ input[type="checkbox"] {
   font-size: 12.5px;
   font-weight: 550;
 }
-.content button.composer-chip:hover:not(:disabled) {
-  background: var(--sunk);
-  border-color: transparent;
-  color: var(--ink);
-}
-.content button.composer-chip span {
+.content .composer-chip span {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.content button.composer-chip svg {
+.content .composer-chip svg {
   flex-shrink: 0;
 }
 
@@ -1280,38 +1370,9 @@ input[type="checkbox"] {
     height: auto;
     min-height: calc(100vh - 26px);
   }
-  .sidenav {
-    width: 100%;
-    flex-direction: row;
-    flex-wrap: wrap;
-    align-items: center;
-    border-right: none;
-    border-bottom: 1px solid var(--line);
-    padding: 10px 12px;
-    gap: 2px;
-  }
-  .sidenav-head {
-    width: 100%;
-    padding: 2px 4px 8px;
-  }
-  .sidenav ul {
-    flex-direction: row;
-    flex-wrap: wrap;
-  }
-  /* in the single-row layout the groups flow inline; the eyebrow would
-     wrap awkwardly, so the grouping goes quiet here */
-  .sidenav-section-label {
-    display: none;
-  }
   .nav-link {
     width: auto;
     padding: 6px 10px;
-  }
-  .sidenav-foot {
-    margin-top: 0;
-    margin-left: auto;
-    padding-top: 0;
-    border-top: none;
   }
   .content {
     padding: 20px 18px 32px;
@@ -1394,3 +1455,41 @@ input[type="checkbox"] {
 .orchestrator-action {
   margin-left: auto;
 }
+
+.harness-panel-screen { padding: 24px 28px; max-width: 720px; }
+.harness-tree-title { margin: 0 0 16px; }
+.harness-tree-root { font-weight: 600; margin-bottom: 8px; }
+.harness-tree { list-style: none; margin: 0 0 20px; padding: 0 0 0 12px; border-left: 1px solid var(--hairline, #333); }
+.harness-tree-row { display: grid; grid-template-columns: 1fr auto minmax(200px, 260px); gap: 12px; align-items: center; padding: 8px 0; }
+.harness-agent-name { font-weight: 500; }
+.harness-agent-classes { display: flex; gap: 4px; flex-wrap: wrap; }
+.harness-class-chip { font-size: 11px; padding: 1px 6px; border-radius: 4px; background: var(--chip-bg, #222); color: var(--muted, #999); }
+.harness-escalation { display: block; margin-top: 8px; }
+.harness-tree-caption { margin-top: 12px; }
+
+/* ---------------------------------------------------------------- app-rail -- */
+.app-rail { display: flex; flex-direction: column; gap: 6px; padding: 12px 10px; width: 200px; min-width: 200px; }
+.app-rail-head { display: flex; align-items: center; gap: 8px; padding: 8px 6px; }
+.app-rail-head > * { pointer-events: none; }
+.app-rail-word { font-weight: 600; }
+.app-rail-label { font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em; color: var(--muted, #999); padding: 8px 6px 2px; }
+.project-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 2px; }
+.project-list-item { display: flex; align-items: center; }
+.project-item { flex: 1; text-align: left; padding: 6px 8px; border-radius: 6px; background: none; border: none; color: inherit; cursor: pointer; }
+.project-item-active { background: var(--active-bg, #26262b); }
+.project-remove { opacity: 0; background: none; border: none; color: var(--muted, #999); cursor: pointer; padding: 0 6px; }
+.project-list-item:hover .project-remove { opacity: 1; }
+.project-add { text-align: left; padding: 6px 8px; background: none; border: none; color: var(--muted, #999); cursor: pointer; }
+.app-rail-foot { margin-top: auto; }
+
+/* ---------------------------------------------------------------- project-rail -- */
+.project-rail { display: flex; flex-direction: column; gap: 4px; padding: 12px 10px; width: 200px; min-width: 200px; border-left: 1px solid var(--hairline, #2a2a2e); }
+.project-rail-empty { color: var(--muted, #999); padding: 16px 12px; }
+.project-rail-head { font-weight: 600; padding: 8px 6px 10px; }
+.section-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 2px; }
+.section-item { width: 100%; text-align: left; padding: 6px 8px; border-radius: 6px; background: none; border: none; color: inherit; cursor: pointer; }
+.section-item-active { background: var(--active-bg, #26262b); }
+
+/* ---------------------------------------------------------------- shell-three-pane -- */
+.shell-three-pane { display: flex; flex-direction: row; align-items: stretch; height: 100%; }
+.shell-three-pane .content { flex: 1; overflow: auto; }
