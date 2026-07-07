@@ -270,6 +270,17 @@ const MIN_TASK_COUNT_FOR_SAVINGS_PASS = 20;
 // remaining "clean" tasks happens to come out.
 const MATERIAL_MEASUREMENT_FAILURE_FRACTION = 0.2;
 
+// Research 2026-07-07 (§3.3, arXiv:2602.07150): single-run pass@1 varies
+// 2.2–6.0pp and has std >1.5pp even at temperature 0, so a clean-subset
+// quality gap SMALLER than this fraction of the clean task count is
+// indistinguishable from measurement noise and must NOT be reported as an
+// ETH-hazard "fail". Above it, the gap is treated as a genuine quality
+// regression. On tiny suites any gap is a large fraction (e.g. 1/2 = 50pp),
+// so aggressive flagging is preserved exactly where the sample is too small
+// to explain the gap as noise. Single-run heuristic; multi-run averaging to
+// buy significance for smaller effects is a deferred follow-up.
+const QUALITY_NOISE_BAND = 0.05;
+
 export interface EvalsRunParams {
   projectDir: string;
   // Full, already-constructed EvalTask objects (setup() closures and all) —
@@ -357,6 +368,10 @@ export interface EvalsReportCard {
   cleanHarnessPassed: number;
   cleanSavingsPct: number | null;
   measurementFailureCount: number;
+  // True when the clean-subset quality gap is within the single-run noise
+  // band (research 2026-07-07 §3.3) — i.e. any harness<baseline gap present
+  // was too small to ground an ETH-hazard "fail". Purely informational.
+  qualityGapWithinNoise: boolean;
 }
 
 // Null-safe running total — same shape as orchestrate.ts's own addCost (and
@@ -877,6 +892,21 @@ export async function runEvals(engine: Engine, params: EvalsRunParams): Promise<
       ? (cleanBaselineCostTotal - cleanHarnessCostTotal) / cleanBaselineCostTotal
       : null;
 
+  // Research 2026-07-07 §3.3: is the clean-subset quality gap large enough to
+  // be a genuine regression rather than single-run noise? A negative gap
+  // (harness >= baseline) is trivially within noise. Guards the ETH-hazard
+  // branch below so a large suite's 1-task wobble can't false-fail.
+  const cleanQualityGap = cleanBaselinePassed - cleanHarnessPassed; // >0 when harness worse
+  const qualityGapWithinNoise =
+    cleanTasks.length === 0 || cleanQualityGap / cleanTasks.length <= QUALITY_NOISE_BAND;
+  if (!qualityHeldClean && qualityGapWithinNoise) {
+    extraNotes.push(
+      `The harness scored below baseline on the clean subset, but the gap ` +
+        `(${cleanBaselinePassed - cleanHarnessPassed}/${cleanTasks.length}) is within the ` +
+        `${Math.round(QUALITY_NOISE_BAND * 100)}% single-run noise band -- treated as quality held, not an ETH hazard.`,
+    );
+  }
+
   let verdict: EvalsReportCard["verdict"];
   if (measurementFailureFractionIsMaterial) {
     // Too corrupted to ground EITHER a "pass" or a "fail" (spec §12.1's own
@@ -891,11 +921,11 @@ export async function runEvals(engine: Engine, params: EvalsRunParams): Promise<
         "failure -- this run is too corrupted to ground a \"pass\" or a \"fail\" verdict in either direction; " +
         "reported as inconclusive rather than trusting the raw pass counts.",
     );
-  } else if (!qualityHeldClean) {
-    // ETH HAZARD (spec §12.1): even on the CLEAN subset (excluding every
-    // measurement failure, on either side), the harness still genuinely
-    // produced tested, applied, oracle-scored fixes that scored worse than
-    // the baseline. Never reported as a savings win, regardless of cost.
+  } else if (!qualityHeldClean && !qualityGapWithinNoise) {
+    // ETH HAZARD (spec §12.1): the harness produced tested, applied,
+    // oracle-scored fixes that scored worse than baseline on the clean subset
+    // by MORE than the noise band (research 2026-07-07 §3.3). A within-noise
+    // gap falls through and is treated as quality held.
     verdict = "fail";
     if (measurementFailureCount > 0) {
       extraNotes.push(
@@ -977,5 +1007,6 @@ export async function runEvals(engine: Engine, params: EvalsRunParams): Promise<
     cleanHarnessPassed,
     cleanSavingsPct,
     measurementFailureCount,
+    qualityGapWithinNoise,
   };
 }
