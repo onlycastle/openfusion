@@ -247,6 +247,17 @@ const DEFAULT_BASELINE_TIMEOUT_MS = 600_000;
 // so a quick CI/demo run can never be mistaken for a real measurement.
 const MIN_TASK_COUNT_FOR_VERDICT = 5;
 
+// Research 2026-07-07 (docs/research/2026-07-07-harness-composition.md §4.2,
+// arXiv:2602.07150 power table): a hazard FLAG and a savings CLAIM need
+// different sample sizes. MIN_TASK_COUNT_FOR_VERDICT (5, above) is the low
+// floor below which even a demo can't ground any consequential verdict; it
+// still gates the cost-hazard flag (a harm signal — flag readily). A savings
+// PASS is a positive claim and demands more: ~20–50 paired tasks (the range
+// this module's own note text already cites). 20 is the conservative lower
+// bound; 30–50 is better for detecting sub-10pp effects. Below this, a
+// priced, quality-held, positive-savings run is still only "inconclusive".
+const MIN_TASK_COUNT_FOR_SAVINGS_PASS = 20;
+
 // Task 4 Fix 2: the fraction of ALL tasks (not just the ones on the "wrong"
 // side of a raw quality gap) that hit a measurement failure before the
 // pipeline stops trusting that run's OWN "fail" conclusion, even if the raw
@@ -646,8 +657,8 @@ function buildNote(opts: {
 }): string {
   const parts: string[] = [];
   parts.push(
-    opts.taskCount < MIN_TASK_COUNT_FOR_VERDICT
-      ? `Sample size ${opts.taskCount} task(s) is below the ${MIN_TASK_COUNT_FOR_VERDICT}-task minimum for a credible savings claim (Anthropic eval guidance — see docs/research/2026-07-04-m6-pricing-eval-verification.md) -- this is a demo, not a claim.`
+    opts.taskCount < MIN_TASK_COUNT_FOR_SAVINGS_PASS
+      ? `Sample size ${opts.taskCount} task(s) is below the ${MIN_TASK_COUNT_FOR_SAVINGS_PASS}-task floor for a credible savings claim (docs/research/2026-07-07-harness-composition.md §4.2) -- a hazard flag can still fire, but a savings PASS cannot. This is a demo, not a claim.`
       : `Sample size: ${opts.taskCount} task(s) (a credible claim wants 20-50 paired tasks; treat this as directional).`,
   );
   parts.push("Cost figures are estimate-class (see engine.orchestrate's own cost.note) -- directional, not exact.");
@@ -929,10 +940,9 @@ export async function runEvals(engine: Engine, params: EvalsRunParams): Promise<
       `${runUnpricedCalls} model call(s) were unpriced -- savings cannot be computed; run with priced models for ` +
         "a savings claim.",
     );
-  } else if (taskCount < MIN_TASK_COUNT_FOR_VERDICT || cleanSavingsPct === null) {
-    // Too few tasks (a demo, not a claim) or an unpriced cost figure on the
-    // clean subset (the savings arithmetic itself is meaningless) — either
-    // way, not enough to stand behind.
+  } else if (taskCount < MIN_TASK_COUNT_FOR_SAVINGS_PASS || cleanSavingsPct === null) {
+    // Too few tasks for a savings CLAIM (a demo, not a claim) or an unpriced
+    // clean-subset cost (the savings arithmetic itself is meaningless).
     verdict = "inconclusive";
   } else if (cleanSavingsPct > 0) {
     verdict = "pass";

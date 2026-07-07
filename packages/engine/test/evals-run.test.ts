@@ -448,6 +448,30 @@ describe("runEvals — sample-size gate", () => {
 
     expect(harnessStatus(dir).evals).toBe("pending");
   });
+
+  it("priced, quality held, positive savings, but between the low floor and the savings-pass floor -> inconclusive", async () => {
+    dir = await makeHarnessFixture();
+    engine = createEngine();
+    engine.frontier.registerAdapter(
+      makeFakeEvalsFrontierAdapter({
+        baselineCorrect: true,
+        harnessCorrect: true,
+        baselineCostUsd: 0.5,
+        harnessCostUsd: 0.05,
+        meter: engine.models.meter,
+      }),
+    );
+
+    // 6 tasks: clears MIN_TASK_COUNT_FOR_VERDICT (5) but below
+    // MIN_TASK_COUNT_FOR_SAVINGS_PASS (20).
+    const tasks: EvalTask[] = Array.from({ length: 6 }, (_, i) => synthEvalTask({ id: `t${i + 1}` }));
+    const report = await runEvals(engine, { projectDir: dir, tasks });
+
+    expect(report.qualityHeld).toBe(true);
+    expect(report.savingsPct!).toBeGreaterThan(0);
+    expect(report.verdict).toBe("inconclusive");
+    expect(harnessStatus(dir).evals).toBe("pending");
+  }, 120_000);
 });
 
 describe("runEvals — ETH hazard", () => {
@@ -860,10 +884,10 @@ describe("runEvals — genuine pass", () => {
       }),
     );
 
-    const tasks: EvalTask[] = Array.from({ length: 5 }, (_, i) => synthEvalTask({ id: `t${i + 1}` }));
+    const tasks: EvalTask[] = Array.from({ length: 20 }, (_, i) => synthEvalTask({ id: `t${i + 1}` }));
     const report = await runEvals(engine, { projectDir: dir, tasks });
 
-    expect(report.taskCount).toBe(5);
+    expect(report.taskCount).toBe(20);
     expect(report.qualityHeld).toBe(true);
     expect(report.savingsPct).toBeCloseTo(0.9, 5);
     expect(report.verdict).toBe("pass");
@@ -876,7 +900,7 @@ describe("runEvals — genuine pass", () => {
     expect(report.cleanBaselinePassed).toBe(report.baseline.passed);
     expect(report.cleanHarnessPassed).toBe(report.harness.passed);
     expect(report.cleanSavingsPct).toBeCloseTo(report.savingsPct!, 5);
-  }, 30_000);
+  }, 120_000);
 });
 
 describe("runEvals — eval scratch dir placement + cleanup", () => {
