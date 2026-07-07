@@ -65,20 +65,36 @@ routing as unproven against your project until then.
 
 `engine.evals.run` produces a baseline-vs-harness report card: a direct frontier session
 (no harness, no wiki) solves each task alongside the full orchestrate loop, both scored
-by the same oracle (the repo's own test suite). The report card carries three verdicts:
+by the same oracle (the repo's own test suite). The verdict is **two-dimensional** (quality
+*and* cost, per `docs/research/2026-07-07-harness-composition.md` §0/§4) and
+**significance-aware** (a single-run quality wobble inside a noise band is not treated as
+a regression). The report card carries three verdicts:
 
-- **pass**: the harness held quality on all clean tasks (no measurement failures), saved
-  cost, and the sample size is ≥5 tasks (a credible claim wants 20–50). Manifest flips to
-  verified. This is the only report that ships as a savings win.
-- **fail**: the harness *degraded* quality below baseline on the clean subset — a genuine
-  ETH hazard (generated context can hurt). Flagged and never shipped, regardless of cost.
-  This check deliberately ignores the sample-size minimum below: a quality regression is
-  worth flagging even on a small run, since it only ever blocks a claim, never inflates one.
-- **inconclusive**: one of: (1) too few tasks (<5 is a demo, not a claim); (2) unpriced
-  cost figures (an unknown model or no cost data → no savings number → no claim);
-  (3) baseline solved zero tasks (nothing to hold quality against);
-  (4) ≥20% of tasks hit measurement failures (infra hiccups, apply mismatches — the run
-  is too corrupted to ground a verdict in either direction).
+- **pass**: the harness held quality on the clean subset (no measurement failures) — or
+  the quality gap was within the single-run noise band — actually cost less than the
+  baseline, every cost figure is priced, and the sample size is ≥20 tasks (a credible claim
+  wants 20–50; see "Sample size guidance" below). Manifest flips to verified. This is the
+  only report that ships as a savings win.
+- **fail**: an ETH hazard on either axis, flagged and never shipped:
+  - *quality hazard* — the harness *degraded* quality below baseline on the clean subset by
+    more than a 5-percentage-point single-run noise band (single-run pass@1 has std >1.5pp
+    even at temperature 0 — a smaller gap reads as noise, not a real regression). This check
+    deliberately ignores the task-count floor entirely: a quality regression is worth
+    flagging even on a small run, since it only ever blocks a claim, never inflates one.
+  - *cost hazard* — the harness held quality (or was within the noise band) but cost ≥10%
+    **more** than the no-harness baseline on the clean subset, at ≥5 priced tasks. Holding
+    quality while costing materially more is the ETH failure mode itself (the study's own
+    finding: quality held, cost +~20%), not a neutral result — flagged even though nothing
+    about quality "failed."
+- **inconclusive**: one of: (1) fewer than 20 tasks (a hazard flag can still fire on a
+  smaller run — the quality hazard has no floor at all, the cost hazard needs ≥5 — but a
+  savings *pass* cannot); (2) unpriced cost figures (an unknown model or no cost data → no
+  savings number → no claim); (3) baseline solved zero tasks (nothing to hold quality
+  against); (4) ≥20% of tasks hit measurement failures (infra hiccups, apply mismatches —
+  the run is too corrupted to ground a verdict in either direction); (5) quality held (or
+  within noise), priced, ≥20 tasks, but the harness didn't actually save money (a real cost
+  increase under the 10% hazard threshold, or no savings at all) — not a hazard, but not a
+  "saves cost" claim either.
 
 **Cost figures are estimate-class** — computed from the pricing table and reported token
 usage, not a billed amount. Treat as directional. They carry a `pricingConfidence` field
@@ -87,10 +103,14 @@ provider's API), `provider-reported` (official docs), `secondary` (research), `u
 (guess), or `unpriced` (unknown model). A single unpriced call taints the savings claim
 to `inconclusive`.
 
-**Sample size guidance** (Anthropic evaluation practice): 20–50 paired tasks make a
-credible claim. A v1 CI smoke run uses synthetic fixture tasks (mechanics verification);
-a real claim requires the operator smoke (`OPENFUSION_EVALS_SMOKE=1 pnpm test`) over
-repo-mined golden tasks (commits adding code without tests, or tests verifying a bug fix).
+**Sample size guidance** (Anthropic evaluation practice, sharpened by
+`docs/research/2026-07-07-harness-composition.md` §4.2): 20–50 paired tasks make a
+credible *savings* claim; the hazard-flag floor is deliberately lower (≥5 for the cost
+hazard, no floor at all for the quality hazard) because a harm signal should be flagged
+readily while a positive claim needs enough tasks to clear the noise band. A v1 CI smoke
+run uses synthetic fixture tasks (mechanics verification); a real savings claim requires
+the operator smoke (`OPENFUSION_EVALS_SMOKE=1 pnpm test`) over ≥20 repo-mined golden tasks
+(commits adding code without tests, or tests verifying a bug fix).
 
 **Two documented residual biases** (both directions, so numbers are read honestly):
 
