@@ -1,4 +1,4 @@
-import { useCallback, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useProject } from "../ProjectContext";
 import {
   EngineError,
@@ -7,7 +7,9 @@ import {
   type CancellableRun,
   type EvalsProgressEvent,
   type EvalsReportCard,
+  type EvalsRunRecord,
   type EvalsTaskDescriptor,
+  type OrchestrateRunRecord,
 } from "../engineClient";
 
 /** Renders a rejection as a short, user-facing sentence — never a stack
@@ -34,6 +36,28 @@ function formatUsd(value: number | null): string {
  * format call). */
 function formatPct(value: number | null): string {
   if (value === null) return "not computable";
+  return `${(value * 100).toFixed(1)}%`;
+}
+
+/** Narrows one `engine.runs.list` record to the `"evals"` kind — the RPC's
+ * `records` field is a loose union (`EvalsRunRecord | OrchestrateRunRecord |
+ * Record<string, unknown>`, see engineClient.ts's own drift caveat) even
+ * though this screen always passes `kind: "evals"` in its request; filtering
+ * again here is a defensive belt-and-suspenders against a future engine
+ * change that ever widened what an "evals"-filtered response could contain. */
+function isEvalsRunRecord(
+  record: EvalsRunRecord | OrchestrateRunRecord | Record<string, unknown>,
+): record is EvalsRunRecord {
+  return (record as { kind?: unknown }).kind === "evals";
+}
+
+/** The History strip's own savings format: an em dash for `null` (never a
+ * fake number), otherwise a percentage to one decimal — deliberately
+ * distinct from `formatPct`'s longer "not computable" prose, which reads
+ * fine inline in the full report card but would be too wide for a compact
+ * history row. */
+function formatHistorySavings(value: number | null): string {
+  if (value === null) return "—";
   return `${(value * 100).toFixed(1)}%`;
 }
 
@@ -187,8 +211,47 @@ export function EvalsScreen() {
   const [progress, setProgress] = useState<ProgressEntry[]>([]);
   const [report, setReport] = useState<EvalsReportCard | null>(null);
   const [runError, setRunError] = useState<string | null>(null);
+  const [evalsHistory, setEvalsHistory] = useState<EvalsRunRecord[]>([]);
 
   const runRef = useRef<CancellableRun<EvalsReportCard> | null>(null);
+
+  // The history fetch below resolves against whichever project is CURRENT
+  // when it settles, not whichever was current when it started — re-picking
+  // a project mid-flight must not let a slower, stale response (e.g. A's
+  // runsList landing after B's, once projectDir has moved on to B) overwrite
+  // the screen with the wrong project's history. Mirrors OrchestrateScreen's
+  // projectDirRef guard / HarnessSettingPanel's activeProjectDirRef guard —
+  // the house stale-guard pattern (see this file's own Task 5 history-strip
+  // code below for where it's actually checked).
+  const projectDirRef = useRef<string | null>(null);
+  projectDirRef.current = projectDir;
+
+  /** Fetches the last 10 `"evals"`-kind ledger records for `dir` and, if
+   * `dir` is still the active project once the call settles, replaces the
+   * History strip's contents. History is best-effort chrome (Task 5 brief):
+   * a rejection renders nothing — never a screen-level error state — so the
+   * `.catch` below deliberately does not touch any state at all (there is
+   * nothing to reconcile; the stale-guard above is what protects the ONE
+   * branch that does write state). */
+  const loadHistory = useCallback((dir: string) => {
+    engineClient
+      .runsList(dir, "evals", 10)
+      .then((res) => {
+        if (projectDirRef.current !== dir) return;
+        setEvalsHistory(res.records.filter(isEvalsRunRecord));
+      })
+      .catch(() => {
+        // best-effort chrome — see this function's own doc comment above.
+      });
+  }, []);
+
+  // Fetch on load AND whenever the active project changes — clears the prior
+  // project's rows immediately so a project switch never briefly shows a
+  // foreign project's history while the new fetch is in flight.
+  useEffect(() => {
+    setEvalsHistory([]);
+    if (projectDir) loadHistory(projectDir);
+  }, [projectDir, loadHistory]);
 
   const isBusy = phase === "running" || phase === "cancelling";
   const tasks = parseTasks(commitShasText, testCommandText);
@@ -217,6 +280,13 @@ export function EvalsScreen() {
       .then((res) => {
         setReport(res);
         setPhase("done");
+        // The engine's evals write point (evals/methods.ts) records a ledger
+        // entry ONLY on success (never on a thrown/cancelled run — see that
+        // module's own comment on why there's no error-path record) — so a
+        // refetch belongs here, not in the catch branch below. `loadHistory`
+        // re-checks `projectDirRef` itself before writing any state, so this
+        // is safe even if the active project has since moved on.
+        loadHistory(projectDir);
       })
       .catch((err: unknown) => {
         if (err instanceof RunCancelledError) {
@@ -226,7 +296,7 @@ export function EvalsScreen() {
         setRunError(friendlyMessage(err));
         setPhase("error");
       });
-  }, [projectDir, commitShasText, testCommandText, isBusy]);
+  }, [projectDir, commitShasText, testCommandText, isBusy, loadHistory]);
 
   // Guarded on `phase === "running"` (not just the button's `disabled`
   // attribute) so a second Cancel click can never issue a second `cancel()`
@@ -393,6 +463,22 @@ export function EvalsScreen() {
 
           <p className="muted-text">{report.note}</p>
         </>
+      )}
+
+      {evalsHistory.length > 0 && (
+        <section className="evals-history">
+          <h2>History</h2>
+          <ul className="evals-history-list">
+            {evalsHistory.map((record, index) => (
+              <li key={`${record.runId ?? record.at}-${index}`} className="evals-history-row">
+                <span className="evals-history-date">{new Date(record.at).toLocaleString()}</span>
+                <span className={`outcome-badge evals-history-verdict-${record.verdict}`}>{record.verdict}</span>
+                <span className="evals-history-savings">{formatHistorySavings(record.savingsPct)}</span>
+                <span className="evals-history-tasks">{record.taskCount} tasks</span>
+              </li>
+            ))}
+          </ul>
+        </section>
       )}
     </section>
   );

@@ -16,8 +16,9 @@ vi.mock("../ProjectContext", () => ({ useProject: () => useProjectMock() }));
 // `runEvals`. `importOriginal` keeps `EngineError`/`RunCancelledError` real
 // so `instanceof` checks inside the component work against the same classes
 // these tests construct.
-const { runEvalsMock } = vi.hoisted(() => ({
+const { runEvalsMock, runsListMock } = vi.hoisted(() => ({
   runEvalsMock: vi.fn(),
+  runsListMock: vi.fn(),
 }));
 
 vi.mock("../engineClient", async (importOriginal) => {
@@ -26,12 +27,13 @@ vi.mock("../engineClient", async (importOriginal) => {
     ...actual,
     engineClient: {
       runEvals: runEvalsMock,
+      runsList: runsListMock,
     },
   };
 });
 
 import { EvalsScreen } from "./EvalsScreen";
-import { EngineError, RunCancelledError, type EvalsReportCard } from "../engineClient";
+import { EngineError, RunCancelledError, type EvalsReportCard, type EvalsRunRecord } from "../engineClient";
 
 function reportFixture(overrides: Partial<EvalsReportCard> = {}): EvalsReportCard {
   return {
@@ -72,6 +74,30 @@ function reportFixture(overrides: Partial<EvalsReportCard> = {}): EvalsReportCar
   };
 }
 
+/** One `"evals"`-kind run-ledger record, as `engineClient.runsList` resolves
+ * it (Task 5). Mirrors the engine's `RunRecordSchema` "evals" branch
+ * (packages/engine/src/runs/ledger.ts) — kept minimal here since the History
+ * strip only reads `at`/`verdict`/`savingsPct`/`taskCount`. */
+function evalsRecordFixture(overrides: Partial<EvalsRunRecord> = {}): EvalsRunRecord {
+  return {
+    v: 1,
+    kind: "evals",
+    at: "2026-07-02T09:00:00.000Z",
+    taskCount: 8,
+    verdict: "pass",
+    savingsPct: 0.42,
+    cleanSavingsPct: 0.42,
+    qualityHeld: true,
+    qualityGapWithinNoise: false,
+    pricingConfidence: "verified",
+    measurementFailureCount: 0,
+    perTask: [],
+    note: "",
+    durationMs: 1000,
+    ...overrides,
+  };
+}
+
 /** A controllable stand-in for `CancellableRun<EvalsReportCard>`: tests drive
  * `resolve`/`reject` directly instead of waiting on a real engine call, and
  * assert against the `cancel` spy. */
@@ -90,6 +116,11 @@ beforeEach(() => {
   useProjectMock.mockReset();
   useProjectMock.mockReturnValue({ activeProjectDir: "/r/alpha" });
   runEvalsMock.mockReset();
+  // The screen now fetches history on mount (Task 5) — every pre-existing
+  // test that doesn't care about history needs a default empty-resolving
+  // mock so it doesn't have to know about `runsList` at all.
+  runsListMock.mockReset();
+  runsListMock.mockResolvedValue({ records: [], skipped: 0 });
 });
 
 /** The active project is already set via `ProjectContext` (mocked to
@@ -576,5 +607,94 @@ describe("EvalsScreen", () => {
 
     fireEvent.change(screen.getByLabelText(/test command/i), { target: { value: "npm test" } });
     expect(runButton().disabled).toBe(false);
+  });
+
+  describe("evals history strip (Task 5)", () => {
+    it("renders a History section with rows in the RPC's own (newest-first) order, verdict badges, and formatted savings", async () => {
+      const records: EvalsRunRecord[] = [
+        evalsRecordFixture({ at: "2026-07-02T09:00:00.000Z", verdict: "pass", savingsPct: 0.567, taskCount: 5 }),
+        evalsRecordFixture({ at: "2026-07-01T09:00:00.000Z", verdict: "fail", savingsPct: null, taskCount: 3 }),
+      ];
+      runsListMock.mockResolvedValue({ records, skipped: 0 });
+
+      await setUpRunnableForm();
+
+      await screen.findByRole("heading", { name: /^history$/i });
+      const rows = document.querySelectorAll(".evals-history-row");
+      expect(rows).toHaveLength(2);
+      expect(rows[0]?.textContent).toMatch(/pass/i);
+      expect(rows[0]?.textContent).toMatch(/56\.7%/);
+      expect(rows[0]?.textContent).toMatch(/5 tasks/);
+      expect(rows[1]?.textContent).toMatch(/fail/i);
+      expect(rows[1]?.textContent).toMatch(/—/);
+      expect(rows[1]?.textContent).toMatch(/3 tasks/);
+
+      expect(runsListMock).toHaveBeenCalledWith("/r/alpha", "evals", 10);
+    });
+
+    it("shows no History heading when runsList resolves with empty records", async () => {
+      runsListMock.mockResolvedValue({ records: [], skipped: 0 });
+
+      await setUpRunnableForm();
+      await waitFor(() => expect(runsListMock).toHaveBeenCalled());
+
+      expect(screen.queryByRole("heading", { name: /^history$/i })).toBeNull();
+    });
+
+    it("renders normally (no crash, no History, no error) when runsList rejects — best-effort chrome, never an error state", async () => {
+      runsListMock.mockRejectedValue(new Error("boom"));
+
+      await setUpRunnableForm();
+      await waitFor(() => expect(runsListMock).toHaveBeenCalled());
+
+      expect(screen.queryByRole("heading", { name: /^history$/i })).toBeNull();
+      expect(screen.queryByRole("alert")).toBeNull();
+      // The rest of the screen still renders fine.
+      expect(screen.getByText("/r/alpha")).toBeTruthy();
+    });
+
+    it("refetches history after a run completes", async () => {
+      await setUpRunnableForm();
+      await waitFor(() => expect(runsListMock).toHaveBeenCalledTimes(1));
+
+      const controllable = makeControllableRun();
+      runEvalsMock.mockReturnValueOnce(controllable);
+      fireEvent.click(screen.getByRole("button", { name: /run evals/i }));
+
+      act(() => controllable.resolve(reportFixture()));
+      await waitFor(() => expect(screen.getByText(/harness holds quality/i)).toBeTruthy());
+
+      await waitFor(() => expect(runsListMock.mock.calls.length).toBeGreaterThanOrEqual(2));
+      const lastCall = runsListMock.mock.calls[runsListMock.mock.calls.length - 1];
+      expect(lastCall?.[0]).toBe("/r/alpha");
+      expect(lastCall?.[1]).toBe("evals");
+    });
+
+    it("stale-guards the history fetch: a slow response for a project no longer active must not overwrite the new project's history", async () => {
+      let resolveA!: (value: { records: EvalsRunRecord[]; skipped: number }) => void;
+      const pendingA = new Promise<{ records: EvalsRunRecord[]; skipped: number }>((resolve) => {
+        resolveA = resolve;
+      });
+      runsListMock.mockReturnValueOnce(pendingA);
+      useProjectMock.mockReturnValue({ activeProjectDir: "/proj/A" });
+      const { rerender } = render(<EvalsScreen />);
+      await waitFor(() => expect(runsListMock).toHaveBeenCalledTimes(1));
+
+      // Switch to project B before A's fetch resolves — B's own fetch
+      // resolves immediately with empty history.
+      runsListMock.mockResolvedValueOnce({ records: [], skipped: 0 });
+      useProjectMock.mockReturnValue({ activeProjectDir: "/proj/B" });
+      rerender(<EvalsScreen />);
+      await waitFor(() => expect(runsListMock).toHaveBeenCalledTimes(2));
+
+      // NOW resolve A's slow response with a non-empty record — must be
+      // dropped, not painted under project B's now-active screen.
+      await act(async () => {
+        resolveA({ records: [evalsRecordFixture()], skipped: 0 });
+        await Promise.resolve();
+      });
+
+      expect(screen.queryByRole("heading", { name: /^history$/i })).toBeNull();
+    });
   });
 });

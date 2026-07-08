@@ -427,6 +427,72 @@ export interface EvalsReportCard {
   measurementFailureCount: number;
 }
 
+// ---------------------------------------------------------------------------
+// Task 5: engine.runs.list — a thin read over the project's run ledger
+// (packages/engine/src/runs/ledger.ts). Same hand-mirror posture and drift
+// caveat as `WikiBuildStats`/`EvalsReportCard` above: `RunRecordSchema`'s
+// full discriminated union has FOUR branches (orchestrate/evals/generate/
+// card); only the two the desktop actually renders today (`EvalsScreen`'s
+// History strip reads `EvalsRunRecord`) are hand-mirrored here.
+// `OrchestrateRunRecord` is mirrored alongside it (a future Orchestrate-
+// screen history view is the obvious next consumer) even though nothing
+// reads it yet — `generate`/`card` records are left as the loose
+// `Record<string, unknown>` fallback in `runsList`'s return type below since
+// no screen renders them.
+// ---------------------------------------------------------------------------
+
+export type RunRecordKind = "orchestrate" | "evals" | "generate" | "card";
+
+/** Mirrors the `"evals"` branch of `RunRecordSchema` (ledger.ts). */
+export interface EvalsRunRecord {
+  v: 1;
+  kind: "evals";
+  at: string;
+  taskCount: number;
+  verdict: "pass" | "fail" | "inconclusive";
+  savingsPct: number | null;
+  cleanSavingsPct: number | null;
+  qualityHeld: boolean;
+  qualityGapWithinNoise: boolean;
+  pricingConfidence: string;
+  measurementFailureCount: number;
+  perTask: Array<{
+    id: string;
+    baselinePassed: boolean;
+    harnessPassed: boolean;
+    harnessOutcome: string;
+    baselineOutcome: string;
+  }>;
+  note: string;
+  durationMs: number;
+  runId?: string;
+}
+
+/** Mirrors the `"orchestrate"` branch of `RunRecordSchema` (ledger.ts). */
+export interface OrchestrateRunRecord {
+  v: 1;
+  kind: "orchestrate";
+  at: string;
+  taskClass: string;
+  agent: string;
+  workerModel: string;
+  attempts: number;
+  outcome: "worker-approved" | "escalated" | "failed" | "error";
+  escalated: boolean;
+  reviews: Array<{ decision: "approve" | "request-changes"; reasons: string[] }>;
+  contextBranch: "approved-card" | "build-and-test-fallback" | "none";
+  toolCallCounts?: Record<string, number>;
+  cost: {
+    workerUsd: number | null;
+    reviewUsd: number | null;
+    escalateUsd: number | null;
+    totalUsd: number | null;
+  };
+  durationMs: number;
+  runId?: string;
+  errorCategory?: "no-harness" | "load-failed" | "cancelled" | "unknown";
+}
+
 // -- runOrchestrate/runEvals request params (runId is minted internally —
 // see `#startCancellableRun` — so it is deliberately NOT part of either
 // caller-facing params type below) ------------------------------------------
@@ -625,6 +691,22 @@ export class EngineClient {
    * `engine.harness.card.approve` for why it skips `mutateHarness`). */
   harnessCardApprove(projectDir: string, opts?: CallOptions): Promise<void> {
     return this.call<void>("engine.harness.card.approve", { projectDir }, opts);
+  }
+
+  /** `engine.runs.list` — a plain, non-mutating read over the project's run
+   * ledger. Returns records in the RPC's own newest-first order (callers
+   * must not re-sort). Best-effort chrome, not load-bearing: unlike the
+   * other methods above, a caller (e.g. EvalsScreen's History strip) is
+   * expected to treat a rejection here as "render nothing", never a
+   * screen-level error state — same posture as the ledger's own `recordRun`
+   * on the write side (see ledger.ts's header comment). */
+  runsList(
+    projectDir: string,
+    kind?: RunRecordKind,
+    limit?: number,
+    opts?: CallOptions,
+  ): Promise<{ records: Array<EvalsRunRecord | OrchestrateRunRecord | Record<string, unknown>>; skipped: number }> {
+    return this.call("engine.runs.list", { projectDir, kind, limit }, opts);
   }
 
   // -- cancellable long runs (M7c Task 2) ----------------------------------
