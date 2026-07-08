@@ -4,7 +4,7 @@ import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { RpcErrorCodes } from "@openfusion/shared";
 import { createEngine, type Engine } from "../src/engine.js";
-import type { AgentDef, HarnessBundle, Manifest, Routing, WikiPage } from "../src/harness/schema.js";
+import { CARD_SLUG, type AgentDef, type HarnessBundle, type Manifest, type Routing, type WikiPage } from "../src/harness/schema.js";
 import { writeHarness } from "../src/harness/store.js";
 
 let dir: string;
@@ -258,6 +258,112 @@ describe("engine.harness.export — agents-md", () => {
     // strip every escaped "\|" first so only real column delimiters remain.
     const delimiterCount = (rosterLines[0]!.replace(/\\\|/g, "").match(/\|/g) ?? []).length;
     expect(delimiterCount).toBe(5);
+  });
+});
+
+const CARD_DIGEST = "Build with `pnpm build`; test with `pnpm test` — extracted straight from package.json scripts.";
+const CARD_BODY = "# Project Card\n\nHand-approved summary of how to build, test, and navigate this repo.\n";
+
+function cardPage(): WikiPage {
+  return { slug: CARD_SLUG, title: "Project Card", digest: CARD_DIGEST, body: CARD_BODY };
+}
+
+describe("engine.harness.export — agents-md project card", () => {
+  it("leads with the Project card section, directive, and digest before Project summary when the card is approved", async () => {
+    makeDir();
+    engine = createEngine();
+    const base = validBundle();
+    await writeHarness(dir, {
+      ...base,
+      pages: [...base.pages, cardPage()],
+      manifest: validManifest({ verification: { structural: "pass", evals: "pending", card: "approved" } }),
+    });
+
+    const res = await call("engine.harness.export", { projectDir: dir, format: "agents-md" });
+    expect(res.error).toBeUndefined();
+
+    const content = readFileSync(path.join(dir, "AGENTS.md"), "utf8");
+
+    expect(content).toContain("## Project card");
+    expect(content).toContain(
+      "Commands here are statically extracted, not execution-verified; if one fails, treat `package.json` scripts / CI workflows as ground truth.",
+    );
+    expect(content).toContain(CARD_DIGEST);
+    expect(content).toContain("Hand-approved summary of how to build, test, and navigate this repo.");
+
+    const cardIndex = content.indexOf("## Project card");
+    const summaryIndex = content.indexOf("## Project summary");
+    expect(cardIndex).toBeGreaterThan(-1);
+    expect(summaryIndex).toBeGreaterThan(-1);
+    expect(cardIndex).toBeLessThan(summaryIndex);
+
+    // The card-led branch does not replace the UNVERIFIED caveat gate — it
+    // still gates on evals, independently of card approval.
+    expect(content).toMatch(/UNVERIFIED/);
+  });
+
+  it("still omits the UNVERIFIED caveat once evals pass, even with an approved card", async () => {
+    makeDir();
+    engine = createEngine();
+    const base = validBundle();
+    await writeHarness(dir, {
+      ...base,
+      pages: [...base.pages, cardPage()],
+      manifest: validManifest({ verification: { structural: "pass", evals: "pass", card: "approved" } }),
+    });
+
+    await call("engine.harness.export", { projectDir: dir, format: "agents-md" });
+    const content = readFileSync(path.join(dir, "AGENTS.md"), "utf8");
+
+    expect(content).toContain("## Project card");
+    expect(content).not.toMatch(/UNVERIFIED/);
+  });
+
+  it("emits no Project card section, and leaves output byte-identical to a harness with no card, while the card is still draft", async () => {
+    makeDir();
+    engine = createEngine();
+    const base = validBundle();
+
+    await writeHarness(dir, base);
+    await call("engine.harness.export", { projectDir: dir, format: "agents-md" });
+    const withoutCard = readFileSync(path.join(dir, "AGENTS.md"), "utf8");
+
+    await writeHarness(dir, {
+      ...base,
+      pages: [...base.pages, cardPage()],
+      manifest: validManifest({ verification: { structural: "pass", evals: "pending", card: "draft" } }),
+    });
+    await call("engine.harness.export", { projectDir: dir, format: "agents-md" });
+    const withDraftCard = readFileSync(path.join(dir, "AGENTS.md"), "utf8");
+
+    expect(withDraftCard).toEqual(withoutCard);
+    expect(withDraftCard).not.toContain("## Project card");
+    // Draft card still doesn't touch the UNVERIFIED gate.
+    expect(withDraftCard).toMatch(/UNVERIFIED/);
+  });
+
+  it("emits no Project card section when verification.card is approved but no card page exists on the bundle", async () => {
+    makeDir();
+    engine = createEngine();
+    const base = validBundle();
+
+    await writeHarness(dir, base);
+    await call("engine.harness.export", { projectDir: dir, format: "agents-md" });
+    const withoutCard = readFileSync(path.join(dir, "AGENTS.md"), "utf8");
+
+    // Manifest claims approved, but no CARD_SLUG page is present — the
+    // both-exist discipline must still suppress the section.
+    await writeHarness(
+      dir,
+      validBundle({
+        manifest: validManifest({ verification: { structural: "pass", evals: "pending", card: "approved" } }),
+      }),
+    );
+    await call("engine.harness.export", { projectDir: dir, format: "agents-md" });
+    const withApprovedFlagNoPage = readFileSync(path.join(dir, "AGENTS.md"), "utf8");
+
+    expect(withApprovedFlagNoPage).toEqual(withoutCard);
+    expect(withApprovedFlagNoPage).not.toContain("## Project card");
   });
 });
 

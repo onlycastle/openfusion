@@ -1,7 +1,7 @@
 import { mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { stringify as stringifyYaml } from "yaml";
-import type { AgentDef, HarnessBundle, WikiPage } from "./schema.js";
+import { CARD_SLUG, type AgentDef, type HarnessBundle, type WikiPage } from "./schema.js";
 
 // The two interop targets M4 Task 5 produces. `agents-md` is the emerging
 // cross-tool convention (a single project-root file any agent CLI can read);
@@ -81,6 +81,29 @@ function renderAgentsMd(bundle: HarnessBundle): string {
 
   if (bundle.manifest.verification.evals !== "pass") {
     lines.push(UNVERIFIED_CAVEAT);
+    lines.push("");
+  }
+
+  // Card-led export (spec §6): both the wiki page (CARD_SLUG) AND
+  // manifest.verification.card === "approved" must hold — the same
+  // both-exist discipline orchestrate.ts's buildWorkerContext uses for
+  // worker-prompt injection. Only then does the card lead the file, ahead of
+  // "## Project summary". A draft card, or an "approved" manifest flag with
+  // no matching page (e.g. hand-edited away), gets NO section here: the
+  // export stays byte-identical to a harness with no card at all — never a
+  // degraded/partial rendering of its own. This gate is independent of the
+  // UNVERIFIED caveat above (which gates harness trust, not card trust).
+  const card = findPage(bundle, CARD_SLUG);
+  if (card !== undefined && bundle.manifest.verification.card === "approved") {
+    const CARD_DIRECTIVE =
+      "> Commands here are statically extracted, not execution-verified; if one fails, treat `package.json` scripts / CI workflows as ground truth.";
+    lines.push("## Project card");
+    lines.push("");
+    lines.push(CARD_DIRECTIVE);
+    lines.push("");
+    lines.push(card.digest);
+    lines.push("");
+    lines.push(card.body.trim());
     lines.push("");
   }
 
