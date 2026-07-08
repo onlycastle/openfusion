@@ -52,7 +52,7 @@ export interface StrippedItem {
 }
 
 const SCRIPT_RUN_RE = /^(?:pnpm|npm) run (\S+)/;
-const YARN_RUN_RE = /^yarn (\S+)/;
+const YARN_RUN_RE = /^yarn (?:run )?(\S+)/;
 const MAKE_RUN_RE = /^(?:make|just) (\S+)/;
 
 function scriptNameOf(command: string): string | undefined {
@@ -187,18 +187,30 @@ type SectionKey = "commands" | "env" | "boundaries" | "anchors" | "glossary" | "
 // generate/orchestrate layer) prepends the "## Project card: <title>"
 // heading. Priority order is fixed: Commands, Environment, Do not touch, Key
 // locations, Glossary, Gotchas. If the composed text exceeds the 2500-char
-// injection budget, whole trailing sections are dropped in soft-priority
-// order — glossary, then gotchas, then anchors ("Key locations") — never
-// commands/env/boundaries (spec §3.2: those are never truncated). The
-// schema's per-field maxes make it very unlikely for commands+env+boundaries
-// alone to exceed the budget, but the final slice below is a defensive last
-// resort (not a throw) so this function's "≤2500 guaranteed" contract holds
-// even for a pathological every-field-maxed input.
+// injection budget, whole trailing sections are dropped first in
+// soft-priority order — glossary, then gotchas, then anchors ("Key
+// locations"). commands/env/boundaries are never dropped as whole sections
+// (spec §3.2: those are never truncated) — but the schema's per-field maxes
+// mean commands+env+boundaries ALONE can still exceed 2500 chars (worst case
+// with every field maxed: ~1676 + ~753 + ~634 ≈ 3067, comfortably over
+// budget). For that case, boundaries — never-truncated, highest-value
+// content per spec §3.2 — must not be cut mid-string: instead we drop whole
+// ITEMS, last-item-first, from `boundaries`, then (if still over) from
+// `env`, re-rendering after each drop, until the digest fits. `commands` is
+// never touched by item-wise dropping either. This always converges: a
+// single maxed boundaries/env item is only ~100-120 chars, and
+// commands-alone maxes out around 1676 chars — well under 2500 — so
+// item-wise dropping brings the digest under budget long before commands is
+// the only thing left. The final slice below is therefore dead-code
+// insurance for the "≤2500 guaranteed" contract, not an expected code path.
 export function composeCardDigest(content: CardContent): string {
+  const boundaries = [...content.boundaries];
+  const env = [...content.env];
+
   const sections: Record<SectionKey, string | null> = {
     commands: commandsSection(content.commands),
-    env: envSection(content.env),
-    boundaries: boundariesSection(content.boundaries),
+    env: envSection(env),
+    boundaries: boundariesSection(boundaries),
     anchors: anchorsSection(content.anchors),
     glossary: glossarySection(content.glossary),
     gotchas: gotchasSection(content.gotchas),
@@ -220,9 +232,26 @@ export function composeCardDigest(content: CardContent): string {
     digest = render();
   }
 
-  // Defensive-only (see comment above): guarantees ≤2500 even if
-  // commands+env+boundaries alone somehow overflow the budget, rather than
-  // throwing out of a content-composition function.
+  // Item-wise trimming (see function comment): whole-section trimming above
+  // only ever removes glossary/gotchas/anchors, so if the digest is STILL
+  // over budget the overflow can only be coming from commands+env+boundaries
+  // themselves. Drop boundaries items last-first (never touching commands),
+  // then env items last-first, re-rendering after each single drop so we
+  // stop the instant it fits.
+  while (digest.length > MAX_DIGEST_CHARS && boundaries.length > 0) {
+    boundaries.pop();
+    sections.boundaries = boundariesSection(boundaries);
+    digest = render();
+  }
+  while (digest.length > MAX_DIGEST_CHARS && env.length > 0) {
+    env.pop();
+    sections.env = envSection(env);
+    digest = render();
+  }
+
+  // Truly-unreachable fallback (see function comment): dead-code insurance
+  // for the "≤2500 guaranteed" contract, not a throw, in case a future
+  // schema change ever makes commands alone exceed the budget.
   if (digest.length > MAX_DIGEST_CHARS) {
     digest = digest.slice(0, MAX_DIGEST_CHARS);
   }

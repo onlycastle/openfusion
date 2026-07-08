@@ -54,6 +54,22 @@ function maxGlossaryEntry(i: number): { term: string; meaning: string } {
   };
 }
 
+function maxBoundary(i: number): string {
+  return `boundary-${i}-${"b".repeat(100)}`.slice(0, 100);
+}
+
+// 80 chars, not the schema's full 120-char max. With 8 max-length commands
+// (~1676 chars) and 6 max-length (100-char) boundaries (~634 chars) already
+// in the mix, a full 6-item run of 120-char env strings leaves so little
+// headroom (~69 chars) that even a single 100-char boundary item can't
+// survive item-wise trimming — the fixture would degenerate to "every
+// boundary dropped" instead of exercising "some dropped, some kept intact".
+// 80 chars leaves enough room for a couple of boundaries to survive, which
+// is the behavior this test exists to verify.
+function wideEnv(i: number): string {
+  return `env-${i}-${"e".repeat(80)}`.slice(0, 80);
+}
+
 describe("validateCardContent", () => {
   it("keeps a command that exactly matches a mined command", () => {
     makeDir();
@@ -74,6 +90,30 @@ describe("validateCardContent", () => {
     const { content: result, stripped } = validateCardContent(content, { mined: [], projectDir: dir });
 
     expect(result.commands).toEqual([{ command: "pnpm run lint", why: "lint" }]);
+    expect(stripped).toEqual([]);
+  });
+
+  it("keeps an unmined `yarn run <script>` command whose script exists in package.json (yarn.lock present)", () => {
+    makeDir();
+    writeFixtureFile("package.json", JSON.stringify({ name: "root", scripts: { lint: "eslint ." } }));
+    writeFixtureFile("yarn.lock", "");
+    const content = baseContent({ commands: [{ command: "yarn run lint", why: "lint" }] });
+
+    const { content: result, stripped } = validateCardContent(content, { mined: [], projectDir: dir });
+
+    expect(result.commands).toEqual([{ command: "yarn run lint", why: "lint" }]);
+    expect(stripped).toEqual([]);
+  });
+
+  it("keeps an unmined plain `yarn <script>` command (no `run`) whose script exists in package.json", () => {
+    makeDir();
+    writeFixtureFile("package.json", JSON.stringify({ name: "root", scripts: { lint: "eslint ." } }));
+    writeFixtureFile("yarn.lock", "");
+    const content = baseContent({ commands: [{ command: "yarn lint", why: "lint" }] });
+
+    const { content: result, stripped } = validateCardContent(content, { mined: [], projectDir: dir });
+
+    expect(result.commands).toEqual([{ command: "yarn lint", why: "lint" }]);
     expect(stripped).toEqual([]);
   });
 
@@ -205,6 +245,60 @@ describe("composeCardDigest", () => {
       expect(digest).toContain(c.command);
     }
     expect(digest.length).toBeLessThanOrEqual(2500);
+  });
+
+  it("drops boundaries items last-first, never mid-string, when maxed commands+env+boundaries alone push the digest over 2500 chars", () => {
+    const commands = Array.from({ length: 8 }, (_, i) => maxCommand(i));
+    const env = Array.from({ length: 6 }, (_, i) => wideEnv(i));
+    const boundaries = Array.from({ length: 6 }, (_, i) => maxBoundary(i));
+    const content = baseContent({ commands, env, boundaries });
+
+    // Sanity check on the fixture itself: this input must actually overflow
+    // the budget for the test to mean anything, and it must overflow from
+    // commands+env+boundaries ALONE (no glossary/gotchas/anchors present, so
+    // the whole-section trim loop has nothing to drop).
+    const withoutTrimming = [
+      "### Commands",
+      ...commands.map((c) => `- \`${c.command}\` — ${c.why}`),
+      "### Environment",
+      ...env.map((e) => `- ${e}`),
+      "### Do not touch",
+      ...boundaries.map((b) => `- ${b}`),
+    ].join("\n");
+    expect(withoutTrimming.length).toBeGreaterThan(2500);
+
+    const digest = composeCardDigest(content);
+
+    expect(digest.length).toBeLessThanOrEqual(2500);
+
+    // Commands: never touched by item-wise dropping — every command string
+    // present verbatim.
+    expect(digest).toContain("Commands");
+    for (const c of commands) {
+      expect(digest).toContain(c.command);
+    }
+
+    // Environment: dropping only reaches env "if needed after boundaries" —
+    // in this fixture, dropping boundaries items alone is enough, so env is
+    // untouched. Every env string present verbatim.
+    expect(digest).toContain("Environment");
+    for (const e of env) {
+      expect(digest).toContain(e);
+    }
+
+    // Boundaries: section present with FEWER items than the input, but
+    // every REMAINING item intact verbatim — no mid-string cut. Extract the
+    // rendered "Do not touch" block (the last section in this fixture) and
+    // check each rendered line is an exact, complete input boundary string.
+    expect(digest).toContain("Do not touch");
+    const boundariesBlock = digest.split("### Do not touch\n")[1] ?? "";
+    const renderedBoundaryLines = boundariesBlock.split("\n").filter((l) => l.length > 0);
+    expect(renderedBoundaryLines.length).toBeGreaterThan(0);
+    expect(renderedBoundaryLines.length).toBeLessThan(boundaries.length);
+    for (const line of renderedBoundaryLines) {
+      expect(line.startsWith("- ")).toBe(true);
+      expect(boundaries).toContain(line.slice(2));
+    }
   });
 });
 
