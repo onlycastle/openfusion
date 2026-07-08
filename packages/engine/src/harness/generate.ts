@@ -29,8 +29,8 @@ import { HarnessGenError, promptForJson } from "./driver.js";
 import {
   AgentDefSchema,
   HarnessBundleSchema,
+  PROSE_PAGE_SLUGS,
   RoutingSchema,
-  WIKI_PAGE_SLUGS,
   validateHarness,
   type WikiPage,
 } from "./schema.js";
@@ -66,11 +66,11 @@ const OverviewSchema = z.object({
 type Overview = z.infer<typeof OverviewSchema>;
 
 // Matches WikiPageSchema's title/digest/body fields exactly (digest's
-// 1200-char ceiling included) — slug is NOT part of this schema because the
-// pipeline assigns it itself from WIKI_PAGE_SLUGS, never from model output.
+// 2500-char ceiling included) — slug is NOT part of this schema because the
+// pipeline assigns it itself from PROSE_PAGE_SLUGS, never from model output.
 const PageContentSchema = z.object({
   title: z.string().min(1),
-  digest: z.string().min(1).max(1200),
+  digest: z.string().min(1).max(2500),
   body: z.string(),
 });
 
@@ -79,7 +79,7 @@ const AgentsRoutingSchema = z.object({
   routing: RoutingSchema,
 });
 
-const PAGE_FOCUS: Record<(typeof WIKI_PAGE_SLUGS)[number], string> = {
+const PAGE_FOCUS: Record<(typeof PROSE_PAGE_SLUGS)[number], string> = {
   architecture:
     "Focus this page on system architecture: the major components, how they fit together, and how data flows between them.",
   subsystems:
@@ -148,7 +148,7 @@ function buildOverviewPrompt(): string {
   ].join("\n\n");
 }
 
-function buildPagePrompt(slug: (typeof WIKI_PAGE_SLUGS)[number], overview: Overview): string {
+function buildPagePrompt(slug: (typeof PROSE_PAGE_SLUGS)[number], overview: Overview): string {
   return [
     `You are writing the "${slug}" wiki page of this repository's AI coding harness.`,
     "Use the repository overview below as context — do NOT re-explore the repository; write directly from this context.",
@@ -295,7 +295,7 @@ export async function generateHarness(engine: Engine, projectDir: string): Promi
     const overview = overviewResult.value;
 
     const pages: WikiPage[] = [];
-    for (const slug of WIKI_PAGE_SLUGS) {
+    for (const slug of PROSE_PAGE_SLUGS) {
       const stage = `page:${slug}`;
       notify(stage, `generating the "${slug}" wiki page`);
       const pageResult = await promptForJson(session, buildPagePrompt(slug, overview), PageContentSchema, {

@@ -12,7 +12,7 @@ import type {
   FrontierSession,
 } from "../src/engines/types.js";
 import { loadHarness } from "../src/harness/store.js";
-import { WIKI_PAGE_SLUGS } from "../src/harness/schema.js";
+import { PROSE_PAGE_SLUGS } from "../src/harness/schema.js";
 
 let dir: string;
 let engine: Engine;
@@ -168,11 +168,11 @@ const AGENTS_ROUTING = {
 };
 
 // One script per promptForJson call, in pipeline order: overview, then the
-// 4 wiki pages (WIKI_PAGE_SLUGS order), then agents-routing.
+// 4 wiki pages (PROSE_PAGE_SLUGS order), then agents-routing.
 function happyScripts(): FrontierEvent[][] {
   return [
     jsonScript(OVERVIEW),
-    ...WIKI_PAGE_SLUGS.map((slug) => jsonScript(pageValue(slug))),
+    ...PROSE_PAGE_SLUGS.map((slug) => jsonScript(pageValue(slug))),
     jsonScript(AGENTS_ROUTING),
   ];
 }
@@ -204,7 +204,7 @@ describe("engine.harness.generate — happy path (scripted fake adapter)", () =>
     const bundle = loadHarness(dir);
     expect(bundle).not.toBeNull();
     expect(bundle!.pages).toHaveLength(4);
-    expect(bundle!.pages.map((p) => p.slug).sort()).toEqual([...WIKI_PAGE_SLUGS].sort());
+    expect(bundle!.pages.map((p) => p.slug).sort()).toEqual([...PROSE_PAGE_SLUGS].sort());
     expect(bundle!.agents).toHaveLength(2);
     expect(bundle!.manifest.verification).toEqual({ structural: "pass", evals: "pending" });
     expect(bundle!.manifest.generatorVersion).toBe(ENGINE_VERSION);
@@ -329,7 +329,7 @@ describe("engine.harness.generate — validation-retry path", () => {
     const scripts = [
       badJsonScript(),
       jsonScript(OVERVIEW),
-      ...WIKI_PAGE_SLUGS.map((slug) => jsonScript(pageValue(slug))),
+      ...PROSE_PAGE_SLUGS.map((slug) => jsonScript(pageValue(slug))),
       jsonScript(AGENTS_ROUTING),
     ];
     engine.frontier.registerAdapter(makeScriptedAdapter({ scripts }));
@@ -392,7 +392,7 @@ describe("engine.harness.generate — hard failure (retry exhaustion)", () => {
     };
     const scripts = [
       jsonScript(OVERVIEW),
-      ...WIKI_PAGE_SLUGS.map((slug) => jsonScript(pageValue(slug))),
+      ...PROSE_PAGE_SLUGS.map((slug) => jsonScript(pageValue(slug))),
       jsonScript(badRouting),
     ];
     engine.frontier.registerAdapter(makeScriptedAdapter({ scripts, closeSpy }));
@@ -425,7 +425,7 @@ describe("engine.harness.generate — driver notice passthrough", () => {
         textEvent("```json\n" + JSON.stringify(OVERVIEW) + "\n```"),
         resultEvent(),
       ],
-      ...WIKI_PAGE_SLUGS.map((slug) => jsonScript(pageValue(slug))),
+      ...PROSE_PAGE_SLUGS.map((slug) => jsonScript(pageValue(slug))),
       jsonScript(AGENTS_ROUTING),
     ];
     engine.frontier.registerAdapter(makeScriptedAdapter({ scripts }));

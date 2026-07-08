@@ -25,9 +25,15 @@ vi.mock("node:fs/promises", async (importOriginal) => {
   };
 });
 
-const { harnessDir, harnessStatus, loadHarness, writeHarness, setEvalsVerdict, HarnessValidationError } = await import(
-  "../src/harness/store.js"
-);
+const {
+  harnessDir,
+  harnessStatus,
+  loadHarness,
+  writeHarness,
+  setEvalsVerdict,
+  setCardState,
+  HarnessValidationError,
+} = await import("../src/harness/store.js");
 
 let dir: string;
 afterEach(() => {
@@ -487,7 +493,13 @@ describe("loadHarness", () => {
 describe("harnessStatus", () => {
   it("reports present: false with null fields when absent", () => {
     makeDir();
-    expect(harnessStatus(dir)).toEqual({ present: false, structural: null, evals: null, headSha: null });
+    expect(harnessStatus(dir)).toEqual({
+      present: false,
+      structural: null,
+      evals: null,
+      headSha: null,
+      card: null,
+    });
   });
 
   it("reports manifest fields without requiring wiki/agents/routing to be readable", async () => {
@@ -502,6 +514,7 @@ describe("harnessStatus", () => {
       structural: "pass",
       evals: "pending",
       headSha: "abc123",
+      card: null,
     });
   });
 
@@ -516,7 +529,25 @@ describe("harnessStatus", () => {
       structural: "fail",
       evals: "fail",
       headSha: "abc123",
+      card: null,
     });
+  });
+
+  it("surfaces card: \"draft\" when the manifest was written with verification.card set", async () => {
+    makeDir();
+    await writeHarness(
+      dir,
+      validBundle({
+        manifest: validManifest({ verification: { structural: "pass", evals: "pending", card: "draft" } }),
+      }),
+    );
+    expect(harnessStatus(dir).card).toBe("draft");
+  });
+
+  it("surfaces card: null on a legacy manifest (no verification.card field at all)", async () => {
+    makeDir();
+    await writeHarness(dir, validBundle());
+    expect(harnessStatus(dir).card).toBeNull();
   });
 });
 
@@ -558,5 +589,47 @@ describe("setEvalsVerdict", () => {
   it("throws HarnessValidationError when no harness has been generated yet", async () => {
     makeDir();
     await expect(setEvalsVerdict(dir, "pass")).rejects.toThrow(HarnessValidationError);
+  });
+});
+
+describe("setCardState", () => {
+  it("updates ONLY manifest.verification.card, preserving evals + structural + artifacts + every other field", async () => {
+    makeDir();
+    const bundle = validBundle();
+    await writeHarness(dir, bundle);
+    const before = JSON.parse(readFileSync(path.join(dir, ".openfusion/manifest.json"), "utf8")) as Manifest;
+    expect(before.verification).toEqual({ structural: "pass", evals: "pending" });
+
+    await setCardState(dir, "approved");
+
+    const after = JSON.parse(readFileSync(path.join(dir, ".openfusion/manifest.json"), "utf8")) as Manifest;
+    expect(after.verification).toEqual({ structural: "pass", evals: "pending", card: "approved" });
+    expect(after.artifacts).toEqual(before.artifacts);
+    expect(after.headSha).toBe(before.headSha);
+    expect(after.generatedAt).toBe(before.generatedAt);
+    expect(after.schemaVersion).toBe(before.schemaVersion);
+    expect(after.generatorVersion).toBe(before.generatorVersion);
+    expect(after.engine).toBe(before.engine);
+
+    // Only manifest.json was touched -- every wiki/agent/routing file this
+    // generation wrote is untouched (still present, still readable).
+    expect(loadHarness(dir)).not.toBeNull();
+  });
+
+  it('flips from "draft" to "approved"', async () => {
+    makeDir();
+    await writeHarness(
+      dir,
+      validBundle({ manifest: validManifest({ verification: { structural: "pass", evals: "pending", card: "draft" } }) }),
+    );
+    expect(harnessStatus(dir).card).toBe("draft");
+
+    await setCardState(dir, "approved");
+    expect(harnessStatus(dir).card).toBe("approved");
+  });
+
+  it("throws HarnessValidationError when no harness has been generated yet", async () => {
+    makeDir();
+    await expect(setCardState(dir, "approved")).rejects.toThrow(HarnessValidationError);
   });
 });

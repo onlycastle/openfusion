@@ -1,8 +1,10 @@
 import { describe, expect, it } from "vitest";
 import {
   AgentDefSchema,
+  CARD_SLUG,
   HarnessBundleSchema,
   ManifestSchema,
+  PROSE_PAGE_SLUGS,
   RoutingSchema,
   WIKI_PAGE_SLUGS,
   WikiPageSchema,
@@ -67,6 +69,21 @@ function validBundle(): HarnessBundle {
     routing: validRouting(),
   };
 }
+
+describe("WIKI_PAGE_SLUGS / PROSE_PAGE_SLUGS / CARD_SLUG", () => {
+  it("WIKI_PAGE_SLUGS contains the project card slug; PROSE_PAGE_SLUGS does not", () => {
+    expect(WIKI_PAGE_SLUGS).toContain(CARD_SLUG);
+    expect(PROSE_PAGE_SLUGS).not.toContain(CARD_SLUG);
+  });
+
+  it("WIKI_PAGE_SLUGS is exactly the four prose pages plus the card, in that order", () => {
+    expect(WIKI_PAGE_SLUGS).toEqual([...PROSE_PAGE_SLUGS, CARD_SLUG]);
+  });
+
+  it('CARD_SLUG is "project-card"', () => {
+    expect(CARD_SLUG).toBe("project-card");
+  });
+});
 
 describe("ManifestSchema", () => {
   it("accepts a well-formed manifest", () => {
@@ -142,6 +159,44 @@ describe("ManifestSchema", () => {
       expect(result.data.artifacts).toEqual([]);
     }
   });
+
+  it("accepts and round-trips verification.card: \"draft\"", () => {
+    const result = ManifestSchema.safeParse({
+      ...validManifest(),
+      verification: { ...validManifest().verification, card: "draft" },
+    });
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.verification.card).toBe("draft");
+    }
+  });
+
+  it('accepts and round-trips verification.card: "approved"', () => {
+    const result = ManifestSchema.safeParse({
+      ...validManifest(),
+      verification: { ...validManifest().verification, card: "approved" },
+    });
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.verification.card).toBe("approved");
+    }
+  });
+
+  it("parses a manifest WITHOUT verification.card (legacy — card stays undefined, not defaulted)", () => {
+    const result = ManifestSchema.safeParse(validManifest());
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.verification.card).toBeUndefined();
+    }
+  });
+
+  it("rejects an invalid verification.card value", () => {
+    const result = ManifestSchema.safeParse({
+      ...validManifest(),
+      verification: { ...validManifest().verification, card: "maybe" },
+    });
+    expect(result.success).toBe(false);
+  });
 });
 
 describe("WikiPageSchema", () => {
@@ -175,12 +230,12 @@ describe("WikiPageSchema", () => {
     expect(WikiPageSchema.safeParse(validPage({ title: "" })).success).toBe(false);
   });
 
-  it("accepts a digest at exactly the 1200-char ceiling", () => {
-    expect(WikiPageSchema.safeParse(validPage({ digest: "x".repeat(1200) })).success).toBe(true);
+  it("accepts a digest at exactly the 2500-char ceiling", () => {
+    expect(WikiPageSchema.safeParse(validPage({ digest: "x".repeat(2500) })).success).toBe(true);
   });
 
-  it("rejects a digest over the 1200-char ceiling", () => {
-    expect(WikiPageSchema.safeParse(validPage({ digest: "x".repeat(1201) })).success).toBe(false);
+  it("rejects a digest over the 2500-char ceiling", () => {
+    expect(WikiPageSchema.safeParse(validPage({ digest: "x".repeat(2501) })).success).toBe(false);
   });
 
   it("rejects an empty digest", () => {
