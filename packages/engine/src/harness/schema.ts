@@ -1,17 +1,31 @@
 import { z } from "zod";
 
-// Canonical wiki page set the generation pipeline (M4 Task 4) produces one
-// page per slug for. Kept here — not enforced as an enum on WikiPageSchema
-// itself — because the schema also has to accept/validate pages loaded back
-// off disk, and a hand-edited harness (spec §7.4, the Harness editor) is
-// allowed to carry additional or renamed pages without failing structural
-// validation.
-export const WIKI_PAGE_SLUGS = [
+// The four frontier-generated prose pages (M4 Task 4) — each gets one page
+// per slug, written straight from the frontier's page-generation stage. Kept
+// here — not enforced as an enum on WikiPageSchema itself — because the
+// schema also has to accept/validate pages loaded back off disk, and a
+// hand-edited harness (spec §7.4, the Harness editor) is allowed to carry
+// additional or renamed pages without failing structural validation.
+export const PROSE_PAGE_SLUGS = [
   "architecture",
   "subsystems",
   "conventions",
   "build-and-test",
 ] as const;
+
+// The human-approved "Project Card" page (spec §3.1, §3.4) — the only wiki
+// page that is ALWAYS injected into every worker prompt, distinct from the
+// four prose pages above which are consulted on demand. Its own generation
+// stage (drafting + the approval gate) arrives in a later task; this slug is
+// introduced now so WIKI_PAGE_SLUGS, the manifest's approval field, and the
+// store's setCardState all agree on its name from day one.
+export const CARD_SLUG = "project-card" as const;
+
+// Every wiki page slug the harness can carry: the four prose pages plus the
+// project card. Not enforced as an enum on WikiPageSchema itself (see above)
+// — a hand-edited harness may carry additional or renamed pages without
+// failing structural validation.
+export const WIKI_PAGE_SLUGS = [...PROSE_PAGE_SLUGS, CARD_SLUG] as const;
 
 // Shared by every artifact name/slug field (wiki page slugs, agent names):
 // lowercase alphanumeric segments joined by single hyphens, no leading/
@@ -40,6 +54,14 @@ export const ManifestSchema = z.object({
     // ETH hazard gate (spec §12.1): stays "pending" until M6's eval loop
     // runs baseline-vs-harness and flips it. Never silently trusted.
     evals: z.enum(["pending", "pass", "fail"]),
+    // Human-approval gate for the project-card wiki page (spec §3.4):
+    // "draft" until a human reviews and approves it, then "approved". A
+    // missing card is a LEGACY manifest — written before this field existed,
+    // or before the card stage (a later task) exists at all — and carries no
+    // card semantics whatsoever (harnessStatus surfaces this as `card:
+    // null`, not "draft"). OPTIONAL, never `.default(...)`, specifically so
+    // "never had a card" and "has a card, still in draft" stay distinguishable.
+    card: z.enum(["draft", "approved"]).optional(),
   }),
   // Relative POSIX paths (under `.openfusion/`, e.g. "routing.yaml",
   // "wiki/architecture.md", "agents/coder.yaml") of every harness artifact
@@ -60,10 +82,13 @@ export const WikiPageSchema = z.object({
   slug: kebabString(),
   title: z.string().min(1),
   // The token-budgeted summary agents actually consume (wiki digests are
-  // injected into worker prompts, not the full page body) — 1200 chars is
-  // the hard ceiling that keeps a 4-page digest set cheap regardless of
-  // model context window.
-  digest: z.string().min(1).max(1200),
+  // injected into worker prompts, not the full page body) — 2500 chars is
+  // the hard ceiling for a SINGLE digest injection (spec §3.1): unlike the
+  // four prose pages (consulted on demand, so their digests stay small — see
+  // generate.ts's buildPagePrompt), the project-card page is the one digest
+  // injected into EVERY worker prompt unconditionally, so it alone gets the
+  // wider budget.
+  digest: z.string().min(1).max(2500),
   body: z.string(),
 });
 export type WikiPage = z.infer<typeof WikiPageSchema>;

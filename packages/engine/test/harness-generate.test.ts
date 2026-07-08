@@ -11,8 +11,8 @@ import type {
   FrontierPromptHandle,
   FrontierSession,
 } from "../src/engines/types.js";
-import { loadHarness } from "../src/harness/store.js";
-import { WIKI_PAGE_SLUGS } from "../src/harness/schema.js";
+import { harnessStatus, loadHarness } from "../src/harness/store.js";
+import { CARD_SLUG, PROSE_PAGE_SLUGS } from "../src/harness/schema.js";
 
 let dir: string;
 let engine: Engine;
@@ -28,6 +28,17 @@ function makeRepo(prefix = "of-harness-gen-"): string {
   execFileSync("git", ["-C", d, "config", "user.email", "t@t"]);
   execFileSync("git", ["-C", d, "config", "user.name", "t"]);
   writeFileSync(path.join(d, "x.ts"), "export function xray() {}\nxray();\n");
+  // A minimal manifest so mineCommands (M4 task 2/4) has something real to
+  // mine: no lockfile is present, so detectPackageManager defaults to "npm"
+  // and this "test" script is mined as the command `npm run test` (source
+  // "package.json:scripts.test") — the card stage's scripted response below
+  // (CARD_CONTENT) deliberately proposes this exact command so it survives
+  // validateCardContent's cross-check, alongside an unmined `npm run ghost`
+  // that must get stripped (no "ghost" script exists in this manifest).
+  writeFileSync(
+    path.join(d, "package.json"),
+    JSON.stringify({ name: "of-harness-gen-fixture", scripts: { test: "echo test" } }, null, 2) + "\n",
+  );
   execFileSync("git", ["-C", d, "add", "-A"]);
   execFileSync("git", ["-C", d, "commit", "-qm", "init"]);
   return d;
@@ -132,6 +143,25 @@ function pageValue(slug: string) {
   };
 }
 
+// Valid CardContentSchema JSON (M4 task 4's project-card stage): one command
+// that matches the fixture repo's mined command exactly (`npm run test`, see
+// makeRepo) — this one must survive validateCardContent — and one command
+// naming a script that does not exist in any manifest (`npm run ghost`) —
+// this one must be stripped, exercising the brief's stripping assertion in
+// the happy path.
+const CARD_CONTENT = {
+  title: "Project Card",
+  commands: [
+    { command: "npm run test", why: "run the test suite" },
+    { command: "npm run ghost", why: "a command that does not actually exist" },
+  ],
+  env: [],
+  boundaries: [],
+  anchors: [],
+  glossary: [],
+  gotchas: [],
+};
+
 const AGENTS_ROUTING = {
   agents: [
     {
@@ -168,11 +198,13 @@ const AGENTS_ROUTING = {
 };
 
 // One script per promptForJson call, in pipeline order: overview, then the
-// 4 wiki pages (WIKI_PAGE_SLUGS order), then agents-routing.
+// 4 wiki pages (PROSE_PAGE_SLUGS order), then the project card (mining runs
+// in between but makes no promptForJson call of its own), then agents-routing.
 function happyScripts(): FrontierEvent[][] {
   return [
     jsonScript(OVERVIEW),
-    ...WIKI_PAGE_SLUGS.map((slug) => jsonScript(pageValue(slug))),
+    ...PROSE_PAGE_SLUGS.map((slug) => jsonScript(pageValue(slug))),
+    jsonScript(CARD_CONTENT),
     jsonScript(AGENTS_ROUTING),
   ];
 }
@@ -189,7 +221,7 @@ describe("engine.harness.generate — happy path (scripted fake adapter)", () =>
     expect(res.error).toBeUndefined();
 
     const result = res.result;
-    expect(result.pages).toBe(4);
+    expect(result.pages).toBe(5);
     expect(result.agents).toBe(2);
     expect(result.reportCard).toEqual({ structural: "pass", evals: "pending" });
     expect(result.note).toContain("UNVERIFIED");
@@ -199,18 +231,37 @@ describe("engine.harness.generate — happy path (scripted fake adapter)", () =>
     expect(Array.isArray(result.files)).toBe(true);
     expect(result.files).toContain(path.join(".openfusion", "manifest.json"));
     expect(result.files).toContain(path.join(".openfusion", "routing.yaml"));
+    expect(result.files).toContain(path.join(".openfusion", "wiki", "project-card.md"));
+
+    // The unmined `npm run ghost` command must have been stripped at
+    // generation (validateCardContent, M4 task 3) — surfaced on the result
+    // so the desktop review panel (spec §3.4) can show it.
+    expect(Array.isArray(result.cardStripped)).toBe(true);
+    expect(result.cardStripped.some((s: { item: string }) => s.item === "npm run ghost")).toBe(true);
 
     // Files actually on disk, loaded back through the store (M4 task 2).
     const bundle = loadHarness(dir);
     expect(bundle).not.toBeNull();
-    expect(bundle!.pages).toHaveLength(4);
-    expect(bundle!.pages.map((p) => p.slug).sort()).toEqual([...WIKI_PAGE_SLUGS].sort());
+    expect(bundle!.pages).toHaveLength(5);
+    expect(bundle!.pages.map((p) => p.slug).sort()).toEqual([...PROSE_PAGE_SLUGS, CARD_SLUG].sort());
     expect(bundle!.agents).toHaveLength(2);
-    expect(bundle!.manifest.verification).toEqual({ structural: "pass", evals: "pending" });
+    expect(bundle!.manifest.verification).toEqual({ structural: "pass", evals: "pending", card: "draft" });
     expect(bundle!.manifest.generatorVersion).toBe(ENGINE_VERSION);
     expect(bundle!.manifest.engine).toBe("claude-code");
     expect(bundle!.manifest.headSha).toHaveLength(40);
     expect(bundle!.routing.escalation.failuresBeforeFrontier).toBe(2);
+
+    // The project card page's on-disk digest keeps the trusted, mined
+    // command and drops the stripped one entirely (not just from the
+    // manifest bookkeeping — from the actual injected digest text).
+    const cardPage = bundle!.pages.find((p) => p.slug === CARD_SLUG);
+    expect(cardPage).toBeDefined();
+    expect(cardPage!.digest).toContain("npm run test");
+    expect(cardPage!.digest).not.toContain("ghost");
+
+    // The card's human-approval gate (spec §3.4) starts at "draft" — never
+    // auto-approved by generation itself.
+    expect(harnessStatus(dir).card).toBe("draft");
 
     // Stage notification sequence, in order — exactly the 8 stages the task
     // brief enumerates, one each, though a stage may now emit MORE than one
@@ -228,14 +279,25 @@ describe("engine.harness.generate — happy path (scripted fake adapter)", () =>
       "page:subsystems",
       "page:conventions",
       "page:build-and-test",
+      "mine",
+      "page:project-card",
       "agents-routing",
       "write",
       "verify",
     ]);
-    // Every promptForJson-backed stage (overview, the 4 pages,
-    // agents-routing) now emits at least one extra "attempt: ..." relay on
-    // top of its own START line.
-    for (const stage of ["overview", "page:architecture", "page:subsystems", "page:conventions", "page:build-and-test", "agents-routing"]) {
+    // Every promptForJson-backed stage (overview, the 4 pages, the project
+    // card, agents-routing) now emits at least one extra "attempt: ..."
+    // relay on top of its own START line. "mine" is not promptForJson-backed
+    // (mineCommands makes no LLM call) so it's deliberately excluded here.
+    for (const stage of [
+      "overview",
+      "page:architecture",
+      "page:subsystems",
+      "page:conventions",
+      "page:build-and-test",
+      "page:project-card",
+      "agents-routing",
+    ]) {
       const forStage = harnessNotices.filter((n) => (n.params as { stage: string }).stage === stage);
       expect(forStage.length).toBeGreaterThanOrEqual(2);
       expect(forStage.some((n) => (n.params as { detail: string }).detail.startsWith("attempt:"))).toBe(true);
@@ -318,6 +380,29 @@ describe("engine.harness.generate — happy path (scripted fake adapter)", () =>
     expect(capturedPrompts[1]).toContain(OVERVIEW.summary);
     expect(capturedPrompts[1]!.toLowerCase()).toContain("do not re-explore");
   }, 30_000);
+
+  // Final review Fix 3 (prompt contract): the card prompt must tell the
+  // model to echo a mined command back VERBATIM rather than reformatting it
+  // (extra flags, reworded quoting, ...) — validateCardContent's
+  // commandResolves check (card.ts) only trusts an EXACT string match
+  // against the mined list, so a reformatted-but-otherwise-correct mined
+  // command was previously indistinguishable from an invented one and got
+  // silently stripped. This test pins the instruction's presence in the
+  // actual prompt text sent to the model.
+  it("the card prompt instructs the model to echo mined commands verbatim, not reformatted", async () => {
+    dir = makeRepo();
+    engine = createEngine();
+    const capturedPrompts: string[] = [];
+    engine.frontier.registerAdapter(makeScriptedAdapter({ scripts: happyScripts(), capturedPrompts }));
+
+    await call("engine.harness.generate", { projectDir: dir });
+    // capturedPrompts order: overview(0), 4 prose pages(1-4), card(5),
+    // agents-routing(6) — see happyScripts's own doc comment for this exact
+    // ordering.
+    const cardPrompt = capturedPrompts[5]!;
+    expect(cardPrompt).toContain("Project Card");
+    expect(cardPrompt.toLowerCase()).toContain("verbatim");
+  }, 30_000);
 });
 
 describe("engine.harness.generate — validation-retry path", () => {
@@ -329,14 +414,15 @@ describe("engine.harness.generate — validation-retry path", () => {
     const scripts = [
       badJsonScript(),
       jsonScript(OVERVIEW),
-      ...WIKI_PAGE_SLUGS.map((slug) => jsonScript(pageValue(slug))),
+      ...PROSE_PAGE_SLUGS.map((slug) => jsonScript(pageValue(slug))),
+      jsonScript(CARD_CONTENT),
       jsonScript(AGENTS_ROUTING),
     ];
     engine.frontier.registerAdapter(makeScriptedAdapter({ scripts }));
 
     const res = await call("engine.harness.generate", { projectDir: dir });
     expect(res.error).toBeUndefined();
-    expect(res.result.pages).toBe(4);
+    expect(res.result.pages).toBe(5);
     expect(res.result.agents).toBe(2);
 
     const bundle = loadHarness(dir);
@@ -392,7 +478,8 @@ describe("engine.harness.generate — hard failure (retry exhaustion)", () => {
     };
     const scripts = [
       jsonScript(OVERVIEW),
-      ...WIKI_PAGE_SLUGS.map((slug) => jsonScript(pageValue(slug))),
+      ...PROSE_PAGE_SLUGS.map((slug) => jsonScript(pageValue(slug))),
+      jsonScript(CARD_CONTENT),
       jsonScript(badRouting),
     ];
     engine.frontier.registerAdapter(makeScriptedAdapter({ scripts, closeSpy }));
@@ -425,7 +512,8 @@ describe("engine.harness.generate — driver notice passthrough", () => {
         textEvent("```json\n" + JSON.stringify(OVERVIEW) + "\n```"),
         resultEvent(),
       ],
-      ...WIKI_PAGE_SLUGS.map((slug) => jsonScript(pageValue(slug))),
+      ...PROSE_PAGE_SLUGS.map((slug) => jsonScript(pageValue(slug))),
+      jsonScript(CARD_CONTENT),
       jsonScript(AGENTS_ROUTING),
     ];
     engine.frontier.registerAdapter(makeScriptedAdapter({ scripts }));

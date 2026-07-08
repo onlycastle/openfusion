@@ -20,36 +20,61 @@ Harness generation (M4) drives a frontier session over the indexed repo to
 produce a committable `.openfusion/` harness — an LLM wiki, a specialist
 agent roster, and a routing policy — gated by structural validation at
 generation time; the eval loop that flips `verification.evals` from
-`"pending"` to `"pass"` lands in M6. Two exporters turn that harness into
-interop artifacts other tools can read: an `AGENTS.md` project brief and
+`"pending"` to `"pass"` lands in M6. Generation also mines commands
+deterministically (`package.json` scripts, Makefile/justfile targets, CI
+workflow steps), then a frontier model selects and annotates them into a
+**Project Card** — a wiki page that starts in `"draft"` state and is
+statically validated (unresolvable paths/symbols/scripts are stripped, not
+silently kept). A draft card is a proposal only: it must be reviewed and
+explicitly **approved** in the desktop app's Harness setting panel before it
+is ever injected into a worker prompt. Two exporters turn the harness into
+interop artifacts other tools can read: an `AGENTS.md` project brief (led by
+the approved card, when there is one, plus a ground-truth directive) and
 per-agent Claude Code subagents under `.claude/agents/`. Orchestration (M5b)
 now composes that harness into the full harness-fusion loop end to end:
 `engine.orchestrate` classifies a task, routes it to a specialist agent,
-runs an open model worker inside an isolated git worktree, and gates the
-resulting diff behind a frontier review — retrying once before escalating to
-a write-scoped frontier session — and `engine.orchestrate.apply` lands an
-approved diff into the base tree. See "How the loop works" below for the
-full flow and its caveats (cost estimates are directional, the harness
+runs an open model worker inside an isolated git worktree — handing it
+**only** the approved Project Card's digest as repo context (a draft or
+legacy harness without a card falls back to the build-and-test page digest
+alone; a harness with neither injects nothing), plus on-demand `wiki_query`/
+`wiki_map` tools against the symbol index — and gates the resulting diff
+behind a frontier review — retrying once before escalating to a
+write-scoped frontier session — and `engine.orchestrate.apply` lands an
+approved diff into the base tree. That injection design is deliberate, not
+minimal-effort: an ETH Zurich + DeepMind study (arXiv:2602.11988) found that
+blanket LLM-generated context injection measurably hurts both success rate
+and inference cost, so only human-approved content is trusted unconditionally
+— everything else is retrieval-on-demand. See "How the loop works" below for
+the full flow and its caveats (cost estimates are directional, the harness
 driving it is unverified until M6, and nothing ever auto-merges).
 
 ## Generating a harness
 
-    engine.harness.generate  { "projectDir": "/path/to/repo" }
-    engine.harness.status    { "projectDir": "/path/to/repo" }
-    engine.harness.export    { "projectDir": "/path/to/repo", "format": "agents-md" }
-    engine.harness.export    { "projectDir": "/path/to/repo", "format": "claude-subagents" }
+    engine.harness.generate     { "projectDir": "/path/to/repo" }
+    engine.harness.status       { "projectDir": "/path/to/repo" }
+    engine.harness.card.update  { "projectDir": "/path/to/repo", "digest": "<edited card digest>" }
+    engine.harness.card.approve { "projectDir": "/path/to/repo" }
+    engine.harness.export       { "projectDir": "/path/to/repo", "format": "agents-md" }
+    engine.harness.export       { "projectDir": "/path/to/repo", "format": "claude-subagents" }
 
 `generate` requires a git repository and a registered frontier adapter; it
 writes `.openfusion/` (wiki pages, agent defs, `routing.yaml`, `manifest.json`)
 and is safe to re-run — regeneration prunes only the artifacts the prior
-generation itself wrote, never hand-edited additions. `status` is a cheap,
-poll-friendly read of `manifest.json` alone. `export` requires a harness that
-is both present and structurally valid (else `SERVER_ERROR`); `agents-md`
-writes `<projectDir>/AGENTS.md`, `claude-subagents` writes one file per agent
-under `<projectDir>/.claude/agents/`. **Unverified until the eval gate
-passes**: every exported harness is marked `UNVERIFIED` in `AGENTS.md` (and
-the eval status is visible via `engine.harness.status`) until
-`manifest.verification.evals` reads `"pass"` — treat agent prompts and
+generation itself wrote, never hand-edited additions, and always resets the
+Project Card back to `"draft"` (a regenerated card is a new proposal, never
+carried forward as pre-approved). `status` is a cheap, poll-friendly read of
+`manifest.json` alone, including `verification.card` (`"draft"`, `"approved"`,
+or absent for a harness with no card). `engine.harness.card.update` lets an
+operator edit the draft digest before approving it; `engine.harness.card.approve`
+flips `verification.card` to `"approved"`, the only state from which the card
+is ever injected into a worker prompt. `export` requires a harness that is
+both present and structurally valid (else `SERVER_ERROR`); `agents-md` writes
+`<projectDir>/AGENTS.md` — leading with the approved card (when present) and
+a directive to treat it as ground truth over guesswork — `claude-subagents`
+writes one file per agent under `<projectDir>/.claude/agents/`. **Unverified
+until the eval gate passes**: every exported harness is marked `UNVERIFIED`
+in `AGENTS.md` (and the eval status is visible via `engine.harness.status`)
+until `manifest.verification.evals` reads `"pass"` — treat agent prompts and
 routing as unproven against your project until then.
 
 ## How the loop works
@@ -65,20 +90,36 @@ routing as unproven against your project until then.
 
 `engine.evals.run` produces a baseline-vs-harness report card: a direct frontier session
 (no harness, no wiki) solves each task alongside the full orchestrate loop, both scored
-by the same oracle (the repo's own test suite). The report card carries three verdicts:
+by the same oracle (the repo's own test suite). The verdict is **two-dimensional** (quality
+*and* cost, per `docs/research/2026-07-07-harness-composition.md` §0/§4) and
+**significance-aware** (a single-run quality wobble inside a noise band is not treated as
+a regression). The report card carries three verdicts:
 
-- **pass**: the harness held quality on all clean tasks (no measurement failures), saved
-  cost, and the sample size is ≥5 tasks (a credible claim wants 20–50). Manifest flips to
-  verified. This is the only report that ships as a savings win.
-- **fail**: the harness *degraded* quality below baseline on the clean subset — a genuine
-  ETH hazard (generated context can hurt). Flagged and never shipped, regardless of cost.
-  This check deliberately ignores the sample-size minimum below: a quality regression is
-  worth flagging even on a small run, since it only ever blocks a claim, never inflates one.
-- **inconclusive**: one of: (1) too few tasks (<5 is a demo, not a claim); (2) unpriced
-  cost figures (an unknown model or no cost data → no savings number → no claim);
-  (3) baseline solved zero tasks (nothing to hold quality against);
-  (4) ≥20% of tasks hit measurement failures (infra hiccups, apply mismatches — the run
-  is too corrupted to ground a verdict in either direction).
+- **pass**: the harness held quality on the clean subset (no measurement failures) — or
+  the quality gap was within the single-run noise band — actually cost less than the
+  baseline, every cost figure is priced, and the sample size is ≥20 tasks (a credible claim
+  wants 20–50; see "Sample size guidance" below). Manifest flips to verified. This is the
+  only report that ships as a savings win.
+- **fail**: an ETH hazard on either axis, flagged and never shipped:
+  - *quality hazard* — the harness *degraded* quality below baseline on the clean subset by
+    more than a 5-percentage-point single-run noise band (single-run pass@1 has std >1.5pp
+    even at temperature 0 — a smaller gap reads as noise, not a real regression). This check
+    deliberately ignores the task-count floor entirely: a quality regression is worth
+    flagging even on a small run, since it only ever blocks a claim, never inflates one.
+  - *cost hazard* — the harness held quality (or was within the noise band) but cost ≥10%
+    **more** than the no-harness baseline on the clean subset, at ≥5 priced tasks. Holding
+    quality while costing materially more is the ETH failure mode itself (the study's own
+    finding: quality held, cost +~20%), not a neutral result — flagged even though nothing
+    about quality "failed."
+- **inconclusive**: one of: (1) fewer than 20 tasks (a hazard flag can still fire on a
+  smaller run — the quality hazard has no floor at all, the cost hazard needs ≥5 — but a
+  savings *pass* cannot); (2) unpriced cost figures (an unknown model or no cost data → no
+  savings number → no claim); (3) baseline solved zero tasks (nothing to hold quality
+  against); (4) ≥20% of tasks hit measurement failures (infra hiccups, apply mismatches —
+  the run is too corrupted to ground a verdict in either direction); (5) quality held (or
+  within noise), priced, ≥20 tasks, but the harness didn't actually save money (a real cost
+  increase under the 10% hazard threshold, or no savings at all) — not a hazard, but not a
+  "saves cost" claim either.
 
 **Cost figures are estimate-class** — computed from the pricing table and reported token
 usage, not a billed amount. Treat as directional. They carry a `pricingConfidence` field
@@ -87,10 +128,14 @@ provider's API), `provider-reported` (official docs), `secondary` (research), `u
 (guess), or `unpriced` (unknown model). A single unpriced call taints the savings claim
 to `inconclusive`.
 
-**Sample size guidance** (Anthropic evaluation practice): 20–50 paired tasks make a
-credible claim. A v1 CI smoke run uses synthetic fixture tasks (mechanics verification);
-a real claim requires the operator smoke (`OPENFUSION_EVALS_SMOKE=1 pnpm test`) over
-repo-mined golden tasks (commits adding code without tests, or tests verifying a bug fix).
+**Sample size guidance** (Anthropic evaluation practice, sharpened by
+`docs/research/2026-07-07-harness-composition.md` §4.2): 20–50 paired tasks make a
+credible *savings* claim; the hazard-flag floor is deliberately lower (≥5 for the cost
+hazard, no floor at all for the quality hazard) because a harm signal should be flagged
+readily while a positive claim needs enough tasks to clear the noise band. A v1 CI smoke
+run uses synthetic fixture tasks (mechanics verification); a real savings claim requires
+the operator smoke (`OPENFUSION_EVALS_SMOKE=1 pnpm test`) over ≥20 repo-mined golden tasks
+(commits adding code without tests, or tests verifying a bug fix).
 
 **Two documented residual biases** (both directions, so numbers are read honestly):
 
@@ -214,7 +259,11 @@ The shell exposes four cockpit screens:
    diff, review verdict, cost breakdown (estimate-class, tagged with
    `pricingConfidence`). Apply button stages the diff (never commits). Cancel
    button calls `engine.cancel({runId})`, rendering "Cancelled" (distinct from
-   "Failed") once settled.
+   "Failed") once settled. When a just-generated harness has a Project Card
+   still in `"draft"`, a nudge — "Project Card drafted — review it in Harness
+   setting." — appears alongside the harness status; it is informational
+   only and never gates the Run button. The card itself is reviewed
+   (view/edit/approve) in the Harness setting panel.
 4. **Evals** — baseline-vs-harness report card. Runs real evals, displays
    honest verdict (pass green / **fail = ETH-HAZARD: harness degraded quality,
    flagged and never shipped as a win** / inconclusive amber), savings % with

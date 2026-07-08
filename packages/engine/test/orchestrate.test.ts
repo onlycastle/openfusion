@@ -14,6 +14,7 @@ import type {
   FrontierSession,
 } from "../src/engines/types.js";
 import type { AgentDef, HarnessBundle, Routing, WikiPage } from "../src/harness/schema.js";
+import { CARD_SLUG } from "../src/harness/schema.js";
 import { writeHarness } from "../src/harness/store.js";
 import type { CostMeter } from "../src/models/meter.js";
 
@@ -67,7 +68,16 @@ const TRIVIAL_PAGE: WikiPage = {
 // worker model gets configured/mocked per test.
 async function writeTestHarness(
   projectDir: string,
-  opts: { failuresBeforeFrontier?: number; pages?: WikiPage[] } = {},
+  opts: {
+    failuresBeforeFrontier?: number;
+    pages?: WikiPage[];
+    // Task 6: manifest.verification.card — OMITTED (the default) reproduces
+    // a legacy manifest (written before the card field existed, or before
+    // the card stage ran at all), exactly like every pre-Task-6 caller of
+    // this helper already gets. Only set explicitly by the worker-context
+    // injection-swap fixtures below, which need to control the approval gate.
+    card?: "draft" | "approved";
+  } = {},
 ): Promise<void> {
   const headSha = git(projectDir, "rev-parse", "HEAD");
   const agent: AgentDef = {
@@ -92,7 +102,11 @@ async function writeTestHarness(
       engine: "claude-code",
       headSha,
       generatedAt: new Date().toISOString(),
-      verification: { structural: "pass", evals: "pending" },
+      verification: {
+        structural: "pass",
+        evals: "pending",
+        ...(opts.card !== undefined ? { card: opts.card } : {}),
+      },
       artifacts: [],
     },
     pages: opts.pages ?? [TRIVIAL_PAGE],
@@ -792,23 +806,46 @@ describe("engine.orchestrate — empty worker diff", () => {
   });
 });
 
-// M6 Task 2: without this, M6 would measure the harness WITHOUT its
-// headline value (distilled context for cheap models) — a worker attempt
-// that never sees a single wiki digest is functionally identical to one
-// with no harness at all. These tests pin that engine.orchestrate actually
-// forwards the loaded harness's own wiki page digests to engine.worker.run
-// (via its `wikiDigest` param — see orchestrate.ts's own doc comment on why
-// that param, not buildWorkerTask's task string, carries them), bounded so
-// a harness with many pages can't blow a cheap worker model's context.
-describe("engine.orchestrate — wiki digests in worker prompts (M6 Task 2)", () => {
-  const SENTINEL_DIGEST = "SENTINEL_DIGEST_7f3ac1: this project uses a custom widget architecture.";
+// Task 6 (the ETH-anti-pattern injection swap): M6 Task 2 (see git history)
+// wired EVERY wiki page's digest into EVERY worker prompt, bounded only by a
+// combined character cap — exactly the configuration the ETH Zurich +
+// DeepMind AGENTS.md study (arXiv:2602.11988) measured as harmful (restated,
+// inferable context costs success AND inference budget). Task 6 replaces
+// that with a categorical swap (spec
+// docs/superpowers/specs/2026-07-08-wiki-project-card-design.md §4,
+// orchestrate.ts's own buildWorkerContext doc comment): an APPROVED project
+// card only, falling back to the build-and-test page's digest alone when
+// there's no approved card, and nothing at all otherwise. These tests pin
+// each of the three branches end to end — the worker actually receives (or
+// doesn't) the right content via engine.worker.run's `wikiDigest` param —
+// and that the branch NAME (never the digest text) reaches an
+// orchestrate.progress notification.
+describe("engine.orchestrate — worker context injection swap (Task 6, ETH anti-pattern fix)", () => {
+  const CARD_DIGEST = "CARD-DIGEST-MARKER: the exact test command is `pnpm test`.";
+  const ARCH_DIGEST = "ARCH-MARKER: this project uses a layered architecture.";
+  const BT_DIGEST = "BT-MARKER: run `pnpm build && pnpm test` from the repo root.";
 
-  it("forwards the harness's wiki page digest to engine.worker.run's wikiDigest param", async () => {
+  const CARD_PAGE: WikiPage = { slug: CARD_SLUG, title: "Project Card", digest: CARD_DIGEST, body: "# Project Card\n" };
+  const ARCH_PAGE: WikiPage = { slug: "architecture", title: "Architecture", digest: ARCH_DIGEST, body: "# Architecture\n" };
+  const BUILD_AND_TEST_PAGE: WikiPage = {
+    slug: "build-and-test",
+    title: "Build and test",
+    digest: BT_DIGEST,
+    body: "# Build and test\n",
+  };
+
+  // Runs one orchestrate call against `pages`/`card`, capturing both the
+  // engine.worker.run params (task/wikiDigest) and every orchestrate.progress
+  // notification's `detail` string — the two things Task 6's contract cares
+  // about (what reached the worker; what got notified).
+  async function runAndCapture(
+    pages: WikiPage[],
+    card: "draft" | "approved" | undefined,
+  ): Promise<{ run: { task: string; wikiDigest?: string }; progressDetails: string[] }> {
     dir = makeRepo();
-    await writeTestHarness(dir, {
-      pages: [{ slug: "architecture", title: "Architecture", digest: SENTINEL_DIGEST, body: "# Architecture\n" }],
-    });
-    engine = createEngine();
+    await writeTestHarness(dir, { pages, card });
+    const notifications: Array<{ method: string; params: unknown }> = [];
+    engine = createEngine({ notify: (method, params) => notifications.push({ method, params }) });
     engine.models.registry.configure({ id: "p1", kind: "deepseek", apiKey: TEST_API_KEY });
     engine.models.registry.setTestModel("p1", makeWorkerMock("hello.txt", "hi", "done"));
     engine.frontier.registerAdapter(
@@ -818,27 +855,60 @@ describe("engine.orchestrate — wiki digests in worker prompts (M6 Task 2)", ()
 
     const res = await call(engine, "engine.orchestrate", { projectDir: dir, task: "add hello.txt" });
     expect(res.error).toBeUndefined();
-
     expect(capturedRuns).toHaveLength(1);
-    expect(capturedRuns[0]!.wikiDigest).toContain(SENTINEL_DIGEST);
-    expect(capturedRuns[0]!.wikiDigest).toContain("## Project knowledge (from the harness wiki)");
-    expect(capturedRuns[0]!.wikiDigest).toContain("Architecture");
+
+    const progressDetails = notifications
+      .filter((n) => n.method === "orchestrate.progress")
+      .map((n) => (n.params as { detail: string }).detail);
+
+    return { run: capturedRuns[0]!, progressDetails };
+  }
+
+  it("approved card present -> only the card digest reaches the worker; branch 'approved-card'", async () => {
+    const { run, progressDetails } = await runAndCapture([CARD_PAGE, ARCH_PAGE], "approved");
+
+    expect(run.wikiDigest).toContain(CARD_DIGEST);
+    expect(run.wikiDigest).toContain("## Project card");
+    expect(run.wikiDigest).not.toContain(ARCH_DIGEST);
     // The digest travels via its own param, not folded into the task text.
-    expect(capturedRuns[0]!.task).not.toContain(SENTINEL_DIGEST);
+    expect(run.task).not.toContain(CARD_DIGEST);
+
+    expect(progressDetails).toContain("worker context: approved-card");
   });
 
-  it("bounds the combined digest context and notes how many pages were truncated", async () => {
+  it("draft card + a build-and-test page -> the build-and-test digest reaches the worker, not the card; branch 'build-and-test-fallback'", async () => {
+    const { run, progressDetails } = await runAndCapture([CARD_PAGE, BUILD_AND_TEST_PAGE], "draft");
+
+    expect(run.wikiDigest).toContain(BT_DIGEST);
+    expect(run.wikiDigest).toContain("## Project knowledge (from the harness wiki)");
+    expect(run.wikiDigest).not.toContain(CARD_DIGEST);
+    expect(run.task).not.toContain(BT_DIGEST);
+
+    expect(progressDetails).toContain("worker context: build-and-test-fallback");
+  });
+
+  it("no card, no build-and-test page (legacy harness) -> no worker context at all; branch 'none'", async () => {
+    const { run, progressDetails } = await runAndCapture([ARCH_PAGE], undefined);
+
+    expect(run.wikiDigest).toBeUndefined();
+    expect(run.task).not.toContain("## Project");
+
+    expect(progressDetails).toContain("worker context: none");
+  });
+
+  // Final review Fix 6 (seam test): every test above writes the manifest's
+  // card state directly via writeTestHarness/writeHarness — none of them
+  // actually exercise the RPC a real desktop user clicks ("Approve") to get
+  // from a draft to an approved card. This test pins the FULL seam: a draft
+  // card on disk -> engine.harness.card.approve (the real dispatcher, the
+  // real store.ts's setCardState) -> a fresh engine.orchestrate run reads
+  // that manifest back off disk (loadHarness) and buildWorkerContext picks
+  // the "approved-card" branch -> the worker actually receives the card
+  // digest. Nothing here bypasses the RPC layer the way writeTestHarness's
+  // `card: "approved"` option does for the other tests in this describe.
+  it("engine.harness.card.approve, then engine.orchestrate: the worker receives the card digest via the real approve RPC + manifest round-trip", async () => {
     dir = makeRepo();
-    // 8 pages x 1200 chars (the schema's own per-digest max) = 9600 total,
-    // comfortably over the 8000-char cap -- forces truncation after the
-    // 6th page (6 x 1200 = 7200 <= 8000; a 7th would push to 8400).
-    const pages: WikiPage[] = Array.from({ length: 8 }, (_, i) => ({
-      slug: `page-${i + 1}`,
-      title: `Page ${i + 1}`,
-      digest: "X".repeat(1200),
-      body: `# Page ${i + 1}\n`,
-    }));
-    await writeTestHarness(dir, { pages });
+    await writeTestHarness(dir, { pages: [CARD_PAGE, ARCH_PAGE], card: "draft" });
     engine = createEngine();
     engine.models.registry.configure({ id: "p1", kind: "deepseek", apiKey: TEST_API_KEY });
     engine.models.registry.setTestModel("p1", makeWorkerMock("hello.txt", "hi", "done"));
@@ -847,19 +917,19 @@ describe("engine.orchestrate — wiki digests in worker prompts (M6 Task 2)", ()
     );
     const capturedRuns = captureWorkerRunCalls(engine);
 
+    // The card starts unapproved — approve it through the real RPC before
+    // orchestrate ever runs, exactly as the desktop review panel would.
+    const approveRes = await call(engine, "engine.harness.card.approve", { projectDir: dir });
+    expect(approveRes.error).toBeUndefined();
+    expect(approveRes.result).toEqual({ approved: true });
+
     const res = await call(engine, "engine.orchestrate", { projectDir: dir, task: "add hello.txt" });
     expect(res.error).toBeUndefined();
+    expect(capturedRuns).toHaveLength(1);
 
-    const wikiDigest = capturedRuns[0]!.wikiDigest!;
-    expect(wikiDigest).toContain("Page 1");
-    expect(wikiDigest).toContain("Page 6");
-    // Pages 7/8 didn't fit under the cap -- named as omitted, not silently
-    // dropped, and never included wholesale.
-    expect(wikiDigest).not.toContain("Page 7");
-    expect(wikiDigest).not.toContain("Page 8");
-    expect(wikiDigest.toLowerCase()).toContain("omitted");
-    expect(wikiDigest).toContain("2 more wiki page digest(s)");
-    expect(wikiDigest).toContain("8000 characters");
+    expect(capturedRuns[0]!.wikiDigest).toContain(CARD_DIGEST);
+    expect(capturedRuns[0]!.wikiDigest).toContain("## Project card");
+    expect(capturedRuns[0]!.wikiDigest).not.toContain(ARCH_DIGEST);
   });
 });
 
@@ -1057,7 +1127,7 @@ describe("engine.orchestrate — guard failures", () => {
 });
 
 describe("engine.orchestrate — progress notifications", () => {
-  it("happy path emits load, route, worker:1, review:1, done in order", async () => {
+  it("happy path emits load, route, load (worker context), worker:1, review:1, done in order", async () => {
     dir = makeRepo();
     await writeTestHarness(dir);
     const notifications: Array<{ method: string; params: unknown }> = [];
@@ -1074,7 +1144,11 @@ describe("engine.orchestrate — progress notifications", () => {
       .filter((n) => n.method === "orchestrate.progress")
       .map((n) => (n.params as { stage: string }).stage);
     const deduped = stages.filter((s, i) => s !== stages[i - 1]);
-    expect(deduped).toEqual(["load", "route", "worker:1", "review:1", "done"]);
+    // Task 6: a second "load" stage now fires right after routing, carrying
+    // the worker-context branch name (`worker context: <branch>`) — see
+    // orchestrate.ts's own call site comment for why it's stage "load" and
+    // not a new stage of its own.
+    expect(deduped).toEqual(["load", "route", "load", "worker:1", "review:1", "done"]);
   });
 
   it("escalation path emits worker:1, review:1, worker:2, review:2, escalate, done", async () => {
@@ -1099,7 +1173,19 @@ describe("engine.orchestrate — progress notifications", () => {
       .filter((n) => n.method === "orchestrate.progress")
       .map((n) => (n.params as { stage: string }).stage);
     const deduped = stages.filter((s, i) => s !== stages[i - 1]);
-    expect(deduped).toEqual(["load", "route", "worker:1", "review:1", "worker:2", "review:2", "escalate", "done"]);
+    // Task 6: same extra "load" (worker-context) stage as the happy-path
+    // test above.
+    expect(deduped).toEqual([
+      "load",
+      "route",
+      "load",
+      "worker:1",
+      "review:1",
+      "worker:2",
+      "review:2",
+      "escalate",
+      "done",
+    ]);
   });
 
   // M7c Task 5: orchestrate.progress/evals.progress notifications previously

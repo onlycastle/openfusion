@@ -4,7 +4,7 @@ import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { createEngine, type Engine } from "../src/engine.js";
 import { writeHarness } from "../src/harness/store.js";
-import type { HarnessBundle } from "../src/harness/schema.js";
+import { CARD_SLUG, type HarnessBundle } from "../src/harness/schema.js";
 
 let dir: string;
 let engine: Engine;
@@ -43,6 +43,19 @@ function bundle(): HarnessBundle {
   };
 }
 
+// bundle() plus a project-card page and the manifest's card verification
+// field — the "has a card" fixture. Everything else about the base bundle
+// (agents/routing/other manifest fields) is untouched, so read's other
+// assertions still hold for this fixture too.
+function bundleWithCard(cardState: "draft" | "approved" = "draft"): HarnessBundle {
+  const base = bundle();
+  return {
+    ...base,
+    manifest: { ...base.manifest, verification: { ...base.manifest.verification, card: cardState } },
+    pages: [...base.pages, { slug: CARD_SLUG, title: "Project Card", digest: "card digest", body: "card body" }],
+  };
+}
+
 describe("engine.harness.read", () => {
   it("returns the trimmed team view for a ready harness", async () => {
     engine = createEngine();
@@ -70,5 +83,27 @@ describe("engine.harness.read", () => {
     const res = await call("engine.harness.read", { projectDir: dir });
     expect(res.result).toBeUndefined();
     expect(res.error.message).toMatch(/no valid harness/i);
+  });
+
+  it("includes the card when both the page and manifest field are present", async () => {
+    engine = createEngine();
+    dir = mkdtempSync(path.join(os.tmpdir(), "of-read-card-"));
+    await writeHarness(dir, bundleWithCard("draft"));
+
+    const res = await call("engine.harness.read", { projectDir: dir });
+
+    expect(res.error).toBeUndefined();
+    expect(res.result.card).toEqual({ digest: "card digest", body: "card body", state: "draft" });
+  });
+
+  it("returns card: null for a legacy harness with no project card", async () => {
+    engine = createEngine();
+    dir = mkdtempSync(path.join(os.tmpdir(), "of-read-card-"));
+    await writeHarness(dir, bundle());
+
+    const res = await call("engine.harness.read", { projectDir: dir });
+
+    expect(res.error).toBeUndefined();
+    expect(res.result.card).toBeNull();
   });
 });

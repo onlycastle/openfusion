@@ -422,10 +422,11 @@ export function harnessStatus(projectDir: string): {
   structural: "pass" | "fail" | null;
   evals: string | null;
   headSha: string | null;
+  card: "draft" | "approved" | null;
 } {
   const mPath = manifestPath(projectDir);
   if (!existsSync(mPath)) {
-    return { present: false, structural: null, evals: null, headSha: null };
+    return { present: false, structural: null, evals: null, headSha: null, card: null };
   }
   const manifest = parseManifestFile(mPath);
   return {
@@ -433,6 +434,7 @@ export function harnessStatus(projectDir: string): {
     structural: manifest.verification.structural,
     evals: manifest.verification.evals,
     headSha: manifest.headSha,
+    card: manifest.verification.card ?? null,
   };
 }
 
@@ -471,6 +473,36 @@ export async function setEvalsVerdict(
   const updated: Manifest = {
     ...manifest,
     verification: { ...manifest.verification, evals: verdict },
+  };
+  await atomicWriteFile(mPath, `${JSON.stringify(updated, null, 2)}\n`);
+}
+
+// The project-card human-approval gate (spec §3.4, a later task's UI flow):
+// updates ONLY manifest.verification.card, in place — every other manifest
+// field (schemaVersion, generatorVersion, engine, headSha, generatedAt,
+// verification.structural, verification.evals, and artifacts) is preserved
+// verbatim. Mirrors setEvalsVerdict exactly, for the same reasons: this
+// reads manifest.json directly and rewrites ONLY that one file via
+// atomicWriteFile, rather than going through writeHarness/HarnessBundleSchema
+// (which would require re-reading and re-validating wiki/agents/routing —
+// and rewriting every artifact file on disk — just to flip one field).
+//
+// Throws HarnessValidationError (not a silent no-op) when no harness has
+// been generated yet, or the on-disk manifest is corrupt/invalid — flipping
+// a card's approval state for a harness that doesn't exist (or can't be
+// trusted) is a caller error, not a case to swallow quietly.
+export async function setCardState(
+  projectDir: string,
+  state: NonNullable<Manifest["verification"]["card"]>,
+): Promise<void> {
+  const mPath = manifestPath(projectDir);
+  if (!existsSync(mPath)) {
+    throw new HarnessValidationError("no harness; run engine.harness.generate first");
+  }
+  const manifest = parseManifestFile(mPath);
+  const updated: Manifest = {
+    ...manifest,
+    verification: { ...manifest.verification, card: state },
   };
   await atomicWriteFile(mPath, `${JSON.stringify(updated, null, 2)}\n`);
 }

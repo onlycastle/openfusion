@@ -72,7 +72,7 @@ function wikiStatusFixture(overrides: Partial<WikiStatus> = {}): WikiStatus {
 }
 
 function harnessStatusFixture(overrides: Partial<HarnessStatus> = {}): HarnessStatus {
-  return { present: true, structural: "pass", evals: "pending", headSha: "abc123", ...overrides };
+  return { present: true, structural: "pass", evals: "pending", headSha: "abc123", card: null, ...overrides };
 }
 
 function generateHarnessFixture(overrides: Partial<GenerateHarnessResult> = {}): GenerateHarnessResult {
@@ -476,6 +476,40 @@ describe("OrchestrateScreen", () => {
     expect(screen.getByRole("alert").textContent).toMatch(/not a git repository/i);
     // A wiki failure must not read as a run failure.
     expect(screen.queryByText(/^failed$/i)).toBeNull();
+  });
+
+  it("shows the draft-card nudge when the harness is ready with a draft card, and Run enablement is unaffected", async () => {
+    harnessStatusMock.mockReset();
+    harnessStatusMock.mockResolvedValue(harnessStatusFixture({ card: "draft" }));
+    render(<OrchestrateScreen />);
+
+    await waitFor(() => expect(screen.getByRole("button", { name: /open task chat/i })).toBeTruthy());
+    expect(screen.getByText(/project card drafted — review it in harness setting\./i)).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: /open task chat/i }));
+    fireEvent.change(screen.getByLabelText(/task/i), { target: { value: "fix the null check bug" } });
+    // The nudge is never a gate — Run still enables normally with a draft card.
+    await waitFor(() => {
+      expect((screen.getByRole("button", { name: /^run$/i }) as HTMLButtonElement).disabled).toBe(false);
+    });
+  });
+
+  it("hides the draft-card nudge when the harness is ready with an approved card", async () => {
+    harnessStatusMock.mockReset();
+    harnessStatusMock.mockResolvedValue(harnessStatusFixture({ card: "approved" }));
+    render(<OrchestrateScreen />);
+
+    await waitFor(() => expect(screen.getByRole("button", { name: /open task chat/i })).toBeTruthy());
+    expect(screen.queryByText(/project card drafted/i)).toBeNull();
+  });
+
+  it("hides the draft-card nudge when the harness is ready with no card (legacy harness)", async () => {
+    harnessStatusMock.mockReset();
+    harnessStatusMock.mockResolvedValue(harnessStatusFixture({ card: null }));
+    render(<OrchestrateScreen />);
+
+    await waitFor(() => expect(screen.getByRole("button", { name: /open task chat/i })).toBeTruthy());
+    expect(screen.queryByText(/project card drafted/i)).toBeNull();
   });
 
   it("renders the routed model from result.resolution in the final outcome view (structural routed-model test)", async () => {

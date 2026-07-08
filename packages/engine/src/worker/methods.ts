@@ -19,16 +19,20 @@
 // the CLIENT owns bounding fan-out (M5b's orchestrator is the intended
 // bounding layer).
 import { randomUUID } from "node:crypto";
+import { existsSync } from "node:fs";
 import path from "node:path";
 import { z } from "zod";
 import { RpcErrorCodes } from "@openfusion/shared";
 import type { Engine } from "../engine.js";
+import type { WikiPage } from "../harness/schema.js";
+import { HarnessValidationError, loadHarness } from "../harness/store.js";
 import { estimateCostUsd, lookupPricing } from "../models/pricing.js";
 import { RpcMethodError } from "../rpc/errors.js";
 import { providerKindOf, requireGitRepo, resolveProjectKey } from "../rpc/guards.js";
 import { registerMethod } from "../rpc/register.js";
+import { wikiDbPath } from "../wiki/store.js";
 import { runWorkerLoop } from "./loop.js";
-import { createWorkerTools } from "./tools.js";
+import { createWorkerTools, type ToolContext } from "./tools.js";
 import { WorktreeManager, type Worktree } from "./worktree.js";
 
 const RunParamsSchema = z.object({
@@ -169,13 +173,42 @@ export function registerWorkerMethods(engine: Engine): void {
       throw new RpcMethodError(RpcErrorCodes.SERVER_ERROR, `worker setup failed: ${message}`);
     }
 
+    // Task 7: ctx.wiki is built ONLY when the project's wiki is already
+    // indexed — mirrors engine.wiki.status's own two-part gate
+    // (existsSync(wikiDbPath(...)) then getMeta("head_sha") !== null) rather
+    // than triggering a build here, since a worker run should never block
+    // on (or silently kick off) a wiki index. `pages` comes from the
+    // generated harness bundle, if any; a HarnessValidationError (corrupt or
+    // hand-edited `.openfusion/` content) degrades to no page hits rather
+    // than failing the run — wiki_query's symbol lookup still works fine on
+    // its own.
+    let wiki: ToolContext["wiki"];
+    if (existsSync(wikiDbPath(path.resolve(params.projectDir)))) {
+      const store = engine.wiki.getStore(params.projectDir);
+      if (store.getMeta("head_sha") !== null) {
+        let pages: WikiPage[] = [];
+        try {
+          pages = loadHarness(params.projectDir)?.pages ?? [];
+        } catch (err) {
+          if (!(err instanceof HarnessValidationError)) throw err;
+        }
+        wiki = { store, pages };
+      }
+    }
+
+    // Task 7 telemetry: tallies tool-call NAMES and COUNTS only — never
+    // arguments — logged once the run completes (see the success path
+    // below, right where the run result is assembled).
+    const toolCallCounts: Record<string, number> = {};
     const tools = createWorkerTools({
       root: worktree.path,
       bashTimeoutMs: params.bashTimeoutMs,
+      wiki,
       // Tool events are structured, already-truncated observability
       // metadata (see tools.ts's own `detail()`) — never prompt/file/
       // command content.
       onToolEvent: (e) => {
+        toolCallCounts[e.tool] = (toolCallCounts[e.tool] ?? 0) + 1;
         engine.notify("worker.progress", { taskId, kind: "tool", tool: e.tool, detail: e.detail });
       },
     });
@@ -264,6 +297,9 @@ export function registerWorkerMethods(engine: Engine): void {
       engine.log(
         `worker.run ${taskId} ${kind}/${params.model}: ${loopResult.steps} steps, ${loopResult.toolCallCount} tool calls`,
       );
+      // Task 7 telemetry: names + counts only, never arguments — see
+      // toolCallCounts' own tally above.
+      engine.log(`worker.run tool-calls model=${params.model} ${JSON.stringify(toolCallCounts)}`);
 
       return {
         diff,
