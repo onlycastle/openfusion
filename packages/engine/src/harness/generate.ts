@@ -25,9 +25,18 @@ import { requireGitRepo } from "../rpc/guards.js";
 import { wikiDbPath } from "../wiki/store.js";
 import { ENGINE_VERSION } from "../version.js";
 import { PRICING } from "../models/pricing.js";
+import {
+  CardContentSchema,
+  composeCardBody,
+  composeCardDigest,
+  validateCardContent,
+  type StrippedItem,
+} from "./card.js";
 import { HarnessGenError, promptForJson } from "./driver.js";
+import { mineCommands, type MinedCommand } from "./mine.js";
 import {
   AgentDefSchema,
+  CARD_SLUG,
   HarnessBundleSchema,
   PROSE_PAGE_SLUGS,
   RoutingSchema,
@@ -49,6 +58,11 @@ export interface GenerateHarnessResult {
   pages: number;
   agents: number;
   note: string;
+  // Commands/anchors the project-card stage's LLM output proposed but that
+  // validateCardContent (M4 task 3) stripped as unverifiable — surfaced here
+  // so the desktop review panel (spec §3.4) can show exactly what was
+  // dropped and why, without re-deriving it itself.
+  cardStripped: StrippedItem[];
 }
 
 const NOTE =
@@ -162,6 +176,47 @@ function buildPagePrompt(slug: (typeof PROSE_PAGE_SLUGS)[number], overview: Over
           digest:
             "string, at most 1200 characters — the token-budgeted summary a worker agent will actually read",
           body: "string — the full markdown page body",
+        },
+        null,
+        2,
+      ) +
+      "\n```",
+  ].join("\n\n");
+}
+
+// Sibling of buildPagePrompt, but for the project card (spec §3.1/§3.2)
+// rather than a prose page: lists every deterministically-mined command
+// (mineCommands, M4 task 2) with its source(s) as the highest-trust input,
+// and states the content rules verbatim from spec §3.2/the task brief —
+// what belongs on a card injected into EVERY worker prompt unconditionally,
+// and what's explicitly forbidden. validateCardContent (M4 task 3) is the
+// actual enforcement point; this prompt is only the first line of defense.
+function buildCardPrompt(overview: Overview, mined: MinedCommand[]): string {
+  const minedList =
+    mined.length > 0
+      ? mined.map((m) => `- \`${m.command}\` (source: ${m.sources.join(", ")})`).join("\n")
+      : "(no commands could be mined from this project's manifests or CI config)";
+
+  return [
+    "You are drafting the Project Card for this repository's AI coding harness — the ONE wiki page that gets injected into EVERY worker prompt unconditionally, unlike the four prose pages above (which a worker consults on demand).",
+    "Repository overview:",
+    "```json\n" + JSON.stringify(overview, null, 2) + "\n```",
+    "Commands mined directly from this project's own manifests and CI config — the highest-trust source available; strongly prefer these over anything you invent:",
+    minedList,
+    "Select ONLY commands a contributor actually needs to build, test, lint, or run this project — prefer the mined commands above. If you propose a command that is NOT in the mined list, it MUST name a script or make/just target that genuinely exists in this project (e.g. a package.json script you can see in the overview, or a Makefile/justfile target) — an invented command that resolves to nothing real will be stripped before this card ever reaches a worker or a human reviewer.",
+    "Include: the exact commands a contributor runs (each with a short reason), environment prerequisites (required env vars, tool versions, local services), hard invariants and do-not-touch boundaries (secrets, vendor directories, generated files, production configs — anything that must never be hand-edited), factual navigation anchors (bare repo-relative paths to where a worker actually needs to look), a short glossary of project-specific terms, and gotchas that grep or a directory listing cannot reveal on their own. If this card ever runs long, commands/env/boundaries are kept in full and never trimmed — glossary, then gotchas, then anchors are dropped first — so put your highest-value facts in commands/env/boundaries.",
+    'FORBIDDEN: prose architecture overviews (that is the "architecture" page\'s job, not this one), anything derivable by simply reading one obvious file, and procedural workflow directives ("always run X before Y", "first do A, then B") — this card is read by four different worker model families with different capabilities and habits, so it must state facts and boundaries, never dictate a workflow.',
+    "Respond with ONLY a single JSON code block matching this exact shape:",
+    "```json\n" +
+      JSON.stringify(
+        {
+          title: "string",
+          commands: [{ command: "string — one exact shell command", why: "string — short reason, max 80 chars" }],
+          env: ["string — one environment prerequisite per entry"],
+          boundaries: ["string — one do-not-touch boundary per entry"],
+          anchors: [{ path: "string — repo-relative path", note: "string", symbol: "string (optional)" }],
+          glossary: [{ term: "string", meaning: "string" }],
+          gotchas: ["string — one gotcha per entry"],
         },
         null,
         2,
@@ -306,6 +361,27 @@ export async function generateHarness(engine: Engine, projectDir: string): Promi
       pages.push({ slug, ...pageResult.value });
     }
 
+    notify("mine", "mining build/test commands from manifests and CI");
+    const mined = await mineCommands(projectDir);
+    notify(`page:${CARD_SLUG}`, "generating the project card (draft)");
+    const cardResult = await promptForJson(session, buildCardPrompt(overview, mined), CardContentSchema, {
+      stage: `page:${CARD_SLUG}`,
+      notify: (n) => notify(`page:${CARD_SLUG}`, `${n.kind}: ${n.detail}`),
+    });
+    costUsd = addCost(costUsd, cardResult.costUsd);
+    const store = engine.wiki.getStore(projectDir);
+    const { content: card, stripped } = validateCardContent(cardResult.value, {
+      mined,
+      projectDir,
+      symbolExists: (name) => store.symbolsByName(name).length > 0,
+    });
+    pages.push({
+      slug: CARD_SLUG,
+      title: card.title,
+      digest: composeCardDigest(card),
+      body: composeCardBody(card, mined, stripped),
+    });
+
     notify("agents-routing", "designing specialist agents and routing");
     const workerModels = listWorkerModelOptions(engine);
     const agentsResult = await promptForJson(
@@ -328,7 +404,7 @@ export async function generateHarness(engine: Engine, projectDir: string): Promi
         engine: FRONTIER_KIND,
         headSha,
         generatedAt: new Date().toISOString(),
-        verification: { structural: "pass" as const, evals: "pending" as const },
+        verification: { structural: "pass" as const, evals: "pending" as const, card: "draft" as const },
         artifacts: [],
       },
       pages,
@@ -383,6 +459,7 @@ export async function generateHarness(engine: Engine, projectDir: string): Promi
       pages: pages.length,
       agents: agents.length,
       note: NOTE,
+      cardStripped: stripped,
     };
   } finally {
     await session.close().catch(() => {
