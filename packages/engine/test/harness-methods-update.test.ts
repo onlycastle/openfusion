@@ -13,6 +13,7 @@ import type {
 } from "../src/engines/types.js";
 import { harnessStatus, loadHarness, writeHarness } from "../src/harness/store.js";
 import { CARD_SLUG, type HarnessBundle } from "../src/harness/schema.js";
+import { readRuns } from "../src/runs/ledger.js";
 
 let dir: string;
 let engine: Engine;
@@ -259,6 +260,35 @@ describe("engine.harness.card.approve", () => {
     const res = await call("engine.harness.card.approve", { projectDir: dir });
     expect(res.result).toBeUndefined();
     expect(res.error.message).toMatch(/no project card; regenerate the harness first/i);
+  });
+});
+
+// Task 4 (run ledger write point): card.update/card.approve each record a
+// "card" action ONLY after their own serialized write has actually
+// succeeded -- see harness/methods.ts's own doc comment on these two write
+// points.
+describe("engine.harness card actions — run ledger write point (Task 4)", () => {
+  it("records a card 'update' action after a successful digest edit, then a card 'approve' action after approval, newest-first", async () => {
+    await setupWithCard("draft");
+
+    const updateRes = await call("engine.harness.card.update", { projectDir: dir, digest: "new digest" });
+    expect(updateRes.error).toBeUndefined();
+
+    const approveRes = await call("engine.harness.card.approve", { projectDir: dir });
+    expect(approveRes.error).toBeUndefined();
+
+    // readRuns returns newest-first (runs/ledger.ts's own doc comment) --
+    // approve (written second) precedes update (written first).
+    const { records } = readRuns(dir, { kind: "card" });
+    expect(records).toHaveLength(2);
+    expect(records.map((r) => (r.kind === "card" ? r.action : undefined))).toEqual(["approve", "update"]);
+  });
+
+  it("does not record a card action when the mutating write itself fails", async () => {
+    await setup(); // no card page written -- card.update has nothing to edit
+    const res = await call("engine.harness.card.update", { projectDir: dir, digest: "x" });
+    expect(res.error).toBeDefined();
+    expect(readRuns(dir, { kind: "card" }).records).toHaveLength(0);
   });
 });
 

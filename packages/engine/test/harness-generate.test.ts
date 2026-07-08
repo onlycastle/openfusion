@@ -13,6 +13,7 @@ import type {
 } from "../src/engines/types.js";
 import { harnessStatus, loadHarness } from "../src/harness/store.js";
 import { CARD_SLUG, PROSE_PAGE_SLUGS } from "../src/harness/schema.js";
+import { readRuns } from "../src/runs/ledger.js";
 
 let dir: string;
 let engine: Engine;
@@ -262,6 +263,21 @@ describe("engine.harness.generate — happy path (scripted fake adapter)", () =>
     // The card's human-approval gate (spec §3.4) starts at "draft" — never
     // auto-approved by generation itself.
     expect(harnessStatus(dir).card).toBe("draft");
+
+    // Task 4 (run ledger write point): engine.harness.generate's own RPC
+    // handler records exactly one "generate" run, on success, mirroring the
+    // RPC result's own pages/agents/cardStripped and the freshly-written
+    // manifest's headSha.
+    const { records } = readRuns(dir, { kind: "generate" });
+    expect(records).toHaveLength(1);
+    const record = records[0]!;
+    if (record.kind !== "generate") throw new Error(`expected a "generate" record, got "${record.kind}"`);
+    expect(record.pages).toBe(5);
+    expect(record.agents).toBe(2);
+    expect(record.estimatedCostUsd).toBe(result.estimatedCostUsd);
+    expect(record.headSha).toBe(bundle!.manifest.headSha);
+    expect(record.cardStripped.some((s) => s.item === "npm run ghost")).toBe(true);
+    expect(record.durationMs).toBeGreaterThanOrEqual(0);
 
     // Stage notification sequence, in order — exactly the 8 stages the task
     // brief enumerates, one each, though a stage may now emit MORE than one
