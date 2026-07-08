@@ -51,12 +51,25 @@ export interface StrippedItem {
   reason: string;
 }
 
-const SCRIPT_RUN_RE = /^(?:pnpm|npm) run (\S+)/;
+// Final review Fix 2 (fail-safe recall): PNPM_RUN_RE tolerates pnpm's own
+// idiomatic bare-script shorthand (`pnpm test`, no "run") exactly the way
+// YARN_RUN_RE already tolerates `yarn test` — an unmined but genuinely
+// correct, idiomatic command should not be stripped for a purely cosmetic
+// reason. NPM_RUN_RE deliberately stays strict (`npm run X` only): npm's own
+// bare-script shorthand (`npm test`, `npm start`) is a real lifecycle
+// convention, but a bare `npm <word>` also collides with npm's OWN built-in
+// subcommands (npm install, npm ci, ...) in a way pnpm/yarn's bare shorthand
+// does not — widening npm the same way risks treating a non-script npm
+// invocation as if it resolved a project script. Strictness here is the
+// fail-safe choice; it costs nothing but requiring `npm run test` instead of
+// `npm test`.
+const PNPM_RUN_RE = /^pnpm (?:run )?(\S+)/;
+const NPM_RUN_RE = /^npm run (\S+)/;
 const YARN_RUN_RE = /^yarn (?:run )?(\S+)/;
 const MAKE_RUN_RE = /^(?:make|just) (\S+)/;
 
 function scriptNameOf(command: string): string | undefined {
-  return SCRIPT_RUN_RE.exec(command)?.[1] ?? YARN_RUN_RE.exec(command)?.[1];
+  return PNPM_RUN_RE.exec(command)?.[1] ?? NPM_RUN_RE.exec(command)?.[1] ?? YARN_RUN_RE.exec(command)?.[1];
 }
 
 function makeTargetOf(command: string): string | undefined {

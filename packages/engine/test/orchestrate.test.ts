@@ -895,6 +895,42 @@ describe("engine.orchestrate — worker context injection swap (Task 6, ETH anti
 
     expect(progressDetails).toContain("worker context: none");
   });
+
+  // Final review Fix 6 (seam test): every test above writes the manifest's
+  // card state directly via writeTestHarness/writeHarness — none of them
+  // actually exercise the RPC a real desktop user clicks ("Approve") to get
+  // from a draft to an approved card. This test pins the FULL seam: a draft
+  // card on disk -> engine.harness.card.approve (the real dispatcher, the
+  // real store.ts's setCardState) -> a fresh engine.orchestrate run reads
+  // that manifest back off disk (loadHarness) and buildWorkerContext picks
+  // the "approved-card" branch -> the worker actually receives the card
+  // digest. Nothing here bypasses the RPC layer the way writeTestHarness's
+  // `card: "approved"` option does for the other tests in this describe.
+  it("engine.harness.card.approve, then engine.orchestrate: the worker receives the card digest via the real approve RPC + manifest round-trip", async () => {
+    dir = makeRepo();
+    await writeTestHarness(dir, { pages: [CARD_PAGE, ARCH_PAGE], card: "draft" });
+    engine = createEngine();
+    engine.models.registry.configure({ id: "p1", kind: "deepseek", apiKey: TEST_API_KEY });
+    engine.models.registry.setTestModel("p1", makeWorkerMock("hello.txt", "hi", "done"));
+    engine.frontier.registerAdapter(
+      makeFakeFrontierAdapter({ reviewVerdicts: [{ decision: "approve", reasons: [], severity: "none" }] }),
+    );
+    const capturedRuns = captureWorkerRunCalls(engine);
+
+    // The card starts unapproved — approve it through the real RPC before
+    // orchestrate ever runs, exactly as the desktop review panel would.
+    const approveRes = await call(engine, "engine.harness.card.approve", { projectDir: dir });
+    expect(approveRes.error).toBeUndefined();
+    expect(approveRes.result).toEqual({ approved: true });
+
+    const res = await call(engine, "engine.orchestrate", { projectDir: dir, task: "add hello.txt" });
+    expect(res.error).toBeUndefined();
+    expect(capturedRuns).toHaveLength(1);
+
+    expect(capturedRuns[0]!.wikiDigest).toContain(CARD_DIGEST);
+    expect(capturedRuns[0]!.wikiDigest).toContain("## Project card");
+    expect(capturedRuns[0]!.wikiDigest).not.toContain(ARCH_DIGEST);
+  });
 });
 
 describe("engine.orchestrate — taskClass + review/escalate cost split (M6 Task 2)", () => {

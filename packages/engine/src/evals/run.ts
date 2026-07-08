@@ -76,9 +76,11 @@
 //          (harnessDir's top-level checkout), never through git, and the
 //          worker/escalation child worktrees engine.worker.getManager
 //          creates never need `.openfusion` present in THEIR OWN directory
-//          either (the wiki digest travels as a plain string param —
-//          buildWikiDigestContext in orchestrate.ts — computed once from
-//          the bundle object, not re-read from disk per attempt). Reusing
+//          either (the worker context — the approved project card's digest,
+//          or the build-and-test page's digest as a fallback, or nothing at
+//          all — travels as a plain string param; buildWorkerContext in
+//          orchestrate.ts computes it once from the bundle object, not
+//          re-read from disk per attempt). Reusing
 //          writeHarness (the same tested primitive engine.harness.generate
 //          itself writes through) instead of a raw recursive directory copy
 //          also means this can never accidentally drag in
@@ -101,12 +103,15 @@
 //          v1 LIMITATION note this comment used to carry). runOracle then
 //          scores harnessDir, exactly like the baseline.
 //     The APPROXIMATION this fix accepts (documented, not hidden): the
-//     copied wiki digests were generated against the real project's CURRENT
-//     state, not the task's own (older, for a golden task) base state —
-//     they describe a past version of the same project approximately, not
-//     exactly. That is a much smaller and more honest approximation than
-//     the flaw it replaces (which wasn't "approximately right", it was
-//     structurally guaranteed wrong whenever HEAD had moved on).
+//     copied bundle's worker context (buildWorkerContext's approved-card
+//     digest, or its build-and-test fallback — see that function's own doc
+//     comment; never "every page digest") was generated against the real
+//     project's CURRENT state, not the task's own (older, for a golden
+//     task) base state — it describes a past version of the same project
+//     approximately, not exactly. That is a much smaller and more honest
+//     approximation than the flaw it replaces (which wasn't "approximately
+//     right", it was structurally guaranteed wrong whenever HEAD had moved
+//     on).
 //     CONTAMINATION DIRECTION (review round 2 — read alongside the staleness
 //     approximation just above, and alongside the wiki-MCP-ABSENCE note near
 //     the bottom of this header): for a GOLDEN task (goldenTaskFromCommit),
@@ -192,11 +197,12 @@
 // eval harness run's review AND escalation frontier sessions
 // (engine.orchestrate's own reviewDiff/runEscalation call sites) are always
 // created with wikiMcpUrl: null, and get NO wiki MCP tool server attached,
-// full stop. (This is specific to review/escalation: the plain-string wiki
-// digest context that WORKER attempts receive — buildWikiDigestContext,
-// computed directly off the already-loaded bundle's own wiki pages, never
-// re-read from `.openfusion/cache/` — is unaffected by this and reaches
-// worker attempts in an eval run exactly as it would in production.)
+// full stop. (This is specific to review/escalation: the plain-string
+// worker context that WORKER attempts receive — buildWorkerContext's
+// approved-card digest, or its build-and-test fallback, computed directly
+// off the already-loaded bundle's own wiki pages, never re-read from
+// `.openfusion/cache/` — is unaffected by this and reaches worker attempts
+// in an eval run exactly as it would in production.)
 //
 // CONSEQUENCE FOR READING THIS PIPELINE'S NUMBERS: the harness measured by
 // this module is therefore a CONSERVATIVELY DEGRADED variant of the harness

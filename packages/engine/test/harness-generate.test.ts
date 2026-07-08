@@ -380,6 +380,29 @@ describe("engine.harness.generate — happy path (scripted fake adapter)", () =>
     expect(capturedPrompts[1]).toContain(OVERVIEW.summary);
     expect(capturedPrompts[1]!.toLowerCase()).toContain("do not re-explore");
   }, 30_000);
+
+  // Final review Fix 3 (prompt contract): the card prompt must tell the
+  // model to echo a mined command back VERBATIM rather than reformatting it
+  // (extra flags, reworded quoting, ...) — validateCardContent's
+  // commandResolves check (card.ts) only trusts an EXACT string match
+  // against the mined list, so a reformatted-but-otherwise-correct mined
+  // command was previously indistinguishable from an invented one and got
+  // silently stripped. This test pins the instruction's presence in the
+  // actual prompt text sent to the model.
+  it("the card prompt instructs the model to echo mined commands verbatim, not reformatted", async () => {
+    dir = makeRepo();
+    engine = createEngine();
+    const capturedPrompts: string[] = [];
+    engine.frontier.registerAdapter(makeScriptedAdapter({ scripts: happyScripts(), capturedPrompts }));
+
+    await call("engine.harness.generate", { projectDir: dir });
+    // capturedPrompts order: overview(0), 4 prose pages(1-4), card(5),
+    // agents-routing(6) — see happyScripts's own doc comment for this exact
+    // ordering.
+    const cardPrompt = capturedPrompts[5]!;
+    expect(cardPrompt).toContain("Project Card");
+    expect(cardPrompt.toLowerCase()).toContain("verbatim");
+  }, 30_000);
 });
 
 describe("engine.harness.generate — validation-retry path", () => {

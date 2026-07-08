@@ -93,6 +93,42 @@ describe("validateCardContent", () => {
     expect(stripped).toEqual([]);
   });
 
+  // Final review Fix 2 (fail-safe recall): pnpm's own idiomatic shorthand
+  // drops "run" entirely (`pnpm test`, `pnpm build`) — mirrors YARN_RUN_RE's
+  // existing `(?:run )?` tolerance so a genuinely correct, idiomatic command
+  // doesn't get stripped for a purely cosmetic reason.
+  it("keeps an unmined bare `pnpm <script>` command (no `run`) whose script exists in package.json", () => {
+    makeDir();
+    writeFixtureFile("package.json", JSON.stringify({ name: "root", scripts: { test: "vitest run" } }));
+    const content = baseContent({ commands: [{ command: "pnpm test", why: "run unit tests" }] });
+
+    const { content: result, stripped } = validateCardContent(content, { mined: [], projectDir: dir });
+
+    expect(result.commands).toEqual([{ command: "pnpm test", why: "run unit tests" }]);
+    expect(stripped).toEqual([]);
+  });
+
+  // npm bare-script shorthand (`npm test`, `npm start`) IS a real lifecycle
+  // convention, but per the reviewer's explicit call, npm stays strict
+  // (`npm run X` only) — the fail-safe choice: unlike pnpm/yarn, a bare `npm
+  // <word>` collides with npm's OWN built-in subcommands (npm install, npm
+  // ci, ...), so widening npm the same way pnpm/yarn were risks treating a
+  // non-script npm invocation as if it resolved a project script. Strictness
+  // here costs nothing but a slightly awkward round-trip through `npm run
+  // test`, and buys unambiguous trust.
+  it("still strips a bare `npm test` command (no `run`) even though the script exists — npm bare-script shorthand stays unsupported by design", () => {
+    makeDir();
+    writeFixtureFile("package.json", JSON.stringify({ name: "root", scripts: { test: "vitest run" } }));
+    const content = baseContent({ commands: [{ command: "npm test", why: "run unit tests" }] });
+
+    const { content: result, stripped } = validateCardContent(content, { mined: [], projectDir: dir });
+
+    expect(result.commands).toEqual([]);
+    expect(stripped).toEqual([
+      { item: "npm test", reason: "unmined command; no matching script/target in any manifest" },
+    ]);
+  });
+
   it("keeps an unmined `yarn run <script>` command whose script exists in package.json (yarn.lock present)", () => {
     makeDir();
     writeFixtureFile("package.json", JSON.stringify({ name: "root", scripts: { lint: "eslint ." } }));

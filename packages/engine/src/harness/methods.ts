@@ -76,6 +76,34 @@ export class HarnessService {
     return promise;
   }
 
+  // Whole-branch review (final review fix wave, Important — approval-gate
+  // bypass): #generating and #writeChain above were NEVER cross-serialized,
+  // only each self-serialized. generateHarness's writeHarness call REPLACES
+  // THE ENTIRE BUNDLE (every wiki page including the project card, every
+  // agent, all of routing.yaml — see generate.ts's own writeHarness call) —
+  // there is no partial-generation state a mutate could safely interleave
+  // with. A mutate racing an in-flight regenerate was therefore always
+  // wrong, in either direction: (a) mutateHarness's own loadHarness reads
+  // the PRE-generate bundle, and its writeHarness then either clobbers or
+  // gets clobbered by generation's own writeHarness landing moments later —
+  // a silently lost edit either way; (b) worse, for card.approve
+  // specifically, a user can click Approve on a draft they are looking at
+  // in the desktop review panel at the EXACT moment a background regenerate
+  // has already replaced that page on disk with an entirely different,
+  // never-reviewed draft — the approval they think they're granting to the
+  // card they read is silently granted to content they never saw at all.
+  // That is the approval-gate bypass this method exists to close: every
+  // mutate RPC handler (card.update, card.approve, updateAgentModel,
+  // updateEscalation — registerHarnessMethods below) checks this at the top
+  // of its serializeWrite callback (so the check itself serializes with
+  // other mutates, not just with generation) and rejects with SERVER_ERROR
+  // rather than touching disk while a regenerate is in flight. See
+  // harness-methods-update.test.ts's "approval-gate race" tests for the
+  // exact scenario pinned.
+  isGenerating(projectDir: string): boolean {
+    return this.#generating.has(resolveProjectKey(projectDir));
+  }
+
   // Queues fn to run only after every previously-queued write for this
   // project has settled (success OR failure — a `.then(fn, fn)`-style
   // neutralization, so one failed mutation can never wedge later queued
@@ -240,24 +268,38 @@ export function registerHarnessMethods(engine: Engine): void {
   }
 
   registerMethod(engine.dispatcher, "engine.harness.updateAgentModel", UpdateAgentModelParamsSchema, async ({ projectDir, agentName, model }) => {
-    await engine.harness.serializeWrite(projectDir, () =>
-      mutateHarness(projectDir, (bundle) => {
+    await engine.harness.serializeWrite(projectDir, () => {
+      // Final review Fix 1 — see HarnessService.isGenerating's own doc
+      // comment for the approval-gate-bypass scenario this closes. Checked
+      // HERE (inside the serializeWrite callback) rather than before the
+      // serializeWrite call so it is itself serialized with every other
+      // queued mutate for this project, not just with generation.
+      if (engine.harness.isGenerating(projectDir)) {
+        throw new RpcMethodError(RpcErrorCodes.SERVER_ERROR, "harness generation in progress; retry after it completes");
+      }
+      return mutateHarness(projectDir, (bundle) => {
         const agent = bundle.agents.find((a) => a.name === agentName);
         if (agent === undefined) {
           throw new RpcMethodError(RpcErrorCodes.SERVER_ERROR, `unknown agent "${agentName}"`);
         }
         agent.model = model;
-      }),
-    );
+      });
+    });
     return { updated: true };
   });
 
   registerMethod(engine.dispatcher, "engine.harness.updateEscalation", UpdateEscalationParamsSchema, async ({ projectDir, failuresBeforeFrontier }) => {
-    await engine.harness.serializeWrite(projectDir, () =>
-      mutateHarness(projectDir, (bundle) => {
+    await engine.harness.serializeWrite(projectDir, () => {
+      // Final review Fix 1 — see engine.harness.updateAgentModel's identical
+      // guard above (and HarnessService.isGenerating's doc comment) for why
+      // this check lives here.
+      if (engine.harness.isGenerating(projectDir)) {
+        throw new RpcMethodError(RpcErrorCodes.SERVER_ERROR, "harness generation in progress; retry after it completes");
+      }
+      return mutateHarness(projectDir, (bundle) => {
         bundle.routing.escalation.failuresBeforeFrontier = failuresBeforeFrontier;
-      }),
-    );
+      });
+    });
     return { updated: true };
   });
 
@@ -267,16 +309,22 @@ export function registerHarnessMethods(engine: Engine): void {
   // never observe an approved card sitting next to a digest nobody has
   // reviewed yet.
   registerMethod(engine.dispatcher, "engine.harness.card.update", CardUpdateParamsSchema, async ({ projectDir, digest }) => {
-    await engine.harness.serializeWrite(projectDir, () =>
-      mutateHarness(projectDir, (bundle) => {
+    await engine.harness.serializeWrite(projectDir, () => {
+      // Final review Fix 1 — see engine.harness.updateAgentModel's identical
+      // guard above (and HarnessService.isGenerating's doc comment) for why
+      // this check lives here.
+      if (engine.harness.isGenerating(projectDir)) {
+        throw new RpcMethodError(RpcErrorCodes.SERVER_ERROR, "harness generation in progress; retry after it completes");
+      }
+      return mutateHarness(projectDir, (bundle) => {
         const page = findCardPage(bundle);
         if (page === undefined) {
           throw new RpcMethodError(RpcErrorCodes.SERVER_ERROR, "no project card; regenerate the harness first");
         }
         page.digest = digest;
         bundle.manifest.verification.card = "draft";
-      }),
-    );
+      });
+    });
     return { updated: true };
   });
 
@@ -289,6 +337,15 @@ export function registerHarnessMethods(engine: Engine): void {
   // single-file manifest write to store.ts's setCardState.
   registerMethod(engine.dispatcher, "engine.harness.card.approve", ProjectParamsSchema, async ({ projectDir }) => {
     await engine.harness.serializeWrite(projectDir, async () => {
+      // Final review Fix 1 — see engine.harness.updateAgentModel's identical
+      // guard above (and HarnessService.isGenerating's doc comment) for why
+      // this check lives here. Most important of the four for THIS handler
+      // specifically: without it, a user can click Approve on a card a
+      // background regenerate has already silently replaced with a
+      // never-reviewed draft — the approval-gate bypass this fix closes.
+      if (engine.harness.isGenerating(projectDir)) {
+        throw new RpcMethodError(RpcErrorCodes.SERVER_ERROR, "harness generation in progress; retry after it completes");
+      }
       let bundle;
       try {
         bundle = loadHarness(projectDir);
