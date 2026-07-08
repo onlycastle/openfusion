@@ -142,7 +142,15 @@ export function registerOrchestrateMethods(engine: Engine): void {
       engine.log(
         `orchestrate ${params.projectDir}: outcome=${result.outcome} attempts=${result.attempts.length}`,
       );
-      recordRun(engine, params.projectDir, {
+      // AWAITED (recordRun still can never throw/reject — see its own doc
+      // comment) so the append has SETTLED before this RPC resolves: a
+      // client calling engine.runs.list right after engine.orchestrate must
+      // see this run, and no ledger write may be left racing whatever the
+      // caller does to the project dir next — an unawaited append's
+      // mkdir/appendFile, still in flight on the libuv threadpool after the
+      // response, intermittently re-created .openfusion/cache during the
+      // test suite's temp-dir teardown, ENOTEMPTY-failing its rmSync.
+      await recordRun(engine, params.projectDir, {
         v: 1,
         kind: "orchestrate",
         at: new Date().toISOString(),
@@ -170,8 +178,9 @@ export function registerOrchestrateMethods(engine: Engine): void {
       // Error records deliberately carry NO task/agent/model detail this
       // handler doesn't actually know (orchestrate() threw before — or
       // without ever — resolving routing) — the "unknown" sentinels below
-      // mirror the brief's own contract rather than guessing.
-      recordRun(engine, params.projectDir, {
+      // mirror the brief's own contract rather than guessing. Awaited for
+      // the same settled-before-response reason as the success record above.
+      await recordRun(engine, params.projectDir, {
         v: 1,
         kind: "orchestrate",
         at: new Date().toISOString(),

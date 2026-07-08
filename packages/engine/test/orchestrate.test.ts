@@ -4,7 +4,7 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "no
 import os from "node:os";
 import path from "node:path";
 import { MockLanguageModelV4 } from "ai/test";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import { RpcErrorCodes } from "@openfusion/shared";
 import { createEngine, type Engine } from "../src/engine.js";
 import type {
@@ -948,12 +948,13 @@ describe("engine.orchestrate — worker context injection swap (Task 6, ETH anti
 });
 
 // Task 3: engine.orchestrate's own run-ledger write point (runs/ledger.ts's
-// recordRun, consumed here — not modified by this task). Dispatches THROUGH
-// the real RPC dispatcher (not a direct orchestrate() call) since the write
-// point lives in orchestrate/methods.ts's handler, not in orchestrate.ts's
-// own pipeline — evals/run.ts's nested orchestrate() calls bypass this
-// handler entirely and are therefore never recorded (see that write point's
-// own doc comment).
+// recordRun, AWAITED by the handler — see the settled-before-response pins
+// below). Dispatches THROUGH the real RPC dispatcher (not a direct
+// orchestrate() call) since the write point lives in
+// orchestrate/methods.ts's handler, not in orchestrate.ts's own pipeline —
+// evals/run.ts's nested orchestrate() calls bypass this handler entirely
+// and are therefore never recorded (see that write point's own doc
+// comment).
 describe("engine.orchestrate — run ledger write point (Task 3)", () => {
   const CARD_DIGEST_MARKER = "LEDGER-CARD-DIGEST-MARKER";
   const LEDGER_CARD_PAGE: WikiPage = {
@@ -1003,15 +1004,16 @@ describe("engine.orchestrate — run ledger write point (Task 3)", () => {
     expect(res.result.contextBranch).toBe("approved-card");
     expect(res.result.toolCallCounts).toEqual({ write_file: 2 });
 
-    // recordRun is fire-and-forget (runs/ledger.ts) — the ledger append
-    // happens on its own microtask chain, not before engine.orchestrate's
-    // own RPC response resolves, so this polls rather than reading
-    // immediately (mirrors runs-ledger.test.ts's own recordRun test).
-    let records: ReturnType<typeof readRuns>["records"] = [];
-    await vi.waitFor(() => {
-      records = readRuns(dir).records;
-      expect(records).toHaveLength(1);
-    });
+    // Read IMMEDIATELY — no polling. The write point AWAITS recordRun
+    // (orchestrate/methods.ts), so the append has settled before the RPC
+    // response resolves; this line deliberately pins that
+    // settled-before-response contract. It matters beyond read-after-write
+    // UX: an unawaited (fire-and-forget) append here once kept running on
+    // the libuv threadpool PAST the response, racing this suite's own
+    // afterEach rmSync teardown — re-creating .openfusion/cache mid-walk
+    // and flaking unrelated tests in this file with ENOTEMPTY.
+    const { records } = readRuns(dir);
+    expect(records).toHaveLength(1);
 
     const record = records[0]!;
     if (record.kind !== "orchestrate") throw new Error(`expected an "orchestrate" record, got "${record.kind}"`);
@@ -1048,11 +1050,11 @@ describe("engine.orchestrate — run ledger write point (Task 3)", () => {
     expect(res.error.code).toBe(RpcErrorCodes.SERVER_ERROR);
     expect(res.error.message).toContain("no harness");
 
-    let records: ReturnType<typeof readRuns>["records"] = [];
-    await vi.waitFor(() => {
-      records = readRuns(dir).records;
-      expect(records).toHaveLength(1);
-    });
+    // Immediate read — same settled-before-response pin as the success-path
+    // test above: the error record too must be durable by the time the RPC
+    // rejection reaches the caller.
+    const { records } = readRuns(dir);
+    expect(records).toHaveLength(1);
 
     const record = records[0]!;
     if (record.kind !== "orchestrate") throw new Error(`expected an "orchestrate" record, got "${record.kind}"`);

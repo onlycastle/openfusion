@@ -14,10 +14,13 @@ import type { Engine } from "../engine.js";
 // eval verdict; this module is what stops that.
 //
 // The ledger OBSERVES the harness; it is never load-bearing. `recordRun` —
-// the ONLY coupling any pipeline has to this module — is fire-and-forget:
-// it returns void, never throws, and on any append failure logs a single
-// line (the record's `kind` only) so the calling pipeline proceeds exactly
-// as if the ledger did not exist.
+// the ONLY coupling any pipeline has to this module — never throws and
+// never rejects: on any append failure it logs a single line (the record's
+// `kind` only) so the calling pipeline proceeds exactly as if the ledger
+// did not exist. It RETURNS its settled-when-durable promise so a caller
+// can choose to await completion (see recordRun's own doc comment for why
+// the orchestrate write point does) — awaiting is about ORDERING only,
+// never failure exposure: the promise cannot reject.
 //
 // The content line: records carry outcome metadata and verifier-level
 // failure signals (review-rejection reasons, error categories) needed for
@@ -173,13 +176,27 @@ export function readRuns(
 }
 
 // The only coupling any pipeline (orchestrate/evals/generate/card) has to
-// this module. Fire-and-forget: wraps the whole appendRun call — including
-// its synchronous RunRecordSchema.parse throw — in a promise chain so ANY
-// failure (schema-invalid record, disk full, permission error, ENOTDIR,
-// whatever) is caught here and never propagates to the caller. On failure,
-// logs the record's `kind` only — never its contents.
-export function recordRun(engine: Pick<Engine, "log">, projectDir: string, record: RunRecord): void {
-  void (async () => appendRun(projectDir, record))().catch(() => {
+// this module. Wraps the whole appendRun call — including its synchronous
+// RunRecordSchema.parse throw — in a promise chain so ANY failure
+// (schema-invalid record, disk full, permission error, ENOTDIR, whatever)
+// is caught here and never propagates to the caller. On failure, logs the
+// record's `kind` only — never its contents.
+//
+// Returns the never-rejecting promise (rather than `void`, its original
+// Task 1 signature) so a write point can AWAIT the append having settled
+// before its own RPC response resolves. Callers that don't care about
+// ordering may still ignore the return value — error isolation is identical
+// either way. The orchestrate write point (orchestrate/methods.ts) awaits
+// for two reasons: (1) read-after-write consistency — a client that calls
+// engine.orchestrate then engine.runs.list must see the run it just made;
+// (2) a write left dangling past the RPC response races the caller's
+// subsequent actions against `mkdir`/`appendFile` still in flight on the
+// libuv threadpool — concretely, the test suite's per-test temp-project
+// teardown (`rmSync(dir, {recursive})`) intermittently threw ENOTEMPTY when
+// the unawaited append re-created `.openfusion/cache/runs.jsonl` mid-walk
+// (Node's C++ rmSync does not re-scan on concurrent creation).
+export function recordRun(engine: Pick<Engine, "log">, projectDir: string, record: RunRecord): Promise<void> {
+  return (async () => appendRun(projectDir, record))().catch(() => {
     engine.log(`run-ledger: append failed (${record.kind})`);
   });
 }
