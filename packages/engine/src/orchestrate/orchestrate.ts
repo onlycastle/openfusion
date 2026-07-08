@@ -31,8 +31,8 @@ import path from "node:path";
 import { RpcErrorCodes } from "@openfusion/shared";
 import type { Engine } from "../engine.js";
 import type { FrontierSession } from "../engines/types.js";
-import type { AgentDef, WikiPage } from "../harness/schema.js";
-import { validateHarness } from "../harness/schema.js";
+import type { AgentDef, HarnessBundle } from "../harness/schema.js";
+import { CARD_SLUG, validateHarness } from "../harness/schema.js";
 import { HarnessValidationError, loadHarness } from "../harness/store.js";
 import { RunCancelledError } from "../rpc/cancel-registry.js";
 import { RpcMethodError } from "../rpc/errors.js";
@@ -231,85 +231,76 @@ function describePriorAttempt(prior: PriorAttempt | undefined): string | undefin
   return undefined;
 }
 
-// M6 Task 2: the total combined wiki-digest text handed to the worker via
-// engine.worker.run's `wikiDigest` param (see buildWikiDigestContext below)
-// is capped here so a harness with many wiki pages can never blow a cheap
-// worker model's context window. 8000 chars is roughly 2000 tokens at a
-// conservative 4-chars/token estimate — small next to any current worker
-// model's context, even stacked on top of the agent's own prompt and the
-// task text. Measured against the DIGEST TEXT ONLY (not the "### <title>"
-// markup this module wraps each page in below), so the actual prompt
-// contribution is somewhat larger than this number but never
-// unboundedly so.
-const MAX_WIKI_DIGEST_CHARS = 8000;
-
-// v1 of "wire wiki digests into worker prompts" (M6 Task 2): there is no
-// agent.taskClasses -> wiki-page mapping yet (harness/schema.ts's WikiPage
-// has no per-agent/per-taskClass affinity), so "which pages actually matter
-// for THIS task" isn't decidable — sending every page's digest, bounded, is
-// the simplest choice that can't silently starve a worker of context a
-// smarter selection might have kept. This is the harness's headline value
-// (distilled per-file/per-area knowledge that lets a cheap model work
-// without reading the whole repo) actually reaching the worker for the
-// first time; before this, buildWorkerTask (below) gave the worker only
-// agent.prompt + the task, with no wiki context of any kind.
+// M6 Task 6 (the ETH-anti-pattern injection swap): everything this function
+// replaces (the old buildWikiDigestContext, deleted here) sent EVERY wiki
+// page's digest into EVERY worker prompt, bounded only by a combined
+// character cap — exactly the configuration the ETH Zurich + DeepMind
+// AGENTS.md study (arXiv:2602.11988, v2 Jun 2026 — see this repo's own
+// docs/research/2026-07-07-harness-composition.md, §0 "the spine") measured
+// as HARMFUL, not merely low-value: LLM-generated context that restates what
+// an agent can already read from the repo cost -0.5-2% success and +20-23%
+// inference in 5 of 8 settings. The mechanism is redundancy, not noise —
+// which is why "send fewer/smaller digests" was never the fix; a categorical
+// swap is (spec docs/superpowers/specs/2026-07-08-wiki-project-card-design.md
+// §4):
 //
-// Pages are taken in the harness's own order (bundle.pages, i.e. on-disk
-// slug order — see harness/store.ts's loadHarness) until the NEXT page's
-// digest would push the running total over MAX_WIKI_DIGEST_CHARS; every
-// page up to that point is included in full (a digest is never
-// partially/mid-sentence truncated), and everything left over is named —
-// not silently dropped — in a trailing note so a truncated run is visible
-// rather than quietly incomplete. Returns undefined when the harness has no
-// pages at all (loadHarness's own readRequiredDir makes an empty
-// `pages` vanishingly rare for a real engine.harness.generate output, but a
-// hand-edited harness — schema.ts's own documented allowance — could still
-// have one), so callers never send an empty/meaningless digest section.
+//   1. An APPROVED Project Card (harness/schema.ts's CARD_SLUG page, gated on
+//      manifest.verification.card === "approved" — spec §3.4's mandatory
+//      human approval gate) is the ONLY generated content this whole research
+//      basis endorses injecting unconditionally: the same ETH study found
+//      HUMAN-CURATED context gave +4% at acceptable cost, because a human
+//      reviewer is exactly the filter that keeps restated/inferable material
+//      out. A card still in "draft" has not cleared that filter and gets
+//      NO MORE trust than no card at all — draft content falls straight
+//      through to branch 2, never a degraded/partial injection of its own.
+//   2. Failing that, the `build-and-test` prose page (if the harness has one)
+//      is injected ALONE — never combined with any other prose page, and
+//      never as a blanket "send all four prose pages" fallback the way this
+//      function's predecessor did. Exact build/test/run commands are the one
+//      class of "non-inferable or expensive to rediscover" fact the research
+//      doc's Pillar 1 table calls out as the harness's own approved-card
+//      content rule (spec §3.2) ALSO wants — this is the one legacy
+//      (unreviewed) digest class the research turned up positive evidence
+//      for, so it is kept as a fallback rather than dropped to nothing.
+//   3. Otherwise: nothing. Every other prose page (architecture, subsystems,
+//      conventions, or even build-and-test when a draft/approved card
+//      already satisfied branch 1) is available to a worker ONLY through the
+//      on-demand retrieval tools spec §5 describes (a later task) — never
+//      bulk-injected into the prompt.
 //
-// Composed as its OWN `wikiDigest` param on the engine.worker.run call
-// (worker/methods.ts's RunParamsSchema already had this field; nothing
-// wired it until now) rather than folded into buildWorkerTask's own task
-// string — worker/loop.ts's buildPrompt already renders wikiDigest under
-// its own "# Repository context" heading, ahead of the task, exactly
-// mirroring how a real repository wiki would be handed to a human
-// contributor: read the context, then do the task. The "## Project
-// knowledge (from the harness wiki)" heading below nests one level inside
-// that existing "# Repository context" section.
-function buildWikiDigestContext(pages: readonly WikiPage[]): string | undefined {
-  if (pages.length === 0) return undefined;
+// The returned `branch` exists purely so the CALL SITE can notify which of
+// the three paths fired (`progress(engine, "load", \`worker context:
+// ${branch}\`, ...)`, below) without ever putting the digest TEXT itself into
+// a log line or notification — same never-logged posture the deleted
+// function held (this is worker-PROMPT content, same class as `params.task`
+// and every worker/frontier summary this pipeline already treats this way).
+type WorkerContextBranch = "approved-card" | "build-and-test-fallback" | "none";
 
-  const included: WikiPage[] = [];
-  let total = 0;
-  for (const page of pages) {
-    if (total + page.digest.length > MAX_WIKI_DIGEST_CHARS) break;
-    included.push(page);
-    total += page.digest.length;
-  }
-  // Unreachable under a schema-valid harness (WikiPageSchema caps a single
-  // digest at 1200 chars, well under MAX_WIKI_DIGEST_CHARS, so the FIRST
-  // page always fits) — guarded anyway so a future cap change or a
-  // hand-edited harness loaded straight off disk can never silently emit
-  // an empty digest section instead of at least the first page's own.
-  if (included.length === 0) {
-    included.push(pages[0]!);
+function buildWorkerContext(bundle: HarnessBundle): { text: string | undefined; branch: WorkerContextBranch } {
+  const cardPage = bundle.pages.find((page) => page.slug === CARD_SLUG);
+  if (cardPage !== undefined && bundle.manifest.verification.card === "approved") {
+    return { text: `## Project card\n\n${cardPage.digest}`, branch: "approved-card" };
   }
 
-  const sections = included.map((page) => `### ${page.title}\n\n${page.digest}`);
-  const omitted = pages.length - included.length;
-  const truncationNote =
-    omitted > 0
-      ? `\n\n[... ${omitted} more wiki page digest(s) omitted — combined digest context is capped at ${MAX_WIKI_DIGEST_CHARS} characters]`
-      : "";
-  return `## Project knowledge (from the harness wiki)\n\n${sections.join("\n\n")}${truncationNote}`;
+  const buildAndTestPage = bundle.pages.find((page) => page.slug === "build-and-test");
+  if (buildAndTestPage !== undefined) {
+    return {
+      text: `## Project knowledge (from the harness wiki)\n\n### ${buildAndTestPage.title}\n\n${buildAndTestPage.digest}`,
+      branch: "build-and-test-fallback",
+    };
+  }
+
+  return { text: undefined, branch: "none" };
 }
 
 // Builds the single `task` string handed to engine.worker.run: the routed
 // agent's own specialist prompt, then the user's task — plus, from the
 // second attempt onward, a feedback line naming what the PRIOR attempt got
 // wrong (Final review Fix 3), so a retry is an informed correction rather
-// than an identical re-roll. The harness's wiki digests are NOT folded in
-// here — see buildWikiDigestContext's own doc comment above for why they
-// travel as engine.worker.run's separate `wikiDigest` param instead.
+// than an identical re-roll. The harness's worker context (the approved
+// card, or its build-and-test fallback) is NOT folded in here — see
+// buildWorkerContext's own doc comment above for why it travels as
+// engine.worker.run's separate `wikiDigest` param instead.
 function buildWorkerTask(agent: AgentDef, task: string, prior?: PriorAttempt): string {
   const base = `${agent.prompt}\n\n${task}`;
   const feedback = describePriorAttempt(prior);
@@ -620,14 +611,17 @@ export async function orchestrate(engine: Engine, params: OrchestrateParams): Pr
     const routed = routeTask(params.task, harness, engine.models.registry);
     progress(engine, "route", `routed to agent "${routed.agent.name}" (class ${routed.taskClass})`, params.runId);
 
-    // M6 Task 2: computed ONCE per run (the harness's own pages never change
-    // between worker attempts) and threaded into every engine.worker.run
-    // call below via its `wikiDigest` param — see buildWikiDigestContext's
-    // own doc comment for the v1 "send every page, bounded" design and the
-    // MAX_WIKI_DIGEST_CHARS cap. Never logged (engine.log) anywhere in this
-    // module — it's worker-prompt content, same posture as `params.task`
-    // and every worker/frontier summary this pipeline handles.
-    const wikiDigest = buildWikiDigestContext(harness.pages);
+    // M6 Task 6: computed ONCE per run (the harness's own pages/manifest
+    // never change between worker attempts) and threaded into every
+    // engine.worker.run call below via its `wikiDigest` param — see
+    // buildWorkerContext's own doc comment (above) for the ETH-anti-pattern
+    // injection-swap rationale (approved card first, build-and-test fallback
+    // second, nothing otherwise). Only the branch NAME is ever logged or
+    // notified (immediately below) — the digest TEXT itself never reaches
+    // engine.log or a notification, same posture as `params.task` and every
+    // worker/frontier summary this pipeline handles.
+    const workerContext = buildWorkerContext(harness);
+    progress(engine, "load", `worker context: ${workerContext.branch}`, params.runId);
 
     const maxWorkerAttempts =
       params.maxWorkerAttempts ?? harness.routing.escalation.failuresBeforeFrontier ?? DEFAULT_MAX_WORKER_ATTEMPTS;
@@ -657,7 +651,7 @@ export async function orchestrate(engine: Engine, params: OrchestrateParams): Pr
           workerResult = await callEngineMethod<WorkerRunResponse>(engine, "engine.worker.run", {
             projectDir: params.projectDir,
             task: buildWorkerTask(routed.agent, params.task, priorAttempt),
-            wikiDigest,
+            wikiDigest: workerContext.text,
             providerId,
             model,
             // Fix 1: unlike reviewTimeoutMs/escalateTimeoutMs above, this is
