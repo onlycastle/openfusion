@@ -38,7 +38,7 @@ harness; it is never load-bearing: every append is wrapped so a failure logs one
 ```
 orchestrate() ─ return/error path ─┐
 runEvals()   ─ return ────────────┼──▶ appendRun(projectDir, record) ──▶ cache/runs.jsonl
-generateHarness() ─ return ───────┤        (fire-and-forget, never throws)
+generateHarness() ─ return ───────┤        (awaited; never rejects)
 card.update / card.approve ───────┘
 engine.runs.list {projectDir, kind?, limit?} ──▶ readRuns() ──▶ newest-first records
 Desktop: EvalsScreen history strip · OrchestrateScreen recent-outcomes row

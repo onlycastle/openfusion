@@ -1069,6 +1069,43 @@ describe("engine.orchestrate — run ledger write point (Task 3)", () => {
     expect(record.contextBranch).toBe("none");
   });
 
+  // Final-review Fix 3: the ledger append itself can fail (disk full,
+  // permission error, ENOTDIR — anything appendRun's mkdir/appendFile or its
+  // Fix-1 ensureGitignoreGuard call can throw) on an orchestrate run that
+  // otherwise SUCCEEDED. `recordRun`'s never-rejects contract must hold even
+  // then: the RPC still resolves with its normal result, and the failure is
+  // only ever visible as a single kind-only engine.log line.
+  it("a ledger append failure during a SUCCESSFUL orchestrate still resolves the RPC, and logs the append-failed line", async () => {
+    dir = makeRepo();
+    await writeTestHarness(dir);
+    const logs: string[] = [];
+    engine = createEngine({ log: (m) => logs.push(m) });
+    engine.models.registry.configure({ id: "p1", kind: "deepseek", apiKey: TEST_API_KEY });
+    engine.models.registry.setTestModel("p1", makeWorkerMock("hello.txt", "hi", "done"));
+    engine.frontier.registerAdapter(
+      makeFakeFrontierAdapter({ reviewVerdicts: [{ decision: "approve", reasons: [], severity: "none" }] }),
+    );
+
+    // Force appendRun's own mkdir to fail WITHOUT taking the harness fixture
+    // down with it: writeTestHarness's manifest.json/wiki/agents/routing.yaml
+    // all live directly under `.openfusion/`, so making `.openfusion` itself
+    // a non-directory (the mechanism runs-ledger.test.ts's unit-level fs
+    // failure test uses) would make loadHarness fail too, which is a
+    // different, uninteresting failure mode. Instead, make `.openfusion/cache`
+    // — a sibling appendRun creates on demand, never touched by writeHarness
+    // — a FILE. Fix 1's ensureGitignoreGuard call (targeting `.openfusion`
+    // itself, still a real directory here, already carrying the
+    // `.gitignore` writeTestHarness wrote) runs first and succeeds; only the
+    // `mkdir(dirname(runs.jsonl))` call just past it hits the FILE and fails.
+    writeFileSync(path.join(dir, ".openfusion", "cache"), "not a directory");
+
+    const res = await call(engine, "engine.orchestrate", { projectDir: dir, task: "add hello.txt" });
+    expect(res.error).toBeUndefined();
+    expect(res.result.outcome).toBe("worker-approved");
+
+    expect(logs).toContain("run-ledger: append failed (orchestrate)");
+  });
+
   it("evals-internal orchestrate() calls (bypassing the RPC dispatcher) are never written to the ledger", async () => {
     // Regression guard for the "evals excluded" contract: calling the plain
     // orchestrate() pipeline function directly — exactly what

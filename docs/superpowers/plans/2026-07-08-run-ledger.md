@@ -4,7 +4,7 @@
 
 **Goal:** Persist a durable, metadata-plus-failure-causes record of every user-initiated orchestrate / eval / generation / card action to `<projectDir>/.openfusion/cache/runs.jsonl`, readable via `engine.runs.list` and surfaced as two compact history strips in the desktop.
 
-**Architecture:** A self-contained `runs/ledger.ts` module (zod-validated JSONL append/read) + a `recordRun` fire-and-forget wrapper. ALL write points live in the RPC handler layer (`orchestrate/methods.ts`, `evals/methods.ts`, `harness/methods.ts`) — pipelines stay untouched except two small additive plumbing changes (surface `contextBranch` on `OrchestrateResult`; surface `toolCallCounts` on the worker-run result). Recording at the RPC layer means eval-internal orchestrate runs (direct function calls from `evals/run.ts`) are naturally excluded — they're captured by the eval record instead.
+**Architecture:** A self-contained `runs/ledger.ts` module (zod-validated JSONL append/read) + an awaited, never-rejecting `recordRun` wrapper. ALL write points live in the RPC handler layer (`orchestrate/methods.ts`, `evals/methods.ts`, `harness/methods.ts`) — pipelines stay untouched except two small additive plumbing changes (surface `contextBranch` on `OrchestrateResult`; surface `toolCallCounts` on the worker-run result). Recording at the RPC layer means eval-internal orchestrate runs (direct function calls from `evals/run.ts`) are naturally excluded — they're captured by the eval record instead.
 
 **Tech Stack:** all in-codebase (zod v4, node:fs, existing RPC register pattern, React+RTL). No new dependencies.
 

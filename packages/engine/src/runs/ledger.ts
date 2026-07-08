@@ -3,6 +3,7 @@ import { appendFile, mkdir } from "node:fs/promises";
 import path from "node:path";
 import { z } from "zod";
 import type { Engine } from "../engine.js";
+import { ensureGitignoreGuard } from "../util/gitignore-guard.js";
 
 // Run Ledger v1 — see docs/superpowers/specs/2026-07-08-run-ledger-design.md.
 //
@@ -112,8 +113,10 @@ export type RunRecord = z.infer<typeof RunRecordSchema>;
 // Single source of truth for where a project's run ledger lives, so callers
 // that only need the path don't duplicate this join and risk drifting from
 // what appendRun/readRuns actually use. Sibling of wikiDbPath (wiki/store.ts
-// :205); same cache/ semantics (auto-gitignored by writeHarness's
-// ensureGitignoreGuard, never pruned by regeneration).
+// :205); same cache/ semantics (never pruned by regeneration). Gitignore
+// coverage is appendRun's OWN responsibility (see its ensureGitignoreGuard
+// call below) — it must not assume writeHarness (or any other caller) ran
+// first.
 export function runsLedgerPath(projectDir: string): string {
   return path.join(path.resolve(projectDir), ".openfusion", "cache", "runs.jsonl");
 }
@@ -122,8 +125,24 @@ export function runsLedgerPath(projectDir: string): string {
 // throws rather than ever writing garbage to the ledger. Callers that want
 // fire-and-forget semantics (every real pipeline) go through `recordRun`
 // below, which catches this throw too.
+//
+// Self-guards its own gitignore coverage (final-review Fix 1) rather than
+// trusting that some other write path (writeHarness, the wiki symbol-index
+// store) has already run `ensureGitignoreGuard` for this project. Without
+// this, `engine.orchestrate` on a project whose harness has never been
+// generated (e.g. the very first call, which fails fast on the error path)
+// could create `.openfusion/cache/runs.jsonl` with NO `.openfusion/.gitignore`
+// anywhere in the repo — `git status` then shows `.openfusion/` as untracked
+// and the ledger becomes committable, contradicting the "local, gitignored"
+// contract (spec §1.1). Placed AFTER the schema parse (so an invalid record
+// still writes nothing at all, not even a `.gitignore`) and BEFORE the
+// mkdir/appendFile that actually create the ledger file. `ensureGitignoreGuard`
+// is additive/idempotent (util/gitignore-guard.ts), so this is safe to call
+// on every append regardless of what harness/store.ts or wiki/store.ts have
+// already written into the same `.openfusion/.gitignore`.
 export async function appendRun(projectDir: string, record: RunRecord): Promise<void> {
   const validated = RunRecordSchema.parse(record);
+  ensureGitignoreGuard(path.join(path.resolve(projectDir), ".openfusion"), ["cache/"]);
   const filePath = runsLedgerPath(projectDir);
   await mkdir(path.dirname(filePath), { recursive: true });
   await appendFile(filePath, JSON.stringify(validated) + "\n");
