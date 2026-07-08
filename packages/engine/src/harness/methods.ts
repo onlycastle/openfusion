@@ -7,8 +7,8 @@ import { registerMethod } from "../rpc/register.js";
 import { HarnessGenError } from "./driver.js";
 import { exportHarness } from "./exporters.js";
 import { generateHarness, type GenerateHarnessResult } from "./generate.js";
-import { AgentModelSchema, validateHarness, type HarnessBundle } from "./schema.js";
-import { HarnessValidationError, harnessStatus, loadHarness, writeHarness } from "./store.js";
+import { AgentModelSchema, CARD_SLUG, validateHarness, type HarnessBundle } from "./schema.js";
+import { HarnessValidationError, harnessStatus, loadHarness, setCardState, writeHarness } from "./store.js";
 
 const ProjectParamsSchema = z.object({ projectDir: z.string().min(1) });
 
@@ -27,6 +27,25 @@ const UpdateEscalationParamsSchema = z.object({
   projectDir: z.string().min(1),
   failuresBeforeFrontier: z.number().int().min(1).max(3),
 });
+
+const CardUpdateParamsSchema = z.object({
+  projectDir: z.string().min(1),
+  // Same 2500-char ceiling as WikiPageSchema.digest (schema.ts) — the card's
+  // digest is the one page digest injected into EVERY worker prompt
+  // unconditionally, so it alone gets the wider budget.
+  digest: z.string().min(1).max(2500),
+});
+
+// Shared by engine.harness.read (card: null vs populated) and
+// engine.harness.card.update/.approve's "no project card" guard: the card
+// slug (schema.ts's CARD_SLUG) must be present as an actual wiki page. A
+// bundle can be hand-edited (spec §7.4) into having one without the other,
+// so this alone is not sufficient for read's non-null card — see
+// engine.harness.read below, which additionally requires
+// manifest.verification.card !== undefined.
+function findCardPage(bundle: HarnessBundle): HarnessBundle["pages"][number] | undefined {
+  return bundle.pages.find((p) => p.slug === CARD_SLUG);
+}
 
 // Holds the per-project in-flight generation map. Mirrors WikiService.build's
 // #building coalescing exactly: a second engine.harness.generate call for a
@@ -168,6 +187,19 @@ export function registerHarnessMethods(engine: Engine): void {
         issues: structuralIssues,
       });
     }
+    // Non-null ONLY when BOTH the project-card page and the manifest's card
+    // verification field exist — a hand-edited bundle (spec §7.4) can carry
+    // one without the other, and that partial state is not a usable card
+    // (nothing to inject into worker prompts, or nothing to report an
+    // approval state for), so it collapses to null rather than a
+    // half-populated shape.
+    const cardPage = findCardPage(bundle);
+    const cardState = bundle.manifest.verification.card;
+    const card =
+      cardPage !== undefined && cardState !== undefined
+        ? { digest: cardPage.digest, body: cardPage.body, state: cardState }
+        : null;
+
     return {
       agents: bundle.agents.map((a) => ({
         name: a.name,
@@ -177,6 +209,7 @@ export function registerHarnessMethods(engine: Engine): void {
       })),
       defaultAgent: bundle.routing.defaults.agent,
       escalation: bundle.routing.escalation.failuresBeforeFrontier,
+      card,
     };
   });
 
@@ -226,5 +259,54 @@ export function registerHarnessMethods(engine: Engine): void {
       }),
     );
     return { updated: true };
+  });
+
+  // An edit ALWAYS invalidates approval (spec §3.4): every successful update
+  // resets manifest.verification.card to "draft" in the SAME mutateHarness
+  // call that writes the new digest, so the on-disk manifest and page can
+  // never observe an approved card sitting next to a digest nobody has
+  // reviewed yet.
+  registerMethod(engine.dispatcher, "engine.harness.card.update", CardUpdateParamsSchema, async ({ projectDir, digest }) => {
+    await engine.harness.serializeWrite(projectDir, () =>
+      mutateHarness(projectDir, (bundle) => {
+        const page = findCardPage(bundle);
+        if (page === undefined) {
+          throw new RpcMethodError(RpcErrorCodes.SERVER_ERROR, "no project card; regenerate the harness first");
+        }
+        page.digest = digest;
+        bundle.manifest.verification.card = "draft";
+      }),
+    );
+    return { updated: true };
+  });
+
+  // Deliberately does NOT go through mutateHarness/writeHarness: approving is
+  // a manifest-only flip (mirrors setCardState's own header comment) and
+  // must not re-serialize and rewrite every wiki page/agent/routing artifact
+  // on disk just to change one field. Instead this loads the bundle (with
+  // the exact same loadHarness error mapping engine.harness.read uses) purely
+  // to check the card is actually present and approvable, then delegates the
+  // single-file manifest write to store.ts's setCardState.
+  registerMethod(engine.dispatcher, "engine.harness.card.approve", ProjectParamsSchema, async ({ projectDir }) => {
+    await engine.harness.serializeWrite(projectDir, async () => {
+      let bundle;
+      try {
+        bundle = loadHarness(projectDir);
+      } catch (err) {
+        if (err instanceof HarnessValidationError) {
+          throw new RpcMethodError(RpcErrorCodes.SERVER_ERROR, err.message, { issues: err.issues });
+        }
+        throw err;
+      }
+      if (bundle === null) {
+        throw new RpcMethodError(RpcErrorCodes.SERVER_ERROR, "no valid harness; run engine.harness.generate first");
+      }
+      const hasApprovableCard = findCardPage(bundle) !== undefined && bundle.manifest.verification.card !== undefined;
+      if (!hasApprovableCard) {
+        throw new RpcMethodError(RpcErrorCodes.SERVER_ERROR, "no project card; regenerate the harness first");
+      }
+      await setCardState(projectDir, "approved");
+    });
+    return { approved: true };
   });
 }

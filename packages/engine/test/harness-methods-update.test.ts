@@ -3,8 +3,8 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { createEngine, type Engine } from "../src/engine.js";
-import { loadHarness, writeHarness } from "../src/harness/store.js";
-import type { HarnessBundle } from "../src/harness/schema.js";
+import { harnessStatus, loadHarness, writeHarness } from "../src/harness/store.js";
+import { CARD_SLUG, type HarnessBundle } from "../src/harness/schema.js";
 
 let dir: string;
 let engine: Engine;
@@ -46,6 +46,24 @@ async function setup(): Promise<void> {
   engine = createEngine();
   dir = mkdtempSync(path.join(os.tmpdir(), "of-upd-"));
   await writeHarness(dir, bundle());
+}
+
+// bundle() plus a project-card page and the manifest's card verification
+// field — the fixture card.update/card.approve exercise. Everything else
+// about the base bundle is untouched.
+function bundleWithCard(cardState: "draft" | "approved" = "draft"): HarnessBundle {
+  const base = bundle();
+  return {
+    ...base,
+    manifest: { ...base.manifest, verification: { ...base.manifest.verification, card: cardState } },
+    pages: [...base.pages, { slug: CARD_SLUG, title: "Project Card", digest: "card digest", body: "card body" }],
+  };
+}
+
+async function setupWithCard(cardState: "draft" | "approved" = "draft"): Promise<void> {
+  engine = createEngine();
+  dir = mkdtempSync(path.join(os.tmpdir(), "of-upd-card-"));
+  await writeHarness(dir, bundleWithCard(cardState));
 }
 
 describe("engine.harness.updateAgentModel", () => {
@@ -131,5 +149,55 @@ describe("engine.harness.updateEscalation", () => {
     await setup();
     const res = await call("engine.harness.updateEscalation", { projectDir: dir, failuresBeforeFrontier: 9 });
     expect(res.error.message).toMatch(/invalid params/i);
+  });
+});
+
+describe("engine.harness.card.update", () => {
+  it("edits the on-disk digest", async () => {
+    await setupWithCard("draft");
+    const res = await call("engine.harness.card.update", { projectDir: dir, digest: "new digest" });
+    expect(res.error).toBeUndefined();
+    expect(res.result).toEqual({ updated: true });
+    const reloaded = loadHarness(dir)!;
+    const page = reloaded.pages.find((p) => p.slug === CARD_SLUG)!;
+    expect(page.digest).toBe("new digest");
+    expect(reloaded.manifest.verification.card).toBe("draft");
+  });
+
+  it("resets an approved card back to draft on edit", async () => {
+    await setupWithCard("approved");
+    const res = await call("engine.harness.card.update", { projectDir: dir, digest: "edited digest" });
+    expect(res.error).toBeUndefined();
+    const reloaded = loadHarness(dir)!;
+    expect(reloaded.manifest.verification.card).toBe("draft");
+    const page = reloaded.pages.find((p) => p.slug === CARD_SLUG)!;
+    expect(page.digest).toBe("edited digest");
+  });
+
+  it("errors when the project has no card", async () => {
+    await setup();
+    const res = await call("engine.harness.card.update", { projectDir: dir, digest: "x" });
+    expect(res.result).toBeUndefined();
+    expect(res.error.message).toMatch(/no project card; regenerate the harness first/i);
+  });
+});
+
+describe("engine.harness.card.approve", () => {
+  it("flips harnessStatus(dir).card to approved and preserves every other manifest field", async () => {
+    await setupWithCard("draft");
+    const before = loadHarness(dir)!.manifest;
+    const res = await call("engine.harness.card.approve", { projectDir: dir });
+    expect(res.error).toBeUndefined();
+    expect(res.result).toEqual({ approved: true });
+    expect(harnessStatus(dir).card).toBe("approved");
+    const after = loadHarness(dir)!.manifest;
+    expect(after).toEqual({ ...before, verification: { ...before.verification, card: "approved" } });
+  });
+
+  it("errors on a legacy harness with no card", async () => {
+    await setup();
+    const res = await call("engine.harness.card.approve", { projectDir: dir });
+    expect(res.result).toBeUndefined();
+    expect(res.error.message).toMatch(/no project card; regenerate the harness first/i);
   });
 });
