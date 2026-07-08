@@ -263,12 +263,17 @@ export interface WikiStatus {
 
 /** Mirrors `packages/engine/src/harness/store.ts`'s `harnessStatus` return:
  * a cheap manifest-only read of whether `.openfusion` has a generated
- * harness, whether its structure passed, and which git HEAD it targets. */
+ * harness, whether its structure passed, and which git HEAD it targets.
+ * `card` mirrors `manifest.verification.card` — `null` when no project card
+ * exists yet (a hand-edited or pre-card-feature bundle). This panel doesn't
+ * read `card` itself (it reads `HarnessTeam.card` via `harnessRead`
+ * instead), but Task 10's screen does. */
 export interface HarnessStatus {
   present: boolean;
   structural: "pass" | "fail" | null;
   evals: string | null;
   headSha: string | null;
+  card: "draft" | "approved" | null;
 }
 
 /** Mirrors the engine's `AgentModel` (harness/schema.ts). */
@@ -282,11 +287,15 @@ export interface HarnessAgentView {
   model: AgentModel;
 }
 
-/** `engine.harness.read` result — the trimmed, editable team view. */
+/** `engine.harness.read` result — the trimmed, editable team view. `card` is
+ * `null` when the harness has no project card page (a hand-edited bundle can
+ * have one without the other — see the engine's `findCardPage` +
+ * `manifest.verification.card` gate in `harness/methods.ts`). */
 export interface HarnessTeam {
   agents: HarnessAgentView[];
   defaultAgent: string;
   escalation: number;
+  card: { digest: string; body: string; state: "draft" | "approved" } | null;
 }
 
 /** Mirrors `packages/engine/src/harness/generate.ts`'s
@@ -601,6 +610,21 @@ export class EngineClient {
   /** `engine.harness.updateEscalation` — set failuresBeforeFrontier (1–3). */
   harnessUpdateEscalation(projectDir: string, failuresBeforeFrontier: number, opts?: CallOptions): Promise<{ updated: boolean }> {
     return this.call<{ updated: boolean }>("engine.harness.updateEscalation", { projectDir, failuresBeforeFrontier }, opts);
+  }
+
+  /** `engine.harness.card.update` — save an edited card digest. The engine
+   * always resets the card to "draft" as part of this same write (an edit
+   * invalidates any prior approval), so no separate approve-reset call is
+   * needed here. */
+  harnessCardUpdate(projectDir: string, digest: string, opts?: CallOptions): Promise<void> {
+    return this.call<void>("engine.harness.card.update", { projectDir, digest }, opts);
+  }
+
+  /** `engine.harness.card.approve` — flip the project card's manifest state
+   * to "approved" (manifest-only write; see `harness/methods.ts`'s
+   * `engine.harness.card.approve` for why it skips `mutateHarness`). */
+  harnessCardApprove(projectDir: string, opts?: CallOptions): Promise<void> {
+    return this.call<void>("engine.harness.card.approve", { projectDir }, opts);
   }
 
   // -- cancellable long runs (M7c Task 2) ----------------------------------

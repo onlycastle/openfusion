@@ -72,7 +72,7 @@ function wikiStatusFixture(overrides: Partial<WikiStatus> = {}): WikiStatus {
 }
 
 function harnessStatusFixture(overrides: Partial<HarnessStatus> = {}): HarnessStatus {
-  return { present: true, structural: "pass", evals: "pending", headSha: "abc123", ...overrides };
+  return { present: true, structural: "pass", evals: "pending", headSha: "abc123", card: null, ...overrides };
 }
 
 function generateHarnessFixture(overrides: Partial<GenerateHarnessResult> = {}): GenerateHarnessResult {

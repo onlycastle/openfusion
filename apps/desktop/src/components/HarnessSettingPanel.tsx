@@ -30,6 +30,11 @@ export function HarnessSettingPanel() {
   const { activeProjectDir } = useProject();
   const [state, setState] = useState<PanelState>({ status: "loading" });
   const [options, setOptions] = useState<ModelOption[]>([]);
+  // Set only by a failed Approve (spec: stays draft, shows the error inline,
+  // does NOT reload) — every other card action (Save draft, a successful
+  // Approve, or a fresh `load`) clears it, so a stale banner can never
+  // survive past the action that produced it.
+  const [cardError, setCardError] = useState<string | null>(null);
 
   // The status/configs/read calls below resolve against whichever project is
   // CURRENT when they settle, not whichever was current when they started —
@@ -42,6 +47,7 @@ export function HarnessSettingPanel() {
 
   const load = useCallback((dir: string) => {
     setState({ status: "loading" });
+    setCardError(null);
     Promise.all([engineClient.harnessStatus(dir), listProviderConfigs()])
       .then(([status, configs]) => {
         if (activeProjectDirRef.current !== dir) return;
@@ -102,6 +108,37 @@ export function HarnessSettingPanel() {
     [activeProjectDir, load],
   );
 
+  const onCardSave = useCallback(
+    (digest: string) => {
+      if (activeProjectDir === null) return;
+      const dir = activeProjectDir;
+      // Reconcile-by-reload, both branches — house pattern (see onModelChange
+      // above): a save can also flip an already-approved card back to draft
+      // server-side, so even the success path needs a fresh `load`, not just
+      // a local patch.
+      engineClient.harnessCardUpdate(dir, digest).then(
+        () => load(dir),
+        () => load(dir),
+      );
+    },
+    [activeProjectDir, load],
+  );
+
+  const onCardApprove = useCallback(() => {
+    if (activeProjectDir === null) return;
+    const dir = activeProjectDir;
+    engineClient.harnessCardApprove(dir).then(
+      () => load(dir),
+      (err: unknown) => {
+        // Stale-guard: a slower response landing after the user has already
+        // moved to a different project must not paint an error banner over
+        // that OTHER project's (unrelated) card section.
+        if (activeProjectDirRef.current !== dir) return;
+        setCardError(friendlyMessage(err));
+      },
+    );
+  }, [activeProjectDir, load]);
+
   if (state.status === "loading") return <div className="harness-panel-screen"><p role="status">Loading harness…</p></div>;
   if (state.status === "error") return <div className="harness-panel-screen"><p role="alert" className="error-text">{state.message}</p></div>;
   if (state.status === "missing") {
@@ -115,6 +152,9 @@ export function HarnessSettingPanel() {
   return (
     <div className="harness-panel-screen">
       <h2 className="harness-tree-title">Harness setting</h2>
+      {state.team.card !== null && (
+        <ProjectCardSection card={state.team.card} error={cardError} onSave={onCardSave} onApprove={onCardApprove} />
+      )}
       <div className="harness-tree-root">Claude Code <span className="muted-text">orchestrator · frontier</span></div>
       <ul className="harness-tree">
         {state.team.agents.map((agent) => (
@@ -155,5 +195,69 @@ function AgentRow({ agent, options, onChange }: { agent: HarnessAgentView; optio
         ))}
       </select>
     </li>
+  );
+}
+
+/** Renders ABOVE the agent tree (spec §3.4) whenever `team.card !== null` —
+ * absent entirely otherwise. Owns only the textarea's local edit-in-progress
+ * state; the actual `harnessCardUpdate`/`harnessCardApprove` calls, the
+ * reconcile-by-reload on save, and the stale-project guard on a failed
+ * approve all live in the parent (mirrors AgentRow/onModelChange: rows are
+ * presentational, the panel owns the RPCs). */
+function ProjectCardSection({
+  card,
+  error,
+  onSave,
+  onApprove,
+}: {
+  card: NonNullable<HarnessTeam["card"]>;
+  error: string | null;
+  onSave: (digest: string) => void;
+  onApprove: () => void;
+}) {
+  const [digestDraft, setDigestDraft] = useState(card.digest);
+
+  // Reseed whenever a reload hands us a NEW `card` (a fresh RPC response
+  // object) — covers both the happy path (post-save/-approve reload) and the
+  // "failed save" reconcile-by-reload, which must discard the rejected edit
+  // and fall back to whatever digest is actually on disk. A failed APPROVE
+  // deliberately does not reload (spec: "stay draft"), so `card` keeps the
+  // same reference and this effect correctly does nothing.
+  useEffect(() => {
+    setDigestDraft(card.digest);
+  }, [card]);
+
+  const isDraft = card.state === "draft";
+  const isDirty = digestDraft !== card.digest;
+
+  return (
+    <section className="harness-card">
+      <div className="harness-card-header">
+        <h3 className="harness-card-title">Project card</h3>
+        <span className={`harness-card-badge harness-card-badge-${card.state}`}>{isDraft ? "Draft" : "Approved"}</span>
+      </div>
+      <textarea
+        className="harness-card-textarea"
+        aria-label="Project card digest"
+        value={digestDraft}
+        disabled={!isDraft}
+        onChange={(e) => setDigestDraft(e.target.value)}
+      />
+      <details className="harness-card-details">
+        <summary>Full card</summary>
+        <pre>{card.body}</pre>
+      </details>
+      {error !== null && <p role="alert" className="error-text">{error}</p>}
+      <div className="harness-card-actions">
+        <button type="button" disabled={!isDraft || !isDirty} onClick={() => onSave(digestDraft)}>
+          Save draft
+        </button>
+        {isDraft && (
+          <button type="button" disabled={isDirty} onClick={onApprove}>
+            Approve
+          </button>
+        )}
+      </div>
+    </section>
   );
 }
