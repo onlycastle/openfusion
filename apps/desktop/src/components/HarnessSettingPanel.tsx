@@ -85,6 +85,7 @@ export function HarnessSettingPanel() {
   const onModelChange = useCallback(
     (agentName: string, value: string) => {
       if (activeProjectDir === null) return;
+      const dir = activeProjectDir;
       const option = options.find((o) => o.value === value);
       if (option === undefined) return;
       // Optimistic: reflect immediately, reconcile (reload) on failure.
@@ -93,7 +94,13 @@ export function HarnessSettingPanel() {
           ? { status: "ready", team: { ...prev.team, agents: prev.team.agents.map((a) => (a.name === agentName ? { ...a, model: option.model } : a)) } }
           : prev,
       );
-      engineClient.harnessUpdateAgentModel(activeProjectDir, agentName, option.model).catch(() => load(activeProjectDir));
+      engineClient.harnessUpdateAgentModel(dir, agentName, option.model).catch(() => {
+        // Stale-guard: don't let a slow failure's reload stomp whatever
+        // project the user has since switched to (see `load`'s own guard —
+        // this is the settle-time call site, not the async continuation).
+        if (activeProjectDirRef.current !== dir) return;
+        load(dir);
+      });
     },
     [activeProjectDir, options, load],
   );
@@ -101,9 +108,14 @@ export function HarnessSettingPanel() {
   const onEscalationChange = useCallback(
     (value: string) => {
       if (activeProjectDir === null) return;
+      const dir = activeProjectDir;
       const n = Number(value);
       setState((prev) => (prev.status === "ready" ? { status: "ready", team: { ...prev.team, escalation: n } } : prev));
-      engineClient.harnessUpdateEscalation(activeProjectDir, n).catch(() => load(activeProjectDir));
+      engineClient.harnessUpdateEscalation(dir, n).catch(() => {
+        // Stale-guard: same as onModelChange above.
+        if (activeProjectDirRef.current !== dir) return;
+        load(dir);
+      });
     },
     [activeProjectDir, load],
   );
@@ -117,8 +129,17 @@ export function HarnessSettingPanel() {
       // server-side, so even the success path needs a fresh `load`, not just
       // a local patch.
       engineClient.harnessCardUpdate(dir, digest).then(
-        () => load(dir),
-        () => load(dir),
+        () => {
+          // Stale-guard: a slower response landing after the user has
+          // switched projects must not flip the NEW project's rendered
+          // panel back to "Loading harness…" via a reload for this OLD dir.
+          if (activeProjectDirRef.current !== dir) return;
+          load(dir);
+        },
+        () => {
+          if (activeProjectDirRef.current !== dir) return;
+          load(dir);
+        },
       );
     },
     [activeProjectDir, load],
@@ -128,7 +149,11 @@ export function HarnessSettingPanel() {
     if (activeProjectDir === null) return;
     const dir = activeProjectDir;
     engineClient.harnessCardApprove(dir).then(
-      () => load(dir),
+      () => {
+        // Stale-guard: same reasoning as onCardSave's success branch above.
+        if (activeProjectDirRef.current !== dir) return;
+        load(dir);
+      },
       (err: unknown) => {
         // Stale-guard: a slower response landing after the user has already
         // moved to a different project must not paint an error banner over

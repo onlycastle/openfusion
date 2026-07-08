@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { render, screen, fireEvent, waitFor, cleanup } from "@testing-library/react";
+import { act, render, screen, fireEvent, waitFor, cleanup } from "@testing-library/react";
 
 const { harnessStatusMock, harnessReadMock, updateModelMock, updateEscMock, listConfigsMock, cardUpdateMock, cardApproveMock } = vi.hoisted(() => ({
   harnessStatusMock: vi.fn(), harnessReadMock: vi.fn(), updateModelMock: vi.fn(), updateEscMock: vi.fn(), listConfigsMock: vi.fn(),
@@ -13,13 +13,20 @@ vi.mock("../engineClient", () => ({
   },
   listProviderConfigs: listConfigsMock,
 }));
-vi.mock("../ProjectContext", () => ({ useProject: () => ({ activeProjectDir: "/r/alpha" }) }));
+// `useProject` is mocked through a hoisted `vi.fn()` (not a fixed inline
+// value) so a test can drive `activeProjectDir` mid-test via
+// `useProjectMock.mockReturnValue(...)` + `rerender` — same pattern as
+// OrchestrateScreen.test.tsx's "changing the active project" test.
+const { useProjectMock } = vi.hoisted(() => ({ useProjectMock: vi.fn() }));
+vi.mock("../ProjectContext", () => ({ useProject: () => useProjectMock() }));
 
 import { HarnessSettingPanel } from "./HarnessSettingPanel";
 
 afterEach(cleanup);
 beforeEach(() => {
   for (const m of [harnessStatusMock, harnessReadMock, updateModelMock, updateEscMock, listConfigsMock, cardUpdateMock, cardApproveMock]) m.mockReset();
+  useProjectMock.mockReset();
+  useProjectMock.mockReturnValue({ activeProjectDir: "/r/alpha" });
   harnessStatusMock.mockResolvedValue({ present: true, structural: "pass", headSha: "abc", card: null });
   harnessReadMock.mockResolvedValue({
     agents: [
@@ -150,6 +157,74 @@ describe("HarnessSettingPanel", () => {
       fireEvent.click(screen.getByRole("button", { name: "Approve" }));
       await waitFor(() => expect(screen.getByRole("alert").textContent).toBe("card not approvable"));
       expect(screen.getByText("Draft")).toBeTruthy();
+    });
+
+    // Regression test for the settle-time reload stale-guard: `load(dir)`
+    // itself checks `activeProjectDirRef` in its ASYNC continuation, but the
+    // handlers that call `load(dir)` after an RPC settles were unguarded —
+    // so alpha's slow save landing after the user switched to beta could
+    // stomp beta's already-rendered panel back to "Loading harness…", and
+    // `load`'s own inner guard would then block alpha's (irrelevant) data
+    // from ever landing, leaving beta's panel stuck spinning forever.
+    //
+    // Approach chosen: drive `activeProjectDir` mid-test via the hoisted
+    // `useProjectMock` + `rerender`, mirroring OrchestrateScreen.test.tsx's
+    // established "changing the active project" test — this file's harness
+    // supports it cleanly once `useProject` is a controllable mock (see the
+    // top of this file), so the call-count-only fallback wasn't needed.
+    it("switching projects while a card save is in flight never flips the new project's panel back to loading", async () => {
+      const alphaTeam = {
+        agents: [
+          { name: "coder", role: "writes code", taskClasses: ["codegen"], model: { kind: "deepseek", model: "deepseek-v4-flash", providerId: "deepseek" } },
+          { name: "fallback", role: "default", taskClasses: ["docs"], model: "frontier" },
+        ],
+        defaultAgent: "fallback", escalation: 2, card: draftCard,
+      };
+      const betaTeam = {
+        agents: [{ name: "beta-agent", role: "writes code", taskClasses: ["codegen"], model: "frontier" }],
+        defaultAgent: "beta-agent", escalation: 1, card: null,
+      };
+      // Per-project fixtures (keyed on the `dir` argument) so `harnessStatus`/
+      // `harnessRead` answer correctly no matter which project's `load` call
+      // lands, in whatever order.
+      harnessStatusMock.mockImplementation((dir: string) =>
+        Promise.resolve({ present: true, structural: "pass", headSha: dir === "/proj/beta" ? "beta-sha" : "abc", card: null }),
+      );
+      harnessReadMock.mockImplementation((dir: string) => Promise.resolve(dir === "/proj/beta" ? betaTeam : alphaTeam));
+
+      useProjectMock.mockReturnValue({ activeProjectDir: "/r/alpha" });
+      const { rerender } = render(<HarnessSettingPanel />);
+      await waitFor(() => expect(screen.getByText("Project card")).toBeTruthy());
+
+      let resolveSave!: () => void;
+      cardUpdateMock.mockReturnValueOnce(new Promise<void>((resolve) => { resolveSave = resolve; }));
+
+      const textarea = screen.getByLabelText("Project card digest");
+      fireEvent.change(textarea, { target: { value: "Edited digest text." } });
+      fireEvent.click(screen.getByRole("button", { name: "Save draft" }));
+      await waitFor(() => expect(cardUpdateMock).toHaveBeenCalledWith("/r/alpha", "Edited digest text."));
+
+      // Switch to project beta while alpha's save RPC is still in flight.
+      useProjectMock.mockReturnValue({ activeProjectDir: "/proj/beta" });
+      rerender(<HarnessSettingPanel />);
+      await waitFor(() => expect(screen.getByText("beta-agent")).toBeTruthy());
+      expect(screen.queryByText(/loading harness/i)).toBeNull();
+
+      const harnessReadCallsBeforeSettle = harnessReadMock.mock.calls.length;
+
+      // Now let alpha's stale save resolve. Its settle-time reload must be
+      // no-op'd by the `activeProjectDirRef` guard — NOT repaint beta's
+      // already-ready panel back to "Loading harness…", and NOT trigger a
+      // fresh (irrelevant) re-fetch of alpha's data.
+      await act(async () => {
+        resolveSave();
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+
+      expect(screen.queryByText(/loading harness/i)).toBeNull();
+      expect(screen.getByText("beta-agent")).toBeTruthy();
+      expect(harnessReadMock.mock.calls.length).toBe(harnessReadCallsBeforeSettle);
     });
   });
 });
