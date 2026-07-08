@@ -15,12 +15,37 @@ import path from "node:path";
 import { tool, type Tool } from "ai";
 import { z } from "zod";
 import { canonicalizePath, isPathContained } from "../engines/path-scope.js";
+import type { WikiPage } from "../harness/schema.js";
+import { querySymbols, renderMap } from "../wiki/query.js";
+import type { SymbolHit, WikiStore } from "../wiki/store.js";
 
 export interface ToolContext {
   root: string;
   bashTimeoutMs?: number;
   onToolEvent?: (e: { tool: string; detail: string }) => void;
+  // Task 7: present only once worker/methods.ts has confirmed the project's
+  // wiki is actually built (never triggers a build itself — see that
+  // module's wiring). When set, createWorkerTools additionally registers
+  // wiki_query/wiki_map: on-demand retrieval tools that replace Task 6's
+  // removed all-digests prompt injection. `pages` is deliberately narrowed
+  // to the three fields wiki_query's page-hit search/excerpt actually reads
+  // (slug/title/digest), not the full WikiPage (which also carries `body`).
+  wiki?: {
+    store: WikiStore;
+    pages: ReadonlyArray<Pick<WikiPage, "slug" | "title" | "digest">>;
+  };
 }
+
+interface WikiQueryResult {
+  definitions: SymbolHit[];
+  references: SymbolHit[];
+  pages: Array<{ slug: string; title: string; excerpt: string }>;
+}
+
+// Page-hit excerpt cap (spec §5 / task brief): matches WikiPage.digest's own
+// role as the token-budgeted summary — an excerpt is a preview, not the
+// whole digest.
+const PAGE_EXCERPT_CHARS = 240;
 
 interface BashResult {
   stdout: string;
@@ -148,7 +173,10 @@ function containmentGate(root: string, canonicalRoot: string, rawPath: string): 
   return { ok: true, resolved: canonical };
 }
 
-// Creates the four-tool worker toolset scoped to `ctx.root`.
+// Creates the worker toolset scoped to `ctx.root`: the four core tools
+// (bash/read_file/write_file/edit) always, plus wiki_query/wiki_map
+// (Task 7) when `ctx.wiki` is present — see ToolContext's own doc comment
+// on `wiki`.
 //
 // Trust model (v1, accepted for this milestone): the worker operates on the
 // user's OWN repository, already isolated into its own git worktree (see
@@ -270,5 +298,48 @@ export function createWorkerTools(ctx: ToolContext): Record<string, Tool> {
     },
   });
 
-  return { bash, read_file, write_file, edit };
+  const tools: Record<string, Tool> = { bash, read_file, write_file, edit };
+
+  if (ctx.wiki !== undefined) {
+    // Captured into locals (rather than read off `ctx.wiki` inside the
+    // closures below) so TS's narrowing of `ctx.wiki !== undefined` doesn't
+    // need to survive into a nested arrow function.
+    const { store, pages } = ctx.wiki;
+
+    tools.wiki_query = tool({
+      description:
+        "Look up a SYMBOL (function/class/type name): returns where it is defined and referenced (file:line) in this project's code index, plus matching project wiki pages. For exact strings, regex, or file contents use bash grep / read_file instead.",
+      inputSchema: z.object({ query: z.string().min(1) }),
+      execute: async ({ query }): Promise<WikiQueryResult> => {
+        ctx.onToolEvent?.({ tool: "wiki_query", detail: detail(query) });
+        const { definitions, references } = querySymbols(store, query);
+        const q = query.toLowerCase();
+        const pageHits = pages
+          .filter((p) => p.title.toLowerCase().includes(q) || p.digest.toLowerCase().includes(q))
+          .map((p) => ({
+            slug: p.slug,
+            title: p.title,
+            excerpt: p.digest.slice(0, PAGE_EXCERPT_CHARS),
+          }));
+        return { definitions, references, pages: pageHits };
+      },
+    });
+
+    tools.wiki_map = tool({
+      description:
+        "Get a token-budgeted map of this project's most important files and symbols — use for whole-repo orientation before diving in.",
+      inputSchema: z.object({
+        budgetTokens: z.number().int().min(64).max(32768).optional(),
+      }),
+      execute: async ({ budgetTokens }): Promise<string> => {
+        ctx.onToolEvent?.({
+          tool: "wiki_map",
+          detail: detail(String(budgetTokens ?? 1024)),
+        });
+        return renderMap(store, budgetTokens);
+      },
+    });
+  }
+
+  return tools;
 }

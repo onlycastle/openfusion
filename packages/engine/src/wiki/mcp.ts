@@ -3,7 +3,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { z } from "zod";
 import type { Engine } from "../engine.js";
-import { rankFiles, renderRepoMap } from "./rank.js";
+import { querySymbols, renderMap } from "./query.js";
 
 async function readBody(req: IncomingMessage): Promise<unknown> {
   const chunks: Buffer[] = [];
@@ -32,10 +32,7 @@ function buildMcpServer(engine: Engine, projectDir: string): McpServer {
     ({ symbol }) => {
       const store = engine.wiki.getStore(projectDir);
       if (store.getMeta("head_sha") === null) return notBuiltResult();
-      const payload = {
-        definitions: store.symbolsByName(symbol),
-        references: store.refsByName(symbol),
-      };
+      const payload = querySymbols(store, symbol);
       return { content: [{ type: "text", text: JSON.stringify(payload) }] };
     },
   );
@@ -50,8 +47,7 @@ function buildMcpServer(engine: Engine, projectDir: string): McpServer {
     ({ budgetTokens }) => {
       const store = engine.wiki.getStore(projectDir);
       if (store.getMeta("head_sha") === null) return notBuiltResult();
-      const ranked = rankFiles(store.allSymbols(), store.allRefs());
-      const map = renderRepoMap(ranked, budgetTokens ?? 1024);
+      const map = renderMap(store, budgetTokens ?? 1024);
       return { content: [{ type: "text", text: map }] };
     },
   );

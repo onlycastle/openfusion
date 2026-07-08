@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import {
   existsSync,
   mkdtempSync,
@@ -11,11 +12,15 @@ import os from "node:os";
 import path from "node:path";
 import type { Tool } from "ai";
 import { afterEach, describe, expect, it } from "vitest";
+import { createEngine, type Engine } from "../src/engine.js";
 import { createWorkerTools } from "../src/worker/tools.js";
 
 let dir: string;
 let outsideDir: string;
-afterEach(() => {
+let engine: Engine | undefined;
+afterEach(async () => {
+  if (engine !== undefined) await engine.close();
+  engine = undefined;
   if (dir) rmSync(dir, { recursive: true, force: true });
   if (outsideDir) rmSync(outsideDir, { recursive: true, force: true });
 });
@@ -491,5 +496,79 @@ describe("NUL-byte path handling (Fix 2)", () => {
     await expect(
       getExecute(tools.edit)({ path: "a\0b.txt", find: "x", replace: "y" }, FAKE_OPTS),
     ).resolves.toMatchObject({ error: expect.any(String) });
+  });
+});
+
+// Task 7: on-demand wiki retrieval tools, registered only when ctx.wiki is
+// present — the replacement for Task 6's removed all-digests prompt
+// injection. Uses a real built wiki (via engine.wiki.build) rather than a
+// hand-rolled store double, so this also pins that worker/tools.ts's
+// wiki_query/wiki_map bodies agree with the store's real row shapes.
+describe("wiki tools (Task 7)", () => {
+  function makeWikiRepo(): string {
+    const root = makeRoot("of-tools-wiki-");
+    execFileSync("git", ["init", "-q", root]);
+    execFileSync("git", ["-C", root, "config", "user.email", "t@t"]);
+    execFileSync("git", ["-C", root, "config", "user.name", "t"]);
+    writeFileSync(path.join(root, "a.ts"), "export function alphaBeta() {}\n");
+    execFileSync("git", ["-C", root, "add", "-A"]);
+    execFileSync("git", ["-C", root, "commit", "-qm", "init"]);
+    return root;
+  }
+
+  it("registers wiki_query/wiki_map only when ctx.wiki is present, with working execute bodies", async () => {
+    dir = makeWikiRepo();
+    engine = createEngine();
+    await engine.wiki.build(dir);
+    const store = engine.wiki.getStore(dir);
+
+    const withWiki = createWorkerTools({
+      root: dir,
+      wiki: {
+        store,
+        pages: [{ slug: "architecture", title: "Architecture", digest: "mentions alphaBeta here" }],
+      },
+    });
+    expect(Object.keys(withWiki).sort()).toEqual(
+      ["bash", "edit", "read_file", "wiki_map", "wiki_query", "write_file"].sort(),
+    );
+
+    const queryResult = await getExecute(withWiki.wiki_query)({ query: "alphaBeta" }, FAKE_OPTS);
+    expect(queryResult.definitions.length).toBeGreaterThanOrEqual(1);
+    expect(queryResult.definitions[0].file).toBe("a.ts");
+    expect(queryResult.pages).toHaveLength(1);
+    expect(queryResult.pages[0]).toMatchObject({ slug: "architecture", title: "Architecture" });
+    expect(queryResult.pages[0].excerpt.length).toBeLessThanOrEqual(240);
+
+    const mapResult = await getExecute(withWiki.wiki_map)({}, FAKE_OPTS);
+    expect(typeof mapResult).toBe("string");
+    expect(mapResult.length).toBeGreaterThan(0);
+    expect(mapResult).toContain("a.ts");
+
+    const withoutWiki = createWorkerTools({ root: dir });
+    expect(Object.keys(withoutWiki).sort()).toEqual(["bash", "edit", "read_file", "write_file"].sort());
+  });
+
+  it("fires onToolEvent for wiki_query/wiki_map without leaking page/store content in the detail", async () => {
+    dir = makeWikiRepo();
+    engine = createEngine();
+    await engine.wiki.build(dir);
+    const store = engine.wiki.getStore(dir);
+    const secretDigest = "SUPER_SECRET_DIGEST_MARKER";
+
+    const events: { tool: string; detail: string }[] = [];
+    const tools = createWorkerTools({
+      root: dir,
+      wiki: { store, pages: [{ slug: "architecture", title: "Architecture", digest: secretDigest }] },
+      onToolEvent: (e) => events.push(e),
+    });
+
+    await getExecute(tools.wiki_query)({ query: "alphaBeta" }, FAKE_OPTS);
+    await getExecute(tools.wiki_map)({}, FAKE_OPTS);
+
+    expect(events.map((e) => e.tool)).toEqual(["wiki_query", "wiki_map"]);
+    for (const e of events) {
+      expect(e.detail).not.toContain(secretDigest);
+    }
   });
 });

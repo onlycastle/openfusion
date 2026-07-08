@@ -200,6 +200,37 @@ describe("engine.worker.run", () => {
     expect(toolEvent.tool).toBe("write_file");
   });
 
+  // Task 7: names+counts-only tool-call telemetry, logged once the run
+  // completes. Runs against a project whose wiki has already been built —
+  // this also exercises worker/methods.ts's ctx.wiki wiring (built/guarded
+  // the same way engine.wiki.status is), even though this particular
+  // model mock never calls wiki_query/wiki_map itself.
+  it("logs a worker.run tool-calls line (names+counts only, no arguments) for a project with a built wiki", async () => {
+    dir = makeRepo();
+    const logs: string[] = [];
+    engine = createEngine({ log: (m) => logs.push(m) });
+    engine.models.registry.configure({ id: "p1", kind: "deepseek", apiKey: TEST_API_KEY });
+    engine.models.registry.setTestModel("p1", makeWorkerMock());
+    await engine.wiki.build(dir);
+
+    const res = await call(engine, "engine.worker.run", {
+      projectDir: dir,
+      task: "create hello.txt",
+      providerId: "p1",
+      model: "deepseek-v4-flash",
+    });
+    expect(res.error).toBeUndefined();
+
+    const toolCallLog = logs.find((l) => l.startsWith("worker.run tool-calls"));
+    expect(toolCallLog).toBeDefined();
+    expect(toolCallLog).toContain("model=deepseek-v4-flash");
+    expect(toolCallLog).toContain(JSON.stringify({ write_file: 1 }));
+    // Names and counts only — never the tool's own arguments (the path/
+    // content the mock's write_file call actually carried).
+    expect(toolCallLog).not.toContain("hello.txt");
+    expect(toolCallLog).not.toContain("HELLO FROM WORKER");
+  });
+
   it("engine.worker.cleanup removes the worktree from disk", async () => {
     dir = makeRepo();
     engine = createEngine();
