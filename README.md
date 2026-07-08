@@ -84,6 +84,16 @@ routing as unproven against your project until then.
     engine.worker.list       { "projectDir": "/path/to/repo" }
     engine.worker.gc         { "projectDir": "/path/to/repo", "keep": ["/path/to/repo/.openfusion/worktrees/<id>"] }
 
+Every orchestrate, eval, generation, and Project Card action also appends one
+metadata-only record to a local, gitignored run ledger
+(`.openfusion/cache/runs.jsonl`) — outcome, cost, and failure-cause fields,
+never task text, diffs, or prompts. `engine.runs.list` reads it back
+(newest-first, optionally filtered by kind); the desktop app renders it as
+the Evals screen's History strip and the Studio chat's recent-outcomes row.
+This is the data substrate the planned weakness-mining / self-improvement
+loop will read from — nothing consumes it yet beyond those two read-only
+strips.
+
 ## Measuring the harness
 
     engine.evals.run { "projectDir": "/path/to/repo", "tasks": [/* ... */] }

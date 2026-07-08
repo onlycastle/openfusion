@@ -6,12 +6,14 @@ import {
   engineClient,
   frontierLoginStatus,
   type CancellableRun,
+  type EvalsRunRecord,
   type FrontierAuthStatus,
   type GenerateHarnessResult,
   type HarnessProgressEvent,
   type HarnessStatus,
   type OrchestrateProgressEvent,
   type OrchestrateResult,
+  type OrchestrateRunRecord,
   type WikiBuildStats,
   type WikiStatus,
 } from "../engineClient";
@@ -150,12 +152,34 @@ function harnessStatusText(state: HarnessState): string {
   return state.message;
 }
 
-function OutcomeBadge({ outcome }: { outcome: OrchestrateResult["outcome"] }) {
+/** Renders the outcome pill for both a live `OrchestrateResult` (the three
+ * in-flight outcomes) and a ledger `OrchestrateRunRecord`'s `"error"`
+ * outcome (the recent-outcomes row below) — widened rather than wrapped so
+ * both render through the identical markup/styling. Existing call sites
+ * that only ever pass an `OrchestrateResult["outcome"]` are unaffected:
+ * `"error"` is a new, additive branch that shares `"failed"`'s styling. */
+function OutcomeBadge({ outcome }: { outcome: OrchestrateResult["outcome"] | "error" }) {
   const label =
-    outcome === "worker-approved" ? "Worker approved" : outcome === "escalated" ? "Escalated" : "Failed";
+    outcome === "worker-approved"
+      ? "Worker approved"
+      : outcome === "escalated"
+        ? "Escalated"
+        : outcome === "error"
+          ? "Error"
+          : "Failed";
   const cls =
     outcome === "worker-approved" ? "outcome-success" : outcome === "escalated" ? "outcome-warning" : "outcome-failure";
   return <span className={`outcome-badge ${cls}`}>{label}</span>;
+}
+
+/** Narrows one `engine.runs.list` record to the `"orchestrate"` kind — same
+ * defensive belt-and-suspenders as EvalsScreen's own `isEvalsRunRecord`:
+ * `runsList`'s `records` field is a loose union even though this screen
+ * always requests `kind: "orchestrate"`. */
+function isOrchestrateRunRecord(
+  record: EvalsRunRecord | OrchestrateRunRecord | Record<string, unknown>,
+): record is OrchestrateRunRecord {
+  return (record as { kind?: unknown }).kind === "orchestrate";
 }
 
 /** A deliberately simple diff renderer: one `<pre>` block, one `<div>` per
@@ -220,6 +244,7 @@ export function OrchestrateScreen({ onOpenSettings }: OrchestrateScreenProps = {
   const [wikiState, setWikiState] = useState<WikiState>({ status: "idle" });
   const [setupState, setSetupState] = useState<SetupState>({ status: "checking" });
   const [harnessState, setHarnessState] = useState<HarnessState>({ status: "idle" });
+  const [recentRuns, setRecentRuns] = useState<OrchestrateRunRecord[]>([]);
 
   const runRef = useRef<CancellableRun<OrchestrateResult> | null>(null);
 
@@ -298,6 +323,33 @@ export function OrchestrateScreen({ onOpenSettings }: OrchestrateScreenProps = {
     refreshHarnessState(projectDir);
   }, [projectDir, refreshHarnessState, resetRunState]);
 
+  /** Fetches the last 5 `"orchestrate"`-kind ledger records for `dir` and, if
+   * `dir` is still the active project once the call settles, replaces the
+   * recent-outcomes row's contents. Best-effort chrome (same posture as
+   * EvalsScreen's own `loadHistory`): a rejection renders nothing — never a
+   * screen-level error state — so the `.catch` below deliberately does not
+   * touch any state at all. */
+  const loadRecentRuns = useCallback((dir: string) => {
+    engineClient
+      .runsList(dir, "orchestrate", 5)
+      .then((res) => {
+        if (projectDirRef.current !== dir) return;
+        setRecentRuns(res.records.filter(isOrchestrateRunRecord));
+      })
+      .catch(() => {
+        // best-effort chrome — see this function's own doc comment above.
+      });
+  }, []);
+
+  // Fetch on load AND whenever the active project changes — mirrors
+  // EvalsScreen's own history-strip effect; clears the prior project's row
+  // immediately so a project switch never briefly shows a foreign project's
+  // recent outcomes while the new fetch is in flight.
+  useEffect(() => {
+    setRecentRuns([]);
+    if (projectDir) loadRecentRuns(projectDir);
+  }, [projectDir, loadRecentRuns]);
+
   const handleBuildWiki = useCallback(() => {
     const dir = projectDir;
     if (!dir || wikiState.status === "building" || wikiState.status === "checking") return;
@@ -367,16 +419,17 @@ export function OrchestrateScreen({ onOpenSettings }: OrchestrateScreenProps = {
 
   const handleRun = useCallback(() => {
     if (!projectDir || !task.trim() || !chatOpen || !harnessReady || !setupReady || isBusy) return;
+    const dir = projectDir; // narrowed non-null — captured for the settle-time refetch below
 
     setProgress([]);
     setResult(null);
     setRunError(null);
     setApplyState({ status: "idle" });
     setPhase("running");
-    setRunProjectDir(projectDir); // Capture the run's project directory
+    setRunProjectDir(dir); // Capture the run's project directory
     setRunTask(task.trim()); // Capture the task text for the transcript's "You" turn
 
-    const run = engineClient.runOrchestrate({ projectDir, task }, (event: OrchestrateProgressEvent) => {
+    const run = engineClient.runOrchestrate({ projectDir: dir, task }, (event: OrchestrateProgressEvent) => {
       progressKeySeq += 1;
       const entry: ProgressEntry = { key: progressKeySeq, stage: event.stage, detail: event.detail };
       setProgress((prev) => [...prev, entry]);
@@ -395,8 +448,19 @@ export function OrchestrateScreen({ onOpenSettings }: OrchestrateScreenProps = {
         }
         setRunError(friendlyMessage(err));
         setPhase("error");
+      })
+      .finally(() => {
+        // Unlike EvalsScreen's success-only refetch, this fires on EVERY
+        // settle path: the engine's `engine.orchestrate` RPC handler writes
+        // an orchestrate ledger record unconditionally — success outcomes
+        // AND the error path, which also covers cancellation (recorded as
+        // `errorCategory: "cancelled"`, still an `outcome: "error"` record).
+        // `loadRecentRuns` re-checks `projectDirRef` itself before writing
+        // any state, so this is safe even if the active project has since
+        // moved on.
+        loadRecentRuns(dir);
       });
-  }, [chatOpen, harnessReady, isBusy, projectDir, setupReady, task]);
+  }, [chatOpen, harnessReady, isBusy, loadRecentRuns, projectDir, setupReady, task]);
 
   // Guarded on `phase === "running"` (not just the button's `disabled`
   // attribute) so a second Cancel click — even one that somehow reaches
@@ -437,6 +501,26 @@ export function OrchestrateScreen({ onOpenSettings }: OrchestrateScreenProps = {
   const canOpenChat = harnessReady && setupReady && !isBusy;
 
   const projectName = projectDir ? baseName(projectDir) : null;
+
+  /* The recent-outcomes row — a quiet strip of the last few ledger records
+   * (RPC order preserved, i.e. newest first; never re-sorted client-side),
+   * rendered as `OutcomeBadge` chips with a taskClass/local-time tooltip.
+   * Absent entirely when there's no history yet (empty array, or the fetch
+   * never resolved/rejected) — this is chrome, never a gate on the composer
+   * below it. */
+  const recentRunsRow = recentRuns.length > 0 && (
+    <div className="recent-runs">
+      {recentRuns.map((record, index) => (
+        <span
+          key={`${record.runId ?? record.at}-${index}`}
+          className="recent-run-chip"
+          title={`${record.taskClass} · ${new Date(record.at).toLocaleString()}`}
+        >
+          <OutcomeBadge outcome={record.outcome} />
+        </span>
+      ))}
+    </div>
+  );
 
   /* The composer card — one raised object holding the task input and its
    * controls: the project chip on the left, the run circle (or, while a run
@@ -635,6 +719,7 @@ export function OrchestrateScreen({ onOpenSettings }: OrchestrateScreenProps = {
           <p className="hero-title">
             What should we work on{projectName ? <span className="hero-project"> in {projectName}</span> : null}?
           </p>
+          {recentRunsRow}
           {composer}
           <p className="hero-caption">cheap worker · frontier review · you approve</p>
         </div>
@@ -781,7 +866,10 @@ export function OrchestrateScreen({ onOpenSettings }: OrchestrateScreenProps = {
             )}
           </div>
 
-          <div className="chat-dock">{composer}</div>
+          <div className="chat-dock">
+            {recentRunsRow}
+            {composer}
+          </div>
         </>
       )}
     </section>

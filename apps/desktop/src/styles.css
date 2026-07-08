@@ -720,6 +720,22 @@ input[type="checkbox"] {
   border-color: var(--caveat-line);
 }
 
+/* ------------------------------------------------------- recent outcomes -- */
+/* OrchestrateScreen's compact recent-outcomes row (Task 6) — a horizontal
+   strip of the last few ledger records as `OutcomeBadge` chips, sitting
+   directly above the composer. Deliberately terser than the evals-history
+   list above (no savings figure/task count here, just the outcome pill
+   plus a taskClass/time tooltip on hover). */
+.recent-runs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 0 0 10px;
+}
+.recent-run-chip {
+  cursor: help;
+}
+
 /* --------------------------------------------------------- telemetry strip -- */
 
 .status-bar {

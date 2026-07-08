@@ -1,6 +1,6 @@
 # Run Ledger v1 — Design
 
-**Date:** 2026-07-08 · **Status:** approved design, pre-implementation
+**Date:** 2026-07-08 · **Status:** implemented — docs/superpowers/plans/2026-07-08-run-ledger.md
 **Motivation:** Weng, "Harness Engineering for Self-Improvement" (2026-07-04) — durable
 artifacts over transient context ("outputs that only live in a transient chat context
 quickly become obsolete and hidden"), and failure records carrying the "terminal
@@ -93,6 +93,15 @@ Call sites use a shared `recordRun(engine, projectDir, record)` helper that try/
 any pipeline has to the ledger. Concurrency: appends are single-line `appendFile` calls
 (O_APPEND); the engine is a single process and pipelines already serialize writes per
 project where it matters — no locking in v1, documented.
+
+**Amendments (implementation, Task 3):** `recordRun` returns a never-rejecting
+`Promise<void>`, and every write point AWAITS it before its RPC handler resolves or
+rethrows. The original fire-and-forget contract above raced its callers — a caller
+(and, worse, process teardown in tests) could observe the run's result before the
+ledger append had actually landed, making both "one run → one record" assertions and
+graceful shutdown non-deterministic. Awaiting a promise that itself never rejects
+preserves the original guarantee (a ledger failure still never fails the pipeline) while
+making the append happen-before its caller's continuation.
 
 ## 5. RPC + desktop
 

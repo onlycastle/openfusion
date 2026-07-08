@@ -26,6 +26,7 @@ const {
   harnessStatusMock,
   harnessGenerateMock,
   frontierLoginStatusMock,
+  runsListMock,
 } = vi.hoisted(() => ({
   runOrchestrateMock: vi.fn(),
   callMock: vi.fn(),
@@ -35,6 +36,7 @@ const {
   harnessStatusMock: vi.fn(),
   harnessGenerateMock: vi.fn(),
   frontierLoginStatusMock: vi.fn(),
+  runsListMock: vi.fn(),
 }));
 
 vi.mock("../engineClient", async (importOriginal) => {
@@ -52,6 +54,10 @@ vi.mock("../engineClient", async (importOriginal) => {
       wikiBuild: wikiBuildMock,
       harnessStatus: harnessStatusMock,
       harnessGenerate: harnessGenerateMock,
+      // The screen now fetches recent-outcomes history on mount (Task 6) —
+      // every pre-existing test that doesn't care about it needs a default
+      // empty-resolving mock so it doesn't have to know about `runsList`.
+      runsList: runsListMock,
     },
   };
 });
@@ -63,6 +69,7 @@ import {
   type GenerateHarnessResult,
   type HarnessStatus,
   type OrchestrateResult,
+  type OrchestrateRunRecord,
   type WikiBuildStats,
   type WikiStatus,
 } from "../engineClient";
@@ -117,6 +124,29 @@ function orchestrateResultFixture(overrides: Partial<OrchestrateResult> = {}): O
   };
 }
 
+/** One `"orchestrate"`-kind run-ledger record, as `engineClient.runsList`
+ * resolves it (Task 6). Mirrors the engine's `RunRecordSchema` "orchestrate"
+ * branch (packages/engine/src/runs/ledger.ts) — kept minimal here since the
+ * recent-outcomes row only reads `at`/`taskClass`/`outcome`/`runId`. */
+function orchestrateRecordFixture(overrides: Partial<OrchestrateRunRecord> = {}): OrchestrateRunRecord {
+  return {
+    v: 1,
+    kind: "orchestrate",
+    at: "2026-07-02T09:00:00.000Z",
+    taskClass: "tests",
+    agent: "generalist",
+    workerModel: "deepseek-v4-flash",
+    attempts: 1,
+    outcome: "worker-approved",
+    escalated: false,
+    reviews: [{ decision: "approve", reasons: [] }],
+    contextBranch: "approved-card",
+    cost: { workerUsd: 0.01, reviewUsd: 0.02, escalateUsd: null, totalUsd: 0.03 },
+    durationMs: 4000,
+    ...overrides,
+  };
+}
+
 /** A controllable stand-in for `CancellableRun<OrchestrateResult>`: tests
  * drive `resolve`/`reject` directly instead of waiting on a real engine
  * call, and assert against the `cancel` spy. */
@@ -149,6 +179,8 @@ beforeEach(() => {
   wikiStatusMock.mockResolvedValue(wikiStatusFixture());
   harnessStatusMock.mockResolvedValue(harnessStatusFixture());
   harnessGenerateMock.mockResolvedValue(generateHarnessFixture());
+  runsListMock.mockReset();
+  runsListMock.mockResolvedValue({ records: [], skipped: 0 });
 });
 
 /** The active project is already set via `ProjectContext` (mocked to
@@ -526,5 +558,134 @@ describe("OrchestrateScreen", () => {
 
     // Assert the structural routed model appears in the DOM (not just progress text)
     await waitFor(() => expect(screen.getByText(/deepseek\/deepseek-v4-flash/)).toBeTruthy());
+  });
+
+  describe("recent-outcomes row (Task 6)", () => {
+    it("renders one chip per record in the RPC's own (newest-first) order, with outcome labels and taskClass/local-time tooltips", async () => {
+      const records: OrchestrateRunRecord[] = [
+        orchestrateRecordFixture({ at: "2026-07-02T09:00:00.000Z", taskClass: "tests", outcome: "worker-approved" }),
+        orchestrateRecordFixture({ at: "2026-07-01T09:00:00.000Z", taskClass: "docs", outcome: "escalated" }),
+        orchestrateRecordFixture({ at: "2026-06-30T09:00:00.000Z", taskClass: "refactor", outcome: "failed" }),
+        orchestrateRecordFixture({
+          at: "2026-06-29T09:00:00.000Z",
+          taskClass: "infra",
+          outcome: "error",
+          errorCategory: "cancelled",
+        }),
+      ];
+      runsListMock.mockResolvedValue({ records, skipped: 0 });
+
+      await openChatAndFillTask();
+      await waitFor(() => expect(runsListMock).toHaveBeenCalledWith("/r/alpha", "orchestrate", 5));
+
+      const row = await waitFor(() => {
+        const el = document.querySelector(".recent-runs");
+        expect(el).toBeTruthy();
+        return el as Element;
+      });
+      const chips = row.querySelectorAll(".recent-run-chip");
+      expect(chips).toHaveLength(4);
+      expect(chips[0]?.textContent).toMatch(/worker approved/i);
+      expect(chips[1]?.textContent).toMatch(/escalated/i);
+      expect(chips[2]?.textContent).toMatch(/^failed$/i);
+      expect(chips[3]?.textContent).toMatch(/^error$/i);
+
+      expect(chips[0]?.getAttribute("title")).toBe(`tests · ${new Date(records[0]!.at).toLocaleString()}`);
+      expect(chips[3]?.getAttribute("title")).toBe(`infra · ${new Date(records[3]!.at).toLocaleString()}`);
+    });
+
+    it("shows no .recent-runs row when runsList resolves with empty records", async () => {
+      runsListMock.mockResolvedValue({ records: [], skipped: 0 });
+
+      await openChatAndFillTask();
+      await waitFor(() => expect(runsListMock).toHaveBeenCalled());
+
+      expect(document.querySelector(".recent-runs")).toBeNull();
+    });
+
+    it("renders normally (no crash, no error state) when runsList rejects — best-effort chrome, never an error state", async () => {
+      runsListMock.mockRejectedValue(new Error("boom"));
+
+      await openChatAndFillTask();
+      await waitFor(() => expect(runsListMock).toHaveBeenCalled());
+
+      expect(document.querySelector(".recent-runs")).toBeNull();
+      expect(screen.queryByRole("alert")).toBeNull();
+      // The rest of the screen still renders fine.
+      expect(screen.getByLabelText(/task/i)).toBeTruthy();
+    });
+
+    it("Run-button enablement is unaffected by recent-outcomes history presence", async () => {
+      runsListMock.mockResolvedValue({ records: [orchestrateRecordFixture()], skipped: 0 });
+
+      await openChatAndFillTask();
+      await waitFor(() => expect(document.querySelector(".recent-runs")).toBeTruthy());
+      await waitFor(() => {
+        expect((screen.getByRole("button", { name: /^run$/i }) as HTMLButtonElement).disabled).toBe(false);
+      });
+    });
+
+    it("refetches recent outcomes after a run completes (success)", async () => {
+      await openChatAndFillTask();
+      await waitFor(() => expect(runsListMock).toHaveBeenCalledTimes(1));
+
+      const controllable = makeControllableRun();
+      runOrchestrateMock.mockReturnValueOnce(controllable);
+      fireEvent.click(screen.getByRole("button", { name: /^run$/i }));
+
+      runsListMock.mockResolvedValueOnce({ records: [orchestrateRecordFixture()], skipped: 0 });
+      act(() => controllable.resolve(orchestrateResultFixture()));
+      await waitFor(() => expect(screen.getByText(/worker approved/i)).toBeTruthy());
+
+      await waitFor(() => expect(runsListMock.mock.calls.length).toBeGreaterThanOrEqual(2));
+      const lastCall = runsListMock.mock.calls[runsListMock.mock.calls.length - 1];
+      expect(lastCall?.[0]).toBe("/r/alpha");
+      expect(lastCall?.[1]).toBe("orchestrate");
+    });
+
+    it("refetches recent outcomes after a run is cancelled (the engine still writes a ledger record for it)", async () => {
+      await openChatAndFillTask();
+      await waitFor(() => expect(runsListMock).toHaveBeenCalledTimes(1));
+
+      const controllable = makeControllableRun();
+      runOrchestrateMock.mockReturnValueOnce(controllable);
+      fireEvent.click(screen.getByRole("button", { name: /^run$/i }));
+
+      act(() => controllable.reject(new RunCancelledError(controllable.runId, undefined)));
+      await waitFor(() => expect(screen.getByText(/^cancelled$/i)).toBeTruthy());
+
+      await waitFor(() => expect(runsListMock.mock.calls.length).toBeGreaterThanOrEqual(2));
+    });
+
+    it("stale-guards the recent-outcomes fetch: a slow response for a project no longer active must not overwrite the new project's row", async () => {
+      let resolveA!: (value: { records: OrchestrateRunRecord[]; skipped: number }) => void;
+      const pendingA = new Promise<{ records: OrchestrateRunRecord[]; skipped: number }>((resolve) => {
+        resolveA = resolve;
+      });
+      runsListMock.mockReturnValueOnce(pendingA);
+      useProjectMock.mockReturnValue({ activeProjectDir: "/proj/A" });
+      const { rerender } = render(<OrchestrateScreen />);
+      await waitFor(() => expect(runsListMock).toHaveBeenCalledTimes(1));
+
+      // Switch to project B before A's fetch resolves — B's own fetch
+      // resolves immediately with empty history.
+      runsListMock.mockResolvedValueOnce({ records: [], skipped: 0 });
+      useProjectMock.mockReturnValue({ activeProjectDir: "/proj/B" });
+      rerender(<OrchestrateScreen />);
+      await waitFor(() => expect(runsListMock).toHaveBeenCalledTimes(2));
+
+      // Open the chat for B so the row (if wrongly populated) would be visible.
+      await waitFor(() => expect(screen.getByRole("button", { name: /open task chat/i })).toBeTruthy());
+      fireEvent.click(screen.getByRole("button", { name: /open task chat/i }));
+
+      // NOW resolve A's slow response with a non-empty record — must be
+      // dropped, not painted under project B's now-active screen.
+      await act(async () => {
+        resolveA({ records: [orchestrateRecordFixture()], skipped: 0 });
+        await Promise.resolve();
+      });
+
+      expect(document.querySelector(".recent-runs")).toBeNull();
+    });
   });
 });
