@@ -11,8 +11,8 @@ import { loadHarness } from "../src/harness/store.js";
 // Real end-to-end smoke test: exercises the DEFAULT Claude adapter
 // (registerFrontierMethods' createClaudeAdapter(), no injected/scripted
 // session), so it spawns the actual `claude` CLI via the Agent SDK, builds
-// a real wiki index, and runs 6 real frontier prompts (overview + 4 pages +
-// agents-routing) against this repo. Needs the CLI installed and
+// a real wiki index, and runs 7 real frontier prompts (overview + 4 prose pages +
+// project card + agents-routing) against this repo. Needs the CLI installed and
 // authenticated however the operator set that up — this test never touches
 // credentials itself (see claude.ts's AUTH-AGNOSTIC design note).
 //
@@ -56,13 +56,13 @@ describe("engine.harness.generate (real smoke)", () => {
 
         const res = await rpc(engine, "engine.harness.generate", { projectDir: dir });
         expect(res.error).toBeUndefined();
-        expect(res.result.pages).toBe(4);
+        expect(res.result.pages).toBe(5);
         expect(res.result.agents).toBeGreaterThanOrEqual(2);
         expect(res.result.reportCard).toEqual({ structural: "pass", evals: "pending" });
 
         const bundle = loadHarness(dir);
         expect(bundle).not.toBeNull();
-        expect(bundle!.pages).toHaveLength(4);
+        expect(bundle!.pages).toHaveLength(5);
         expect(bundle!.agents.length).toBeGreaterThanOrEqual(2);
         expect(validateHarness(bundle!)).toEqual([]);
       } finally {
