@@ -11,9 +11,11 @@ import { promisify } from "node:util";
 import { z } from "zod";
 import { RpcErrorCodes } from "@openfusion/shared";
 import type { Engine } from "../engine.js";
+import { HarnessValidationError } from "../harness/store.js";
 import { RpcMethodError } from "../rpc/errors.js";
 import { requireGitRepo } from "../rpc/guards.js";
 import { registerMethod } from "../rpc/register.js";
+import { recordRun, type RunRecord } from "../runs/ledger.js";
 import { orchestrate, type OrchestrateParams, type OrchestrateResult } from "./orchestrate.js";
 
 const execFileAsync = promisify(execFile);
@@ -59,6 +61,51 @@ const ApplyParamsSchema = z.object({
   diff: z.string(),
 });
 
+// Task 3: derived from RunRecordSchema's own "orchestrate" variant
+// (runs/ledger.ts) rather than a hand-written union, so this can never drift
+// from what the ledger actually accepts.
+type OrchestrateErrorCategory = NonNullable<Extract<RunRecord, { kind: "orchestrate" }>["errorCategory"]>;
+
+// Task 3: maps a thrown engine.orchestrate error to a coarse, CONTENT-FREE
+// category for the ledger's error record — the error's own MESSAGE never
+// reaches the ledger (runs/ledger.ts's own content-line rule), only this
+// enum. Checked in the brief's own priority order:
+//   1. "no harness" is the literal, never-changing message orchestrate.ts's
+//      own guard throws when no harness has been generated yet.
+//   2. A harness that IS present but corrupt/hand-edited surfaces either as
+//      a HarnessValidationError orchestrate.ts re-wraps into a plain
+//      RpcMethodError (carrying the original `issues` array in `data` — by
+//      the time it reaches here there is no `cause` chain to walk, so that
+//      carried `issues` array is the practical "this wraps a
+//      HarnessValidationError" signal) or as orchestrate.ts's own literal
+//      "harness failed structural validation" message for a bundle that
+//      parses but fails schema validation.
+//   3. A cancellation carries `cancelled: true` in `data` (both of
+//      orchestrate.ts's own cancellation throws set it) or, defensively, the
+//      word "cancelled" in the message (RunCancelledError's own "run
+//      cancelled").
+//   4. Anything else is "unknown" — a real, unclassified infra failure
+//      (unconfigured provider, adapter throw, etc.).
+function categorizeOrchestrateError(err: unknown): OrchestrateErrorCategory {
+  const message = err instanceof Error ? err.message : String(err);
+  if (message.includes("no harness")) return "no-harness";
+
+  const data = err instanceof RpcMethodError ? err.data : undefined;
+  const hasIssues = typeof data === "object" && data !== null && "issues" in data;
+  if (err instanceof HarnessValidationError || hasIssues || message.includes("structural validation")) {
+    return "load-failed";
+  }
+
+  const dataCancelled =
+    typeof data === "object" &&
+    data !== null &&
+    "cancelled" in data &&
+    (data as { cancelled?: unknown }).cancelled === true;
+  if (dataCancelled || message.includes("cancelled")) return "cancelled";
+
+  return "unknown";
+}
+
 // Sibling-pattern marker class (mirrors ModelsService/HarnessService on
 // Engine) — holds no state of its own today. engine.orchestrate does not
 // coalesce concurrent calls for the same project the way
@@ -80,12 +127,68 @@ export function registerOrchestrateMethods(engine: Engine): void {
     // see cancel-registry.ts's header comment for the full ownership split.
     const runId = params.runId;
     if (runId !== undefined) engine.cancelRegistry.register(runId);
+    // Task 3 (run ledger write point): THIS handler is the run ledger's ONLY
+    // coupling to engine.orchestrate — evals/run.ts's runHarnessTask calls
+    // orchestrate() DIRECTLY (see that call site's own doc comment,
+    // evals/run.ts ~line 634), bypassing this RPC handler entirely, so
+    // eval-internal harness runs are deliberately NEVER written to the
+    // ledger; only a real, user (or client)-initiated engine.orchestrate call
+    // is. `startedAt` is captured before the pipeline runs so `durationMs` on
+    // both the success and error records below measures this WHOLE call, not
+    // just the part orchestrate()'s own internals might track.
+    const startedAt = Date.now();
     try {
       const result: OrchestrateResult = await orchestrate(engine, params as OrchestrateParams);
       engine.log(
         `orchestrate ${params.projectDir}: outcome=${result.outcome} attempts=${result.attempts.length}`,
       );
+      recordRun(engine, params.projectDir, {
+        v: 1,
+        kind: "orchestrate",
+        at: new Date().toISOString(),
+        taskClass: result.taskClass,
+        agent: result.agent,
+        workerModel: result.resolution === "frontier" ? "frontier" : result.resolution.model,
+        attempts: result.attempts.length,
+        outcome: result.outcome,
+        escalated: result.outcome === "escalated",
+        // Content-line rule (runs/ledger.ts's own header comment): only the
+        // verdict decision + reasons ever reach the ledger — `a.summary`
+        // (this attempt's own worker/frontier prose) is deliberately never
+        // read here.
+        reviews: result.attempts.flatMap((a) =>
+          a.verdict ? [{ decision: a.verdict.decision, reasons: a.verdict.reasons }] : [],
+        ),
+        contextBranch: result.contextBranch,
+        ...(result.toolCallCounts !== undefined ? { toolCallCounts: result.toolCallCounts } : {}),
+        cost: result.cost,
+        durationMs: Date.now() - startedAt,
+        ...(params.runId !== undefined ? { runId: params.runId } : {}),
+      });
       return result;
+    } catch (err) {
+      // Error records deliberately carry NO task/agent/model detail this
+      // handler doesn't actually know (orchestrate() threw before — or
+      // without ever — resolving routing) — the "unknown" sentinels below
+      // mirror the brief's own contract rather than guessing.
+      recordRun(engine, params.projectDir, {
+        v: 1,
+        kind: "orchestrate",
+        at: new Date().toISOString(),
+        taskClass: "unknown",
+        agent: "unknown",
+        workerModel: "unknown",
+        attempts: 0,
+        outcome: "error",
+        escalated: false,
+        reviews: [],
+        contextBranch: "none",
+        cost: { workerUsd: null, reviewUsd: null, escalateUsd: null, totalUsd: null },
+        durationMs: Date.now() - startedAt,
+        errorCategory: categorizeOrchestrateError(err),
+        ...(params.runId !== undefined ? { runId: params.runId } : {}),
+      });
+      throw err;
     } finally {
       if (runId !== undefined) engine.cancelRegistry.deregister(runId);
     }
