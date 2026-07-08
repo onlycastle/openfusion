@@ -241,11 +241,24 @@ const FRONTIER_KIND = "claude-code";
 const DEFAULT_BASELINE_TIMEOUT_MS = 600_000;
 
 // Anthropic eval guidance (docs/research/2026-07-04-m6-pricing-eval-
-// verification.md, "Sample size"): a 5-task run is a demo, not a claim — a
-// credible savings claim wants 20-50 paired tasks. Below this threshold the
-// verdict is always "inconclusive" regardless of how good the numbers look,
-// so a quick CI/demo run can never be mistaken for a real measurement.
+// verification.md, "Sample size"): the LOW floor -- below it, no
+// consequential verdict is grounded, full stop; a run this small is a demo,
+// not a claim. Post-M6.1 (see MIN_TASK_COUNT_FOR_SAVINGS_PASS just below),
+// this constant no longer gates a savings PASS by itself -- it now gates
+// only the cost-hazard FAIL flag (a harm signal, flagged readily at the low
+// floor), while a savings PASS must clear the separate, higher 20-task floor.
 const MIN_TASK_COUNT_FOR_VERDICT = 5;
+
+// Research 2026-07-07 (docs/research/2026-07-07-harness-composition.md §4.2,
+// arXiv:2602.07150 power table): a hazard FLAG and a savings CLAIM need
+// different sample sizes. MIN_TASK_COUNT_FOR_VERDICT (5, above) is the low
+// floor below which even a demo can't ground any consequential verdict; it
+// still gates the cost-hazard flag (a harm signal — flag readily). A savings
+// PASS is a positive claim and demands more: ~20–50 paired tasks (the range
+// this module's own note text already cites). 20 is the conservative lower
+// bound; 30–50 is better for detecting sub-10pp effects. Below this, a
+// priced, quality-held, positive-savings run is still only "inconclusive".
+const MIN_TASK_COUNT_FOR_SAVINGS_PASS = 20;
 
 // Task 4 Fix 2: the fraction of ALL tasks (not just the ones on the "wrong"
 // side of a raw quality gap) that hit a measurement failure before the
@@ -258,6 +271,29 @@ const MIN_TASK_COUNT_FOR_VERDICT = 5;
 // off a run that unreliable, regardless of how the arithmetic on the
 // remaining "clean" tasks happens to come out.
 const MATERIAL_MEASUREMENT_FAILURE_FRACTION = 0.2;
+
+// Research 2026-07-07 (§3.3, arXiv:2602.07150): single-run pass@1 varies
+// 2.2–6.0pp and has std >1.5pp even at temperature 0, so a clean-subset
+// quality gap SMALLER than this fraction of the clean task count is
+// indistinguishable from measurement noise and must NOT be reported as an
+// ETH-hazard "fail". Above it, the gap is treated as a genuine quality
+// regression. On tiny suites any gap is a large fraction (e.g. 1/2 = 50pp),
+// so aggressive flagging is preserved exactly where the sample is too small
+// to explain the gap as noise. Single-run heuristic; multi-run averaging to
+// buy significance for smaller effects is a deferred follow-up.
+const QUALITY_NOISE_BAND = 0.05;
+
+// Research 2026-07-07 (§0/§4.3, arXiv:2602.11988): the eval gate is
+// two-dimensional. A harness that HOLDS quality but costs materially MORE
+// than the no-harness baseline is an ETH COST hazard (the study's exact
+// failure mode: quality held, cost +~20%), not a neutral result. When the
+// clean-subset savings is at or below -this fraction (i.e. the harness is
+// >=10% MORE expensive) at held quality, priced, and above the low hazard
+// floor, the verdict is "fail". A milder increase (between this and 0) stays
+// "inconclusive" ("quality held but not worth it"). Uses the LOW floor
+// (MIN_TASK_COUNT_FOR_VERDICT) not the savings-PASS floor — a harm signal is
+// flagged readily, asymmetric with the higher bar a positive claim must clear.
+const COST_REGRESSION_FAIL_FRACTION = 0.10;
 
 export interface EvalsRunParams {
   projectDir: string;
@@ -346,6 +382,10 @@ export interface EvalsReportCard {
   cleanHarnessPassed: number;
   cleanSavingsPct: number | null;
   measurementFailureCount: number;
+  // True when the clean-subset quality gap is within the single-run noise
+  // band (research 2026-07-07 §3.3) — i.e. any harness<baseline gap present
+  // was too small to ground an ETH-hazard "fail". Purely informational.
+  qualityGapWithinNoise: boolean;
 }
 
 // Null-safe running total — same shape as orchestrate.ts's own addCost (and
@@ -646,8 +686,8 @@ function buildNote(opts: {
 }): string {
   const parts: string[] = [];
   parts.push(
-    opts.taskCount < MIN_TASK_COUNT_FOR_VERDICT
-      ? `Sample size ${opts.taskCount} task(s) is below the ${MIN_TASK_COUNT_FOR_VERDICT}-task minimum for a credible savings claim (Anthropic eval guidance — see docs/research/2026-07-04-m6-pricing-eval-verification.md) -- this is a demo, not a claim.`
+    opts.taskCount < MIN_TASK_COUNT_FOR_SAVINGS_PASS
+      ? `Sample size ${opts.taskCount} task(s) is below the ${MIN_TASK_COUNT_FOR_SAVINGS_PASS}-task floor for a credible savings claim (docs/research/2026-07-07-harness-composition.md §4.2) -- a hazard flag can still fire, but a savings PASS cannot. This is a demo, not a claim.`
       : `Sample size: ${opts.taskCount} task(s) (a credible claim wants 20-50 paired tasks; treat this as directional).`,
   );
   parts.push("Cost figures are estimate-class (see engine.orchestrate's own cost.note) -- directional, not exact.");
@@ -866,6 +906,21 @@ export async function runEvals(engine: Engine, params: EvalsRunParams): Promise<
       ? (cleanBaselineCostTotal - cleanHarnessCostTotal) / cleanBaselineCostTotal
       : null;
 
+  // Research 2026-07-07 §3.3: is the clean-subset quality gap large enough to
+  // be a genuine regression rather than single-run noise? A negative gap
+  // (harness >= baseline) is trivially within noise. Guards the ETH-hazard
+  // branch below so a large suite's 1-task wobble can't false-fail.
+  const cleanQualityGap = cleanBaselinePassed - cleanHarnessPassed; // >0 when harness worse
+  const qualityGapWithinNoise =
+    cleanTasks.length === 0 || cleanQualityGap / cleanTasks.length <= QUALITY_NOISE_BAND;
+  if (!qualityHeldClean && qualityGapWithinNoise) {
+    extraNotes.push(
+      `The harness scored below baseline on the clean subset, but the gap ` +
+        `(${cleanBaselinePassed - cleanHarnessPassed}/${cleanTasks.length}) is within the ` +
+        `${Math.round(QUALITY_NOISE_BAND * 100)}% single-run noise band -- treated as quality held, not an ETH hazard.`,
+    );
+  }
+
   let verdict: EvalsReportCard["verdict"];
   if (measurementFailureFractionIsMaterial) {
     // Too corrupted to ground EITHER a "pass" or a "fail" (spec §12.1's own
@@ -880,11 +935,11 @@ export async function runEvals(engine: Engine, params: EvalsRunParams): Promise<
         "failure -- this run is too corrupted to ground a \"pass\" or a \"fail\" verdict in either direction; " +
         "reported as inconclusive rather than trusting the raw pass counts.",
     );
-  } else if (!qualityHeldClean) {
-    // ETH HAZARD (spec §12.1): even on the CLEAN subset (excluding every
-    // measurement failure, on either side), the harness still genuinely
-    // produced tested, applied, oracle-scored fixes that scored worse than
-    // the baseline. Never reported as a savings win, regardless of cost.
+  } else if (!qualityHeldClean && !qualityGapWithinNoise) {
+    // ETH HAZARD (spec §12.1): the harness produced tested, applied,
+    // oracle-scored fixes that scored worse than baseline on the clean subset
+    // by MORE than the noise band (research 2026-07-07 §3.3). A within-noise
+    // gap falls through and is treated as quality held.
     verdict = "fail";
     if (measurementFailureCount > 0) {
       extraNotes.push(
@@ -929,10 +984,27 @@ export async function runEvals(engine: Engine, params: EvalsRunParams): Promise<
       `${runUnpricedCalls} model call(s) were unpriced -- savings cannot be computed; run with priced models for ` +
         "a savings claim.",
     );
-  } else if (taskCount < MIN_TASK_COUNT_FOR_VERDICT || cleanSavingsPct === null) {
-    // Too few tasks (a demo, not a claim) or an unpriced cost figure on the
-    // clean subset (the savings arithmetic itself is meaningless) — either
-    // way, not enough to stand behind.
+  } else if (
+    (qualityHeldClean || qualityGapWithinNoise) &&
+    cleanSavingsPct !== null &&
+    cleanSavingsPct <= -COST_REGRESSION_FAIL_FRACTION &&
+    taskCount >= MIN_TASK_COUNT_FOR_VERDICT
+  ) {
+    // ETH COST HAZARD (research 2026-07-07 §0/§4.3): quality is held (or the
+    // gap is within noise) yet the harness is materially MORE expensive than
+    // the no-harness baseline on the clean subset. The harness is failing its
+    // cost-savings purpose while charging more -> "fail", not a silent
+    // "inconclusive". Fires at the LOW floor (a harm flag), asymmetric with
+    // the savings-PASS floor below.
+    verdict = "fail";
+    extraNotes.push(
+      `The harness held quality but cost ${Math.round(-cleanSavingsPct * 100)}% MORE than the no-harness ` +
+        `baseline on the clean subset (>= the ${Math.round(COST_REGRESSION_FAIL_FRACTION * 100)}% cost-regression ` +
+        `threshold) -- reported as an ETH cost-hazard fail.`,
+    );
+  } else if (taskCount < MIN_TASK_COUNT_FOR_SAVINGS_PASS || cleanSavingsPct === null) {
+    // Too few tasks for a savings CLAIM (a demo, not a claim) or an unpriced
+    // clean-subset cost (the savings arithmetic itself is meaningless).
     verdict = "inconclusive";
   } else if (cleanSavingsPct > 0) {
     verdict = "pass";
@@ -967,5 +1039,6 @@ export async function runEvals(engine: Engine, params: EvalsRunParams): Promise<
     cleanHarnessPassed,
     cleanSavingsPct,
     measurementFailureCount,
+    qualityGapWithinNoise,
   };
 }

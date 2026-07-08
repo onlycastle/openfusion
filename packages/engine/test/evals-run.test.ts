@@ -179,6 +179,69 @@ function makeFakeEvalsFrontierAdapter(opts: FakeEvalsFrontierOptions): FrontierA
   };
 }
 
+// Like makeFakeEvalsFrontierAdapter, but the HARNESS side (resultLabel !=
+// "eval-baseline") writes the WRONG source on its first `harnessFailCount`
+// invocations and the correct source thereafter; the baseline side is always
+// correct. The frontier-only fixture harness routes straight to escalation --
+// exactly ONE frontier session per task on each side -- so the harness-side
+// counter maps 1:1 to task order, letting a test produce a SMALL clean-subset
+// quality gap (e.g. 1 of 30) to exercise QUALITY_NOISE_BAND.
+function makePartialFailFrontierAdapter(opts: {
+  harnessFailCount: number;
+  baselineCostUsd: number;
+  harnessCostUsd: number;
+  meter: CostMeter;
+}): FrontierAdapter {
+  let harnessSeen = 0;
+  return {
+    kind: "claude-code",
+    async createSession({ projectDir, resultLabel }): Promise<FrontierSession> {
+      const isBaseline = resultLabel === "eval-baseline";
+      let correct: boolean;
+      if (isBaseline) {
+        correct = true;
+      } else {
+        harnessSeen += 1;
+        correct = harnessSeen > opts.harnessFailCount; // first N harness runs fail
+      }
+      const costUsd = isBaseline ? opts.baselineCostUsd : opts.harnessCostUsd;
+      return {
+        id: randomUUID(),
+        projectDir,
+        prompt(_text: string, _promptOpts?: { timeoutMs?: number }): FrontierPromptHandle {
+          async function* gen(): AsyncGenerator<FrontierEvent> {
+            writeFileSync(path.join(projectDir, "source.js"), correct ? CORRECT_SOURCE : WRONG_SOURCE);
+            yield { type: "tool_use", name: "Write", summary: "wrote source.js" };
+            yield { type: "text", text: "done" };
+            const event: FrontierEvent = {
+              type: "result",
+              resultText: "done",
+              costUsd,
+              usage: { inputTokens: 10, outputTokens: 5, cacheReadTokens: 0 },
+              numTurns: 1,
+              durationMs: 1,
+              engineSessionId: null,
+            };
+            opts.meter.record({
+              providerId: "claude-code",
+              kind: "frontier-claude",
+              model: "fake-frontier-model",
+              usage: event.usage,
+              costUsd: event.costUsd,
+              at: Date.now(),
+              source: isBaseline ? "frontier-review" : "frontier-escalate",
+              pricingConfidence: costUsd !== null ? "verified" : "unpriced",
+            });
+            yield event;
+          }
+          return { events: gen(), abort: () => {} };
+        },
+        async close(): Promise<void> {},
+      };
+    },
+  };
+}
+
 // --- C1 fixtures: mixed pricing (frontier priced, WORKER model unpriced) --
 //
 // Unlike writeFrontierOnlyHarness above (which routes straight to the
@@ -448,6 +511,30 @@ describe("runEvals — sample-size gate", () => {
 
     expect(harnessStatus(dir).evals).toBe("pending");
   });
+
+  it("priced, quality held, positive savings, but between the low floor and the savings-pass floor -> inconclusive", async () => {
+    dir = await makeHarnessFixture();
+    engine = createEngine();
+    engine.frontier.registerAdapter(
+      makeFakeEvalsFrontierAdapter({
+        baselineCorrect: true,
+        harnessCorrect: true,
+        baselineCostUsd: 0.5,
+        harnessCostUsd: 0.05,
+        meter: engine.models.meter,
+      }),
+    );
+
+    // 6 tasks: clears MIN_TASK_COUNT_FOR_VERDICT (5) but below
+    // MIN_TASK_COUNT_FOR_SAVINGS_PASS (20).
+    const tasks: EvalTask[] = Array.from({ length: 6 }, (_, i) => synthEvalTask({ id: `t${i + 1}` }));
+    const report = await runEvals(engine, { projectDir: dir, tasks });
+
+    expect(report.qualityHeld).toBe(true);
+    expect(report.savingsPct!).toBeGreaterThan(0);
+    expect(report.verdict).toBe("inconclusive");
+    expect(harnessStatus(dir).evals).toBe("pending");
+  }, 120_000);
 });
 
 describe("runEvals — ETH hazard", () => {
@@ -486,6 +573,147 @@ describe("runEvals — ETH hazard", () => {
     expect(report.verdict).toBe("fail");
     expect(harnessStatus(dir).evals).toBe("fail");
   });
+});
+
+describe("runEvals — quality-gap significance (noise band, research 2026-07-07 §3.3)", () => {
+  it("small clean-subset gap within the noise band (1 of 20) -> NOT an ETH fail; quality treated as held", async () => {
+    dir = await makeHarnessFixture();
+    engine = createEngine();
+    engine.frontier.registerAdapter(
+      makePartialFailFrontierAdapter({
+        harnessFailCount: 1, // 1/20 = 5pp; strictly at/below the 0.05 band -> not significant
+        baselineCostUsd: 0.5,
+        harnessCostUsd: 0.05,
+        meter: engine.models.meter,
+      }),
+    );
+    const tasks: EvalTask[] = Array.from({ length: 20 }, (_, i) => synthEvalTask({ id: `t${i + 1}` }));
+    const report = await runEvals(engine, { projectDir: dir, tasks });
+
+    expect(report.baseline.passed).toBe(20);
+    expect(report.harness.passed).toBe(19);
+    expect(report.qualityGapWithinNoise).toBe(true);
+    // Not a fail: within noise, so quality "held"; priced + >=20 tasks +
+    // positive savings -> pass.
+    expect(report.verdict).toBe("pass");
+    expect(harnessStatus(dir).evals).toBe("pass");
+  }, 120_000);
+
+  it("clean-subset gap ABOVE the noise band (3 of 20 = 15pp) -> ETH fail", async () => {
+    dir = await makeHarnessFixture();
+    engine = createEngine();
+    engine.frontier.registerAdapter(
+      makePartialFailFrontierAdapter({
+        harnessFailCount: 3, // 3/20 = 15pp > 0.05
+        baselineCostUsd: 0.5,
+        harnessCostUsd: 0.05,
+        meter: engine.models.meter,
+      }),
+    );
+    const tasks: EvalTask[] = Array.from({ length: 20 }, (_, i) => synthEvalTask({ id: `t${i + 1}` }));
+    const report = await runEvals(engine, { projectDir: dir, tasks });
+
+    expect(report.harness.passed).toBe(17);
+    expect(report.qualityGapWithinNoise).toBe(false);
+    expect(report.verdict).toBe("fail");
+    expect(harnessStatus(dir).evals).toBe("fail");
+  }, 120_000);
+});
+
+describe("runEvals — cost-regression hazard (two-dimensional verdict, research 2026-07-07 §4.3)", () => {
+  it("quality held but harness materially MORE expensive (>=10%) -> ETH cost-hazard fail (fires at the low floor)", async () => {
+    dir = await makeHarnessFixture();
+    engine = createEngine();
+    engine.frontier.registerAdapter(
+      makeFakeEvalsFrontierAdapter({
+        baselineCorrect: true,
+        harnessCorrect: true,
+        baselineCostUsd: 0.05,
+        harnessCostUsd: 0.5, // harness 10x the baseline cost -> savings ~ -9.0
+        meter: engine.models.meter,
+      }),
+    );
+    const tasks: EvalTask[] = Array.from({ length: 5 }, (_, i) => synthEvalTask({ id: `t${i + 1}` }));
+    const report = await runEvals(engine, { projectDir: dir, tasks });
+
+    expect(report.qualityHeld).toBe(true);
+    expect(report.savingsPct!).toBeLessThan(0);
+    expect(report.verdict).toBe("fail");
+    expect(harnessStatus(dir).evals).toBe("fail");
+    // Non-vacuous: every report note contains the boilerplate "Cost figures
+    // are estimate-class..." sentence, so asserting just "cost" would pass
+    // regardless of which branch fired. This substring is unique to the
+    // cost-hazard branch's OWN note text (run.ts's extraNotes.push inside the
+    // `cleanSavingsPct <= -COST_REGRESSION_FAIL_FRACTION` branch) and does
+    // NOT appear in the always-present boilerplate.
+    expect(report.note.toLowerCase()).toContain("cost-regression threshold");
+  }, 120_000);
+
+  it("quality held, harness only MILDLY more expensive (<10%) -> inconclusive, never a fail", async () => {
+    dir = await makeHarnessFixture();
+    engine = createEngine();
+    engine.frontier.registerAdapter(
+      makeFakeEvalsFrontierAdapter({
+        baselineCorrect: true,
+        harnessCorrect: true,
+        baselineCostUsd: 0.1,
+        harnessCostUsd: 0.103, // +3% -> savings -0.03, within the -0.10 band
+        meter: engine.models.meter,
+      }),
+    );
+    const tasks: EvalTask[] = Array.from({ length: 20 }, (_, i) => synthEvalTask({ id: `t${i + 1}` }));
+    const report = await runEvals(engine, { projectDir: dir, tasks });
+
+    expect(report.qualityHeld).toBe(true);
+    expect(report.savingsPct!).toBeLessThan(0);
+    expect(report.verdict).toBe("inconclusive");
+    expect(harnessStatus(dir).evals).toBe("pending");
+  }, 120_000);
+});
+
+describe("runEvals — cross-change interactions", () => {
+  it("within-noise quality gap AND a material cost regression -> cost-hazard fail wins", async () => {
+    dir = await makeHarnessFixture();
+    engine = createEngine();
+    engine.frontier.registerAdapter(
+      makePartialFailFrontierAdapter({
+        harnessFailCount: 1, // 1/20 = 5pp, within the 0.05 noise band -> quality treated as held
+        baselineCostUsd: 0.05,
+        harnessCostUsd: 0.5, // harness 10x the baseline cost -> a material cost regression
+        meter: engine.models.meter,
+      }),
+    );
+    const tasks: EvalTask[] = Array.from({ length: 20 }, (_, i) => synthEvalTask({ id: `t${i + 1}` }));
+    const report = await runEvals(engine, { projectDir: dir, tasks });
+
+    // Within-noise -> quality treated as held -> held-quality + material cost
+    // regression -> cost-hazard fail. Pins the most important cross-change
+    // interaction between the significance gate and the cost-hazard gate.
+    expect(report.qualityGapWithinNoise).toBe(true);
+    expect(report.verdict).toBe("fail");
+    expect(harnessStatus(dir).evals).toBe("fail");
+  }, 120_000);
+
+  it("small-suite quality gap of 1-of-2 (50pp) still fails (noise band must not weaken small-N flagging)", async () => {
+    dir = await makeHarnessFixture();
+    engine = createEngine();
+    engine.frontier.registerAdapter(
+      makePartialFailFrontierAdapter({
+        harnessFailCount: 1, // 1/2 = 50pp, well above the 0.05 noise band
+        baselineCostUsd: 0.5,
+        harnessCostUsd: 0.05, // harness CHEAPER -- no cost-hazard confound
+        meter: engine.models.meter,
+      }),
+    );
+    const tasks: EvalTask[] = Array.from({ length: 2 }, (_, i) => synthEvalTask({ id: `t${i + 1}` }));
+    const report = await runEvals(engine, { projectDir: dir, tasks });
+
+    // Pins the plan's own "1-of-2 = 50pp must still fail" invariant: a tiny
+    // suite's large fractional gap must never be absorbed by the noise band.
+    expect(report.qualityGapWithinNoise).toBe(false);
+    expect(report.verdict).toBe("fail");
+    expect(harnessStatus(dir).evals).toBe("fail");
+  }, 120_000);
 });
 
 describe("runEvals — base identity (Task 4 Fix 1)", () => {
@@ -860,10 +1088,10 @@ describe("runEvals — genuine pass", () => {
       }),
     );
 
-    const tasks: EvalTask[] = Array.from({ length: 5 }, (_, i) => synthEvalTask({ id: `t${i + 1}` }));
+    const tasks: EvalTask[] = Array.from({ length: 20 }, (_, i) => synthEvalTask({ id: `t${i + 1}` }));
     const report = await runEvals(engine, { projectDir: dir, tasks });
 
-    expect(report.taskCount).toBe(5);
+    expect(report.taskCount).toBe(20);
     expect(report.qualityHeld).toBe(true);
     expect(report.savingsPct).toBeCloseTo(0.9, 5);
     expect(report.verdict).toBe("pass");
@@ -876,7 +1104,7 @@ describe("runEvals — genuine pass", () => {
     expect(report.cleanBaselinePassed).toBe(report.baseline.passed);
     expect(report.cleanHarnessPassed).toBe(report.harness.passed);
     expect(report.cleanSavingsPct).toBeCloseTo(report.savingsPct!, 5);
-  }, 30_000);
+  }, 120_000);
 });
 
 describe("runEvals — eval scratch dir placement + cleanup", () => {

@@ -185,7 +185,9 @@ smoke (verified on a running app built with `tauri build`).
 ## 6. Eval Loop
 
 After generation (and after major refreshes), run micro-evals baseline-vs-harness.
-The loop (realized in M6) works as follows:
+The loop (realized in M6; the verdict math hardened by M6.1 — see
+`docs/research/2026-07-07-harness-composition.md` §4 for the corrections below) works
+as follows:
 
 1. Per task, create two isolated scratch directories seeded via the task's own
    setup() method (at the pre-change state — golden tasks mined from repo history,
@@ -197,15 +199,25 @@ The loop (realized in M6) works as follows:
    in but otherwise starts from the same pre-change state. Apply the returned diff and
    oracle-score the result.
 4. Compare pass/fail counts and costs (both routes work each task from identical base
-   state, scored by identical oracle). Verdicts:
-   - **pass** if quality held, savings > 0, and sample size ≥ 5 tasks (credible: 20–50);
-     manifest flips to verified.
-   - **fail** if harness *degraded* quality on the clean subset (no measurement failures);
-     ETH hazard, never shipped. This check deliberately ignores the ≥5-task sample-size
-     floor below: a quality regression is worth flagging even on a small run, since it
-     only ever blocks a claim, never inflates one.
-   - **inconclusive** if too few tasks, unpriced, baseline solved zero, or ≥20% measurement
-     failures (infra hiccups, apply mismatches — run too corrupted for "pass" or "fail").
+   state, scored by identical oracle). The verdict is **two-dimensional** — quality AND
+   cost (research §0/§4.3): a harness that holds quality but costs materially more than
+   baseline is an ETH failure, not a neutral result — and **significance-aware**: a
+   within-noise quality gap is not treated as a regression (research §3.3, single-run
+   pass@1 std >1.5pp even at temperature 0).
+   - **pass** if quality held on the clean subset (or the gap is within a 5-percentage-
+     point single-run noise band), savings > 0, priced, and sample size ≥ 20 tasks
+     (credible: 20–50) — the savings-PASS floor; manifest flips to verified.
+   - **fail** on either of two ETH hazards: (a) *quality hazard* — harness *degraded*
+     quality on the clean subset beyond the noise band (no measurement failures); this
+     check deliberately ignores any sample-size floor — a quality regression is worth
+     flagging even on a small run, since it only ever blocks a claim, never inflates one;
+     (b) *cost hazard* — quality held (or within noise) but the harness cost ≥10% MORE
+     than baseline on the clean subset, at ≥5 tasks — the hazard-flag floor (research
+     §4.2), deliberately lower than the savings-PASS floor since a harm signal should be
+     flagged readily.
+   - **inconclusive** if too few tasks for a pass (<20 — a hazard can still fire below
+     that), unpriced, baseline solved zero, or ≥20% measurement failures (infra hiccups,
+     apply mismatches — run too corrupted for "pass" or "fail").
 5. Cost figures are estimate-class (directional) and carry `pricingConfidence` (worst
    across the run); an unpriced model taints to inconclusive.
 
@@ -300,8 +312,13 @@ ready to hold Apple signing credentials in CI.
 
 ## 12. Key Risks
 
-1. **Generated context can hurt** (ETH result: worse in 5/8 settings).
-   Mitigation: eval gate before trust + human-editable harness.
+1. **Generated context can hurt** — **ETH Zurich + DeepMind**, "Evaluating
+   AGENTS.md: Are Repository-Level Context Files Helpful for Coding Agents?"
+   (arXiv:2602.11988; corrects an earlier "ETH Zurich/LogicStar" attribution —
+   see `docs/research/2026-07-07-harness-composition.md` §4.1): LLM-generated
+   context reduced success ~0.5–2% on average, worse in 5 of 8 settings, while
+   raising inference cost 20–23%. Mitigation: eval gate before trust +
+   human-editable harness.
 2. **First-party blast radius** — thin wrapper apps died in 2025–26.
    Mitigation: the IP is the generation engine + eval loop, not the shell;
    engine-agnostic frontier interface (ACP-shaped).
@@ -335,8 +352,14 @@ ready to hold Apple signing credentials in CI.
    not a billed amount; they are directional, not precise. The `pricingConfidence`
    field (verified/provider-reported/secondary/unverified/unpriced — worst across
    the run) taints the savings claim: an unpriced model → no savings number → inconclusive
-   verdict. A real claim requires 20–50 paired tasks (v1 CI uses synthetic fixtures
-   for mechanics; an operator smoke over golden tasks verifies a real project).
+   verdict. **The gate is two-dimensional** (M6.1 —
+   `docs/research/2026-07-07-harness-composition.md` §0/§4.3): a harness that holds
+   quality but costs ≥10% more than baseline on the clean subset is flagged as a fail,
+   not reported as neutral. **Task-count floors are split** (§4.2): the quality hazard
+   has no floor at all and the cost hazard fires at ≥5 tasks (a harm signal is flagged
+   readily), while a savings *pass* needs ≥20 paired tasks (credible: 20–50) — v1 CI uses
+   synthetic fixtures for mechanics; an operator smoke over ≥20 golden tasks verifies a
+   real project.
    Documented residual biases (both directions): eval harness runs lack wiki MCP
    server (biases against), and golden-task bundles generated at HEAD (biases toward
    on those tasks). Treat v1 savings as directional; a measured "pass" understates
