@@ -550,6 +550,10 @@ export function OrchestrateScreen({ onOpenSettings }: OrchestrateScreenProps = {
             )}
           </div>
 
+          {harnessState.status === "ready" && harnessState.harness.card === "draft" && (
+            <p className="muted-text">Project Card drafted — review it in Harness setting.</p>
+          )}
+
           {wikiState.status === "error" && (
             <p role="alert" className="error-text">
               {wikiState.message}

@@ -1,6 +1,6 @@
 # Wiki v1: Project Card + Worker Retrieval — Design
 
-**Date:** 2026-07-08 · **Status:** approved design, pre-implementation
+**Date:** 2026-07-08 · **Status:** implemented — docs/superpowers/plans/2026-07-08-wiki-project-card.md
 **Research basis:** `docs/research/2026-07-07-harness-composition.md` (Pillar 1) + a
 three-agent adversarial validation pass (2026-07-08) whose amendments are folded in
 below and marked **[AMENDED]** where they changed the original proposal.

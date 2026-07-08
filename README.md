@@ -20,36 +20,61 @@ Harness generation (M4) drives a frontier session over the indexed repo to
 produce a committable `.openfusion/` harness — an LLM wiki, a specialist
 agent roster, and a routing policy — gated by structural validation at
 generation time; the eval loop that flips `verification.evals` from
-`"pending"` to `"pass"` lands in M6. Two exporters turn that harness into
-interop artifacts other tools can read: an `AGENTS.md` project brief and
+`"pending"` to `"pass"` lands in M6. Generation also mines commands
+deterministically (`package.json` scripts, Makefile/justfile targets, CI
+workflow steps), then a frontier model selects and annotates them into a
+**Project Card** — a wiki page that starts in `"draft"` state and is
+statically validated (unresolvable paths/symbols/scripts are stripped, not
+silently kept). A draft card is a proposal only: it must be reviewed and
+explicitly **approved** in the desktop app's Harness setting panel before it
+is ever injected into a worker prompt. Two exporters turn the harness into
+interop artifacts other tools can read: an `AGENTS.md` project brief (led by
+the approved card, when there is one, plus a ground-truth directive) and
 per-agent Claude Code subagents under `.claude/agents/`. Orchestration (M5b)
 now composes that harness into the full harness-fusion loop end to end:
 `engine.orchestrate` classifies a task, routes it to a specialist agent,
-runs an open model worker inside an isolated git worktree, and gates the
-resulting diff behind a frontier review — retrying once before escalating to
-a write-scoped frontier session — and `engine.orchestrate.apply` lands an
-approved diff into the base tree. See "How the loop works" below for the
-full flow and its caveats (cost estimates are directional, the harness
+runs an open model worker inside an isolated git worktree — handing it
+**only** the approved Project Card's digest as repo context (a draft or
+legacy harness without a card falls back to the build-and-test page digest
+alone; a harness with neither injects nothing), plus on-demand `wiki_query`/
+`wiki_map` tools against the symbol index — and gates the resulting diff
+behind a frontier review — retrying once before escalating to a
+write-scoped frontier session — and `engine.orchestrate.apply` lands an
+approved diff into the base tree. That injection design is deliberate, not
+minimal-effort: an ETH Zurich + DeepMind study (arXiv:2602.11988) found that
+blanket LLM-generated context injection measurably hurts both success rate
+and inference cost, so only human-approved content is trusted unconditionally
+— everything else is retrieval-on-demand. See "How the loop works" below for
+the full flow and its caveats (cost estimates are directional, the harness
 driving it is unverified until M6, and nothing ever auto-merges).
 
 ## Generating a harness
 
-    engine.harness.generate  { "projectDir": "/path/to/repo" }
-    engine.harness.status    { "projectDir": "/path/to/repo" }
-    engine.harness.export    { "projectDir": "/path/to/repo", "format": "agents-md" }
-    engine.harness.export    { "projectDir": "/path/to/repo", "format": "claude-subagents" }
+    engine.harness.generate     { "projectDir": "/path/to/repo" }
+    engine.harness.status       { "projectDir": "/path/to/repo" }
+    engine.harness.card.update  { "projectDir": "/path/to/repo", "digest": "<edited card digest>" }
+    engine.harness.card.approve { "projectDir": "/path/to/repo" }
+    engine.harness.export       { "projectDir": "/path/to/repo", "format": "agents-md" }
+    engine.harness.export       { "projectDir": "/path/to/repo", "format": "claude-subagents" }
 
 `generate` requires a git repository and a registered frontier adapter; it
 writes `.openfusion/` (wiki pages, agent defs, `routing.yaml`, `manifest.json`)
 and is safe to re-run — regeneration prunes only the artifacts the prior
-generation itself wrote, never hand-edited additions. `status` is a cheap,
-poll-friendly read of `manifest.json` alone. `export` requires a harness that
-is both present and structurally valid (else `SERVER_ERROR`); `agents-md`
-writes `<projectDir>/AGENTS.md`, `claude-subagents` writes one file per agent
-under `<projectDir>/.claude/agents/`. **Unverified until the eval gate
-passes**: every exported harness is marked `UNVERIFIED` in `AGENTS.md` (and
-the eval status is visible via `engine.harness.status`) until
-`manifest.verification.evals` reads `"pass"` — treat agent prompts and
+generation itself wrote, never hand-edited additions, and always resets the
+Project Card back to `"draft"` (a regenerated card is a new proposal, never
+carried forward as pre-approved). `status` is a cheap, poll-friendly read of
+`manifest.json` alone, including `verification.card` (`"draft"`, `"approved"`,
+or absent for a harness with no card). `engine.harness.card.update` lets an
+operator edit the draft digest before approving it; `engine.harness.card.approve`
+flips `verification.card` to `"approved"`, the only state from which the card
+is ever injected into a worker prompt. `export` requires a harness that is
+both present and structurally valid (else `SERVER_ERROR`); `agents-md` writes
+`<projectDir>/AGENTS.md` — leading with the approved card (when present) and
+a directive to treat it as ground truth over guesswork — `claude-subagents`
+writes one file per agent under `<projectDir>/.claude/agents/`. **Unverified
+until the eval gate passes**: every exported harness is marked `UNVERIFIED`
+in `AGENTS.md` (and the eval status is visible via `engine.harness.status`)
+until `manifest.verification.evals` reads `"pass"` — treat agent prompts and
 routing as unproven against your project until then.
 
 ## How the loop works
@@ -234,7 +259,11 @@ The shell exposes four cockpit screens:
    diff, review verdict, cost breakdown (estimate-class, tagged with
    `pricingConfidence`). Apply button stages the diff (never commits). Cancel
    button calls `engine.cancel({runId})`, rendering "Cancelled" (distinct from
-   "Failed") once settled.
+   "Failed") once settled. When a just-generated harness has a Project Card
+   still in `"draft"`, a nudge — "Project Card drafted — review it in Harness
+   setting." — appears alongside the harness status; it is informational
+   only and never gates the Run button. The card itself is reviewed
+   (view/edit/approve) in the Harness setting panel.
 4. **Evals** — baseline-vs-harness report card. Runs real evals, displays
    honest verdict (pass green / **fail = ETH-HAZARD: harness degraded quality,
    flagged and never shipped as a win** / inconclusive amber), savings % with
