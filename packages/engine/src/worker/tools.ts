@@ -18,11 +18,32 @@ import { canonicalizePath, isPathContained } from "../engines/path-scope.js";
 import type { WikiPage } from "../harness/schema.js";
 import { querySymbols, renderMap } from "../wiki/query.js";
 import type { SymbolHit, WikiStore } from "../wiki/store.js";
+import { applyPatchToWorktree } from "./apply-patch.js";
+
+// Phase 1 dialect-pack telemetry: expected tool failures (model mistakes)
+// are classified so edit_fail_rate / tool_error_rate can be attributed per
+// pack without logging task text or file content.
+export type ToolErrorKind =
+  | "not_found"
+  | "not_unique"
+  | "containment"
+  | "invalid_args"
+  | "io"
+  | "timeout"
+  | "aborted"
+  | "unknown";
+
+export interface ToolEvent {
+  tool: string;
+  detail: string;
+  ok: boolean;
+  errorKind?: ToolErrorKind;
+}
 
 export interface ToolContext {
   root: string;
   bashTimeoutMs?: number;
-  onToolEvent?: (e: { tool: string; detail: string }) => void;
+  onToolEvent?: (e: ToolEvent) => void;
   // Task 7: present only once worker/methods.ts has confirmed the project's
   // wiki is actually built (never triggers a build itself — see that
   // module's wiring). When set, createWorkerTools additionally registers
@@ -34,6 +55,14 @@ export interface ToolContext {
     store: WikiStore;
     pages: ReadonlyArray<Pick<WikiPage, "slug" | "title" | "digest">>;
   };
+  // Dialect-pack composition knobs (Phase 1). Defaults preserve pre-pack
+  // behavior: all core tools + string-replace edit description.
+  includeEdit?: boolean;
+  editDescription?: string;
+  includeBash?: boolean;
+  includeWikiTools?: boolean;
+  /** When true, register apply_patch and omit string-replace edit. */
+  includeApplyPatch?: boolean;
 }
 
 interface WikiQueryResult {
@@ -197,43 +226,88 @@ function containmentGate(root: string, canonicalRoot: string, rawPath: string): 
 // whatever it prints flows straight into a third-party model provider's
 // context, so the boundary this milestone provides is blast-radius/
 // isolation of WRITES (deferred fully to M7), not data confidentiality.
+const DEFAULT_EDIT_DESCRIPTION =
+  "Replace a single, EXACT, unique occurrence of `find` with `replace` " +
+  "in a file at a path relative to the worktree root. Fails if `find` " +
+  "is missing or matches more than once -- widen `find` with more " +
+  "surrounding context to disambiguate.";
+
+function emit(
+  ctx: ToolContext,
+  toolName: string,
+  detailStr: string,
+  ok: boolean,
+  errorKind?: ToolErrorKind,
+): void {
+  ctx.onToolEvent?.({ tool: toolName, detail: detailStr, ok, errorKind });
+}
+
 export function createWorkerTools(ctx: ToolContext): Record<string, Tool> {
   const canonicalRoot = fs.realpathSync(ctx.root);
   const bashTimeoutMs = ctx.bashTimeoutMs ?? DEFAULT_BASH_TIMEOUT_MS;
+  const includeBash = ctx.includeBash !== false;
+  const includeApplyPatch = ctx.includeApplyPatch === true;
+  const includeEdit = !includeApplyPatch && ctx.includeEdit !== false;
+  const includeWiki = ctx.includeWikiTools !== false && ctx.wiki !== undefined;
+  const editDescription = ctx.editDescription ?? DEFAULT_EDIT_DESCRIPTION;
 
-  const bash = tool({
-    description:
-      "Run a shell command via /bin/sh, with cwd pinned to the worktree root. " +
-      "NOTE: this does not prevent the command from `cd`-ing out of the " +
-      "worktree or touching absolute paths outside it -- unlike the file " +
-      "tools, bash does not enforce path containment. A nonzero exit code " +
-      "is a normal result, not a failure of this tool.",
-    inputSchema: z.object({ command: z.string().min(1) }),
-    execute: async ({ command }, { abortSignal }): Promise<BashResult> => {
-      ctx.onToolEvent?.({ tool: "bash", detail: detail(command) });
-      return runBash(command, ctx.root, bashTimeoutMs, abortSignal);
-    },
-  });
+  const tools: Record<string, Tool> = {};
 
-  const read_file = tool({
+  if (includeBash) {
+    tools.bash = tool({
+      description:
+        "Run a shell command via /bin/sh, with cwd pinned to the worktree root. " +
+        "NOTE: this does not prevent the command from `cd`-ing out of the " +
+        "worktree or touching absolute paths outside it -- unlike the file " +
+        "tools, bash does not enforce path containment. A nonzero exit code " +
+        "is a normal result, not a failure of this tool.",
+      inputSchema: z.object({ command: z.string().min(1) }),
+      execute: async ({ command }, { abortSignal }): Promise<BashResult> => {
+        const result = await runBash(command, ctx.root, bashTimeoutMs, abortSignal);
+        const timedOut = result.error?.includes("timed out") === true;
+        const aborted = result.error === "aborted";
+        const ok = result.error === undefined;
+        emit(
+          ctx,
+          "bash",
+          detail(command),
+          ok,
+          ok ? undefined : aborted ? "aborted" : timedOut ? "timeout" : "unknown",
+        );
+        return result;
+      },
+    });
+  }
+
+  tools.read_file = tool({
     description: "Read a UTF-8 text file at a path relative to the worktree root.",
     inputSchema: z.object({ path: z.string().min(1) }),
     execute: async ({ path: rawPath }, { abortSignal }): Promise<ReadResult | FileErrorResult> => {
-      if (abortSignal?.aborted) return { error: "aborted" };
-      ctx.onToolEvent?.({ tool: "read_file", detail: detail(rawPath) });
+      if (abortSignal?.aborted) {
+        emit(ctx, "read_file", detail(rawPath), false, "aborted");
+        return { error: "aborted" };
+      }
       const gate = containmentGate(ctx.root, canonicalRoot, rawPath);
-      if (!gate.ok) return { error: gate.error };
-      if (!fs.existsSync(gate.resolved)) return { error: "not found" };
+      if (!gate.ok) {
+        emit(ctx, "read_file", detail(rawPath), false, "containment");
+        return { error: gate.error };
+      }
+      if (!fs.existsSync(gate.resolved)) {
+        emit(ctx, "read_file", detail(rawPath), false, "not_found");
+        return { error: "not found" };
+      }
       try {
         const content = fs.readFileSync(gate.resolved, "utf8");
+        emit(ctx, "read_file", detail(rawPath), true);
         return { content: truncate(content, READ_TRUNCATE_CHARS) };
       } catch (e) {
+        emit(ctx, "read_file", detail(rawPath), false, "io");
         return { error: `read failed: ${(e as Error).message}` };
       }
     },
   });
 
-  const write_file = tool({
+  tools.write_file = tool({
     description:
       "Write (create or overwrite) a UTF-8 text file at a path relative to " +
       "the worktree root, creating parent directories as needed.",
@@ -242,65 +316,108 @@ export function createWorkerTools(ctx: ToolContext): Record<string, Tool> {
       { path: rawPath, content },
       { abortSignal },
     ): Promise<WriteResult | FileErrorResult> => {
-      if (abortSignal?.aborted) return { error: "aborted" };
-      ctx.onToolEvent?.({ tool: "write_file", detail: detail(rawPath) });
+      if (abortSignal?.aborted) {
+        emit(ctx, "write_file", detail(rawPath), false, "aborted");
+        return { error: "aborted" };
+      }
       const gate = containmentGate(ctx.root, canonicalRoot, rawPath);
-      if (!gate.ok) return { error: gate.error };
+      if (!gate.ok) {
+        emit(ctx, "write_file", detail(rawPath), false, "containment");
+        return { error: gate.error };
+      }
       try {
         fs.mkdirSync(path.dirname(gate.resolved), { recursive: true });
         fs.writeFileSync(gate.resolved, content, "utf8");
+        emit(ctx, "write_file", detail(rawPath), true);
         return { ok: true, bytes: Buffer.byteLength(content, "utf8") };
       } catch (e) {
+        emit(ctx, "write_file", detail(rawPath), false, "io");
         return { error: `write failed: ${(e as Error).message}` };
       }
     },
   });
 
-  const edit = tool({
-    description:
-      "Replace a single, EXACT, unique occurrence of `find` with `replace` " +
-      "in a file at a path relative to the worktree root. Fails if `find` " +
-      "is missing or matches more than once -- widen `find` with more " +
-      "surrounding context to disambiguate.",
-    inputSchema: z.object({
-      path: z.string().min(1),
-      find: z.string().min(1),
-      replace: z.string(),
-    }),
-    execute: async (
-      { path: rawPath, find, replace },
-      { abortSignal },
-    ): Promise<EditResult | FileErrorResult> => {
-      if (abortSignal?.aborted) return { error: "aborted" };
-      ctx.onToolEvent?.({ tool: "edit", detail: detail(rawPath) });
-      const gate = containmentGate(ctx.root, canonicalRoot, rawPath);
-      if (!gate.ok) return { error: gate.error };
-      if (!fs.existsSync(gate.resolved)) return { error: "not found" };
-      let content: string;
-      try {
-        content = fs.readFileSync(gate.resolved, "utf8");
-      } catch (e) {
-        return { error: `read failed: ${(e as Error).message}` };
-      }
-      const occurrences = content.split(find).length - 1;
-      if (occurrences === 0) return { error: "find not found" };
-      if (occurrences > 1) {
-        return { error: `find matched ${occurrences} times, must be unique` };
-      }
-      const idx = content.indexOf(find);
-      const next = content.slice(0, idx) + replace + content.slice(idx + find.length);
-      try {
-        fs.writeFileSync(gate.resolved, next, "utf8");
-        return { ok: true };
-      } catch (e) {
-        return { error: `write failed: ${(e as Error).message}` };
-      }
-    },
-  });
+  if (includeApplyPatch) {
+    tools.apply_patch = tool({
+      description:
+        "Apply a multi-file patch in Codex-style freeform format. Wrap with " +
+        "`*** Begin Patch` / `*** End Patch`. File ops: " +
+        "`*** Update File: rel/path`, `*** Add File: rel/path`, " +
+        "`*** Delete File: rel/path`. Hunk lines use leading space (context), " +
+        "`-` (remove), `+` (add). Prefer this over sed/echo for edits.",
+      inputSchema: z.object({ patch: z.string().min(1) }),
+      execute: async ({ patch }, { abortSignal }): Promise<{ ok: true; filesTouched: string[] } | FileErrorResult> => {
+        if (abortSignal?.aborted) {
+          emit(ctx, "apply_patch", detail("patch"), false, "aborted");
+          return { error: "aborted" };
+        }
+        const result = applyPatchToWorktree(ctx.root, patch);
+        if (!result.ok) {
+          emit(ctx, "apply_patch", detail(result.error), false, result.errorKind);
+          return { error: result.error };
+        }
+        emit(ctx, "apply_patch", detail(result.filesTouched.join(",")), true);
+        return { ok: true, filesTouched: result.filesTouched };
+      },
+    });
+  }
 
-  const tools: Record<string, Tool> = { bash, read_file, write_file, edit };
+  if (includeEdit) {
+    tools.edit = tool({
+      description: editDescription,
+      inputSchema: z.object({
+        path: z.string().min(1),
+        find: z.string().min(1),
+        replace: z.string(),
+      }),
+      execute: async (
+        { path: rawPath, find, replace },
+        { abortSignal },
+      ): Promise<EditResult | FileErrorResult> => {
+        if (abortSignal?.aborted) {
+          emit(ctx, "edit", detail(rawPath), false, "aborted");
+          return { error: "aborted" };
+        }
+        const gate = containmentGate(ctx.root, canonicalRoot, rawPath);
+        if (!gate.ok) {
+          emit(ctx, "edit", detail(rawPath), false, "containment");
+          return { error: gate.error };
+        }
+        if (!fs.existsSync(gate.resolved)) {
+          emit(ctx, "edit", detail(rawPath), false, "not_found");
+          return { error: "not found" };
+        }
+        let content: string;
+        try {
+          content = fs.readFileSync(gate.resolved, "utf8");
+        } catch (e) {
+          emit(ctx, "edit", detail(rawPath), false, "io");
+          return { error: `read failed: ${(e as Error).message}` };
+        }
+        const occurrences = content.split(find).length - 1;
+        if (occurrences === 0) {
+          emit(ctx, "edit", detail(rawPath), false, "not_found");
+          return { error: "find not found" };
+        }
+        if (occurrences > 1) {
+          emit(ctx, "edit", detail(rawPath), false, "not_unique");
+          return { error: `find matched ${occurrences} times, must be unique` };
+        }
+        const idx = content.indexOf(find);
+        const next = content.slice(0, idx) + replace + content.slice(idx + find.length);
+        try {
+          fs.writeFileSync(gate.resolved, next, "utf8");
+          emit(ctx, "edit", detail(rawPath), true);
+          return { ok: true };
+        } catch (e) {
+          emit(ctx, "edit", detail(rawPath), false, "io");
+          return { error: `write failed: ${(e as Error).message}` };
+        }
+      },
+    });
+  }
 
-  if (ctx.wiki !== undefined) {
+  if (includeWiki && ctx.wiki !== undefined) {
     // Captured into locals (rather than read off `ctx.wiki` inside the
     // closures below) so TS's narrowing of `ctx.wiki !== undefined` doesn't
     // need to survive into a nested arrow function.
@@ -311,7 +428,7 @@ export function createWorkerTools(ctx: ToolContext): Record<string, Tool> {
         "Look up a SYMBOL (function/class/type name): returns where it is defined and referenced (file:line) in this project's code index, plus matching project wiki pages. For exact strings, regex, or file contents use bash grep / read_file instead.",
       inputSchema: z.object({ query: z.string().min(1) }),
       execute: async ({ query }): Promise<WikiQueryResult> => {
-        ctx.onToolEvent?.({ tool: "wiki_query", detail: detail(query) });
+        emit(ctx, "wiki_query", detail(query), true);
         const { definitions, references } = querySymbols(store, query);
         const q = query.toLowerCase();
         const pageHits = pages
@@ -332,10 +449,7 @@ export function createWorkerTools(ctx: ToolContext): Record<string, Tool> {
         budgetTokens: z.number().int().min(64).max(32768).optional(),
       }),
       execute: async ({ budgetTokens }): Promise<string> => {
-        ctx.onToolEvent?.({
-          tool: "wiki_map",
-          detail: detail(String(budgetTokens ?? 1024)),
-        });
+        emit(ctx, "wiki_map", detail(String(budgetTokens ?? 1024)), true);
         return renderMap(store, budgetTokens);
       },
     });

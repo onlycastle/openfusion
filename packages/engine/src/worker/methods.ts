@@ -31,8 +31,10 @@ import { RpcMethodError } from "../rpc/errors.js";
 import { providerKindOf, requireGitRepo, resolveProjectKey } from "../rpc/guards.js";
 import { registerMethod } from "../rpc/register.js";
 import { wikiDbPath } from "../wiki/store.js";
+import { resolveDialectPackId } from "../models/catalog.js";
 import { runWorkerLoop } from "./loop.js";
-import { createWorkerTools, type ToolContext } from "./tools.js";
+import { createWorkerRuntime } from "./runtime.js";
+import type { ToolContext } from "./tools.js";
 import { WorktreeManager, type Worktree } from "./worktree.js";
 
 const RunParamsSchema = z.object({
@@ -43,6 +45,9 @@ const RunParamsSchema = z.object({
   wikiDigest: z.string().optional(),
   maxSteps: z.number().int().min(1).max(100).optional(),
   bashTimeoutMs: z.number().int().min(1000).max(600000).optional(),
+  // Phase 1: dialect pack id. When omitted, resolved from (provider kind,
+  // model) via the bundled family catalog's default pack.
+  dialectPack: z.string().min(1).optional(),
   // Whole-run deadline for the model loop (NOT a per-tool-call budget --
   // that's bashTimeoutMs above). Ceiling is 30 minutes, well above
   // engine.models.complete's own 10-minute timeoutMs ceiling: a worker run
@@ -196,11 +201,19 @@ export function registerWorkerMethods(engine: Engine): void {
       }
     }
 
-    // Task 7 telemetry: tallies tool-call NAMES and COUNTS only — never
+    // Phase 1 telemetry: tool-call NAMES/COUNTS plus error kinds — never
     // arguments — logged once the run completes (see the success path
     // below, right where the run result is assembled).
     const toolCallCounts: Record<string, number> = {};
-    const tools = createWorkerTools({
+    const toolErrorCounts: Record<string, number> = {};
+    let editFailCount = 0;
+
+    const dialectPackId = resolveDialectPackId({
+      explicit: params.dialectPack,
+      providerKind: kind,
+      modelId: params.model,
+    });
+    const runtime = createWorkerRuntime(dialectPackId, {
       root: worktree.path,
       bashTimeoutMs: params.bashTimeoutMs,
       wiki,
@@ -209,7 +222,19 @@ export function registerWorkerMethods(engine: Engine): void {
       // command content.
       onToolEvent: (e) => {
         toolCallCounts[e.tool] = (toolCallCounts[e.tool] ?? 0) + 1;
-        engine.notify("worker.progress", { taskId, kind: "tool", tool: e.tool, detail: e.detail });
+        if (!e.ok) {
+          const key = `${e.tool}:${e.errorKind ?? "unknown"}`;
+          toolErrorCounts[key] = (toolErrorCounts[key] ?? 0) + 1;
+          if (e.tool === "edit" || e.tool === "apply_patch") editFailCount += 1;
+        }
+        engine.notify("worker.progress", {
+          taskId,
+          kind: "tool",
+          tool: e.tool,
+          detail: e.detail,
+          ok: e.ok,
+          errorKind: e.errorKind,
+        });
       },
     });
 
@@ -252,8 +277,9 @@ export function registerWorkerMethods(engine: Engine): void {
         model: languageModel,
         task: params.task,
         wikiDigest: params.wikiDigest,
-        tools,
-        maxSteps: params.maxSteps,
+        tools: runtime.tools,
+        instructions: runtime.instructions,
+        maxSteps: params.maxSteps ?? runtime.maxSteps,
         abortSignal: AbortSignal.any(signals),
         // Step progress is likewise structured + truncated (loop.ts's own
         // ON_STEP_TEXT_TRUNCATE_CHARS) — never the model's full raw output.
@@ -295,11 +321,15 @@ export function registerWorkerMethods(engine: Engine): void {
       });
 
       engine.log(
-        `worker.run ${taskId} ${kind}/${params.model}: ${loopResult.steps} steps, ${loopResult.toolCallCount} tool calls`,
+        `worker.run ${taskId} ${kind}/${params.model}: ${loopResult.steps} steps, ${loopResult.toolCallCount} tool calls pack=${runtime.dialectPackId}`,
       );
-      // Task 7 telemetry: names + counts only, never arguments — see
-      // toolCallCounts' own tally above.
+      // Phase 1 telemetry: names + counts + error kinds only, never arguments.
       engine.log(`worker.run tool-calls model=${params.model} ${JSON.stringify(toolCallCounts)}`);
+      if (Object.keys(toolErrorCounts).length > 0) {
+        engine.log(
+          `worker.run tool-errors model=${params.model} pack=${runtime.dialectPackId} ${JSON.stringify(toolErrorCounts)} editFail=${editFailCount}`,
+        );
+      }
 
       return {
         diff,
@@ -310,6 +340,12 @@ export function registerWorkerMethods(engine: Engine): void {
         usage: loopResult.usage,
         costUsd,
         worktree: { path: worktree.path, branch: worktree.branch },
+        dialectPack: runtime.dialectPackId,
+        dialectPackVersion: runtime.dialectPackVersion,
+        editDialect: runtime.editDialect,
+        toolCallCounts,
+        toolErrorCounts,
+        editFailCount,
       };
     } catch (err) {
       // The worktree (and any partial edits already on disk) is

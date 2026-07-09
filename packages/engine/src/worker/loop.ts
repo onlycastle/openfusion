@@ -22,6 +22,10 @@ export interface WorkerRunInput {
   wikiDigest?: string;
   tools: Record<string, Tool>;
   maxSteps?: number;
+  // Dialect-pack system/instruction block (Phase 1). When omitted, falls
+  // back to the historical WORKER_INSTRUCTIONS constant so unit tests that
+  // inject tools directly keep working.
+  instructions?: string;
   // Forwarded straight through to generateText's own `abortSignal` (see the
   // call below). The caller (engine.worker.run, worker/methods.ts) owns
   // building this -- a combined timeoutMs deadline + a per-run
@@ -65,8 +69,10 @@ function truncate(s: string, max: number): string {
 // (optionally) the wiki digest as repository context, then the task
 // itself -- in that order, so the model reads its marching orders before
 // any task-specific detail.
-function buildPrompt(input: Pick<WorkerRunInput, "task" | "wikiDigest">): string {
-  const sections = [WORKER_INSTRUCTIONS];
+function buildPrompt(
+  input: Pick<WorkerRunInput, "task" | "wikiDigest" | "instructions">,
+): string {
+  const sections = [input.instructions ?? WORKER_INSTRUCTIONS];
   if (input.wikiDigest !== undefined && input.wikiDigest.length > 0) {
     sections.push(`# Repository context\n\n${input.wikiDigest}`);
   }
