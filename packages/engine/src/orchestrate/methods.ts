@@ -14,6 +14,7 @@ import type { Engine } from "../engine.js";
 import { RpcMethodError } from "../rpc/errors.js";
 import { requireGitRepo } from "../rpc/guards.js";
 import { registerMethod } from "../rpc/register.js";
+import { recordRun } from "../runs/ledger.js";
 import { orchestrate, type OrchestrateParams, type OrchestrateResult } from "./orchestrate.js";
 
 const execFileAsync = promisify(execFile);
@@ -78,14 +79,80 @@ export function registerOrchestrateMethods(engine: Engine): void {
     // ended. orchestrate() itself (and, for a nested evals.run-driven call,
     // engine.worker.run's own handler) only ever get()s this SAME runId —
     // see cancel-registry.ts's header comment for the full ownership split.
+    //
+    // Run-ledger write point (spec 2026-07-08): records only RPC-layer
+    // orchestrate calls — evals/run.ts's direct orchestrate() calls bypass
+    // this handler and are captured under kind:"evals" instead.
     const runId = params.runId;
     if (runId !== undefined) engine.cancelRegistry.register(runId);
+    const startedAt = Date.now();
     try {
       const result: OrchestrateResult = await orchestrate(engine, params as OrchestrateParams);
       engine.log(
         `orchestrate ${params.projectDir}: outcome=${result.outcome} attempts=${result.attempts.length}`,
       );
+      recordRun(engine, params.projectDir, {
+        v: 1,
+        kind: "orchestrate",
+        at: new Date().toISOString(),
+        taskClass: result.taskClass,
+        agent: result.agent,
+        workerModel: result.resolution === "frontier" ? "frontier" : result.resolution.model,
+        attempts: result.attempts.length,
+        outcome: result.outcome,
+        escalated: result.outcome === "escalated",
+        reviews: result.attempts.flatMap((a) =>
+          a.verdict ? [{ decision: a.verdict.decision, reasons: a.verdict.reasons }] : [],
+        ),
+        contextBranch: result.contextBranch,
+        ...(result.toolCallCounts !== undefined ? { toolCallCounts: result.toolCallCounts } : {}),
+        ...(result.toolErrorCounts !== undefined ? { toolErrorCounts: result.toolErrorCounts } : {}),
+        ...(result.editFailCount !== undefined ? { editFailCount: result.editFailCount } : {}),
+        ...(result.family !== undefined ? { family: result.family } : {}),
+        ...(result.dialectPack !== undefined ? { dialectPack: result.dialectPack } : {}),
+        ...(result.routeId !== undefined ? { routeId: result.routeId } : {}),
+        cost: {
+          workerUsd: result.cost.workerUsd,
+          reviewUsd: result.cost.reviewUsd,
+          escalateUsd: result.cost.escalateUsd,
+          totalUsd: result.cost.totalUsd,
+        },
+        durationMs: Date.now() - startedAt,
+        ...(runId !== undefined ? { runId } : {}),
+      });
       return result;
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      const data =
+        err instanceof Error && "data" in err
+          ? (err as { data?: { cancelled?: boolean } }).data
+          : undefined;
+      const errorCategory =
+        data?.cancelled === true || /cancelled/i.test(message)
+          ? ("cancelled" as const)
+          : /no harness/i.test(message)
+            ? ("no-harness" as const)
+            : /structural validation|load-failed|HarnessValidation/i.test(message)
+              ? ("load-failed" as const)
+              : ("unknown" as const);
+      recordRun(engine, params.projectDir, {
+        v: 1,
+        kind: "orchestrate",
+        at: new Date().toISOString(),
+        taskClass: "unknown",
+        agent: "unknown",
+        workerModel: "unknown",
+        attempts: 0,
+        outcome: "error",
+        escalated: false,
+        reviews: [],
+        contextBranch: "none",
+        cost: { workerUsd: null, reviewUsd: null, escalateUsd: null, totalUsd: null },
+        durationMs: Date.now() - startedAt,
+        errorCategory,
+        ...(runId !== undefined ? { runId } : {}),
+      });
+      throw err;
     } finally {
       if (runId !== undefined) engine.cancelRegistry.deregister(runId);
     }

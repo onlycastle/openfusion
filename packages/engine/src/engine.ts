@@ -6,6 +6,7 @@ import { registerCoreMethods } from "./methods.js";
 import { ModelsService, registerModelsMethods } from "./models/methods.js";
 import { OrchestrateService, registerOrchestrateMethods } from "./orchestrate/methods.js";
 import { CancelRegistry, registerCancelMethod } from "./rpc/cancel-registry.js";
+import { RunsService, registerRunsMethods } from "./runs/methods.js";
 import { WikiService, registerWikiMethods } from "./wiki/methods.js";
 import { WorkerService, registerWorkerMethods } from "./worker/methods.js";
 
@@ -30,6 +31,7 @@ export class Engine {
   readonly worker = new WorkerService();
   readonly orchestrate = new OrchestrateService();
   readonly evals = new EvalsService();
+  readonly runs = new RunsService();
   // M7b Task 2: runId (string) -> AbortController, so engine.cancel {runId}
   // can reach whichever sub-operation (worker attempt / review / escalation /
   // eval baseline turn) is currently in flight for that run, however deep it
@@ -64,6 +66,7 @@ export class Engine {
     // dependency direction" reason (registration order itself doesn't gate
     // anything — dispatch() resolves handlers at CALL time).
     registerEvalsMethods(this);
+    registerRunsMethods(this);
   }
 
   async close(): Promise<void> {
@@ -113,6 +116,24 @@ export { PRICING, lookupPricing, estimateCostUsd, normalizeUsage } from "./model
 export type { ModelPricing, NormalizedUsage } from "./models/pricing.js";
 export { CostMeter } from "./models/meter.js";
 export type { UsageRecord, MeterTotals, ModelTotals } from "./models/meter.js";
+export {
+  DIALECT_PACKS,
+  DIALECT_PACK_CATALOG_VERSION,
+  FAMILY_CATALOG_VERSION,
+  MODEL_FAMILIES,
+  getDialectPack,
+  getModelFamily,
+  profilePolicy,
+  resolveDialectPackId,
+  resolveFamily,
+} from "./models/catalog.js";
+export type {
+  DialectPackMeta,
+  EditDialect,
+  HarnessProfile,
+  ModelFamily,
+  ProfilePolicy,
+} from "./models/catalog.js";
 export { HarnessService, registerHarnessMethods } from "./harness/methods.js";
 export { generateHarness } from "./harness/generate.js";
 export type { GenerateHarnessResult } from "./harness/generate.js";
@@ -130,6 +151,7 @@ export {
   validateHarness,
 } from "./harness/schema.js";
 export type { AgentDef, HarnessBundle, HarnessIssue, Manifest, Routing, WikiPage } from "./harness/schema.js";
+export { upgradeHarnessV1ToV2, upgradeRouting, needsUpgrade } from "./harness/upgrade.js";
 export {
   HarnessValidationError,
   harnessDir,
@@ -141,11 +163,19 @@ export { WorkerService, registerWorkerMethods } from "./worker/methods.js";
 export { WorktreeManager } from "./worker/worktree.js";
 export type { Worktree } from "./worker/worktree.js";
 export { createWorkerTools } from "./worker/tools.js";
-export type { ToolContext } from "./worker/tools.js";
+export type { ToolContext, ToolErrorKind, ToolEvent } from "./worker/tools.js";
+export { createWorkerRuntime } from "./worker/runtime.js";
+export type { WorkerRuntime } from "./worker/runtime.js";
 export { runWorkerLoop } from "./worker/loop.js";
 export type { WorkerRunInput, WorkerRunResult } from "./worker/loop.js";
-export { classifyTask, routeTask, DEFAULT_TASK_CLASS } from "./orchestrate/routing.js";
-export type { RoutedAgent } from "./orchestrate/routing.js";
+export {
+  classifyTask,
+  classifyDifficulty,
+  routeTask,
+  resolveNamedAgent,
+  DEFAULT_TASK_CLASS,
+} from "./orchestrate/routing.js";
+export type { RoutedAgent, WorkerResolution, TaskDifficulty } from "./orchestrate/routing.js";
 export { ReviewVerdictSchema, reviewDiff } from "./orchestrate/review.js";
 export type { ReviewVerdict, ReviewDiffInput, ReviewDiffOpts } from "./orchestrate/review.js";
 export { OrchestrateService, registerOrchestrateMethods } from "./orchestrate/methods.js";
@@ -156,5 +186,8 @@ export type { EvalTask, OracleResult, SynthEvalTaskOptions } from "./evals/tasks
 export { EvalsService, registerEvalsMethods } from "./evals/methods.js";
 export { runEvals } from "./evals/run.js";
 export type { EvalsRunParams, EvalsReportCard, PerTaskResult, HarnessTaskOutcome } from "./evals/run.js";
+export { appendRun, readRuns, recordRun, runsLedgerPath, RunRecordSchema } from "./runs/ledger.js";
+export type { RunRecord } from "./runs/ledger.js";
+export { RunsService, registerRunsMethods } from "./runs/methods.js";
 export { setEvalsVerdict } from "./harness/store.js";
 export { CancelRegistry, RunCancelledError, registerCancelMethod } from "./rpc/cancel-registry.js";

@@ -21,6 +21,7 @@ import type { Engine } from "../engine.js";
 import { RpcMethodError } from "../rpc/errors.js";
 import { registerMethod } from "../rpc/register.js";
 import { goldenTaskFromCommit, type EvalTask } from "./tasks.js";
+import { recordRun } from "../runs/ledger.js";
 import { runEvals, type EvalsReportCard } from "./run.js";
 
 const TaskDescriptorSchema = z.object({
@@ -49,6 +50,7 @@ export function registerEvalsMethods(engine: Engine): void {
   registerMethod(engine.dispatcher, "engine.evals.run", RunParamsSchema, async (params) => {
     const runId = params.runId;
     if (runId !== undefined) engine.cancelRegistry.register(runId);
+    const startedAt = Date.now();
     try {
       let tasks: EvalTask[];
       try {
@@ -70,6 +72,29 @@ export function registerEvalsMethods(engine: Engine): void {
         `evals.run ${params.projectDir}: verdict=${report.verdict} taskCount=${report.taskCount} ` +
           `savingsPct=${report.savingsPct ?? "null"}`,
       );
+      recordRun(engine, params.projectDir, {
+        v: 1,
+        kind: "evals",
+        at: new Date().toISOString(),
+        taskCount: report.taskCount,
+        verdict: report.verdict,
+        savingsPct: report.savingsPct,
+        cleanSavingsPct: report.cleanSavingsPct,
+        qualityHeld: report.qualityHeld,
+        qualityGapWithinNoise: report.qualityGapWithinNoise,
+        pricingConfidence: report.pricingConfidence,
+        measurementFailureCount: report.measurementFailureCount,
+        perTask: report.perTask.map((t) => ({
+          id: t.id,
+          baselinePassed: t.baselinePassed,
+          harnessPassed: t.harnessPassed,
+          harnessOutcome: t.harnessOutcome,
+          baselineOutcome: t.baselineOutcome,
+        })),
+        note: report.note,
+        durationMs: Date.now() - startedAt,
+        ...(runId !== undefined ? { runId } : {}),
+      });
       return report;
     } finally {
       if (runId !== undefined) engine.cancelRegistry.deregister(runId);
