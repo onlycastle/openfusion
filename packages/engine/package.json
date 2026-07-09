@@ -4,7 +4,8 @@
   "type": "module",
   "license": "Apache-2.0",
   "bin": {
-    "openfusion-engine": "./dist/main.js"
+    "openfusion-engine": "./dist/main.js",
+    "openfusion-bench": "./dist/evals/bench/cli.js"
   },
   "exports": {
     ".": {

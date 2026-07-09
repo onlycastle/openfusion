@@ -17,3 +17,6 @@ target/
 # never committed, see apps/desktop/scripts/stage-sidecar.mjs.
 apps/desktop/src-tauri/binaries/
 apps/desktop/src-tauri/gen/
+
+# Bench run outputs (summaries committed manually to seal milestones)
+benchmarks/results/
