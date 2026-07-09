@@ -34,6 +34,15 @@ const {
   setCardState,
   HarnessValidationError,
 } = await import("../src/harness/store.js");
+const { upgradeHarnessV1ToV2 } = await import("../src/harness/upgrade.js");
+
+/** Expected in-memory shape after loadHarness (always upgrades v1 → v2). */
+function expectedLoaded(bundle: HarnessBundle): HarnessBundle {
+  return upgradeHarnessV1ToV2({
+    ...bundle,
+    manifest: { ...bundle.manifest, artifacts: expectedArtifacts(bundle) },
+  });
+}
 
 let dir: string;
 afterEach(() => {
@@ -163,7 +172,7 @@ describe("writeHarness", () => {
     makeDir();
     const bundle = validBundle();
     // @ts-expect-error deliberately invalid for the test
-    bundle.manifest.schemaVersion = 2;
+    bundle.manifest.schemaVersion = 99;
     await expect(writeHarness(dir, bundle)).rejects.toThrow();
     expect(existsSync(path.join(dir, ".openfusion"))).toBe(false);
   });
@@ -270,10 +279,7 @@ describe("writeHarness manifest-last ordering", () => {
 
     const manifestRaw = readFileSync(path.join(dir, ".openfusion/manifest.json"), "utf8");
     expect(JSON.parse(manifestRaw).headSha).toBe("abc123");
-    expect(loadHarness(dir)).toEqual({
-      ...bundle,
-      manifest: { ...bundle.manifest, artifacts: expectedArtifacts(bundle) },
-    });
+    expect(loadHarness(dir)).toEqual(expectedLoaded(bundle));
   });
 
   it("never prunes prior-generation content when the manifest write itself fails", async () => {
@@ -421,10 +427,7 @@ describe("loadHarness", () => {
     const bundle = validBundle();
     await writeHarness(dir, bundle);
     const loaded = loadHarness(dir);
-    expect(loaded).toEqual({
-      ...bundle,
-      manifest: { ...bundle.manifest, artifacts: expectedArtifacts(bundle) },
-    });
+    expect(loaded).toEqual(expectedLoaded(bundle));
   });
 
   it("round-trips a digest at the 1200-char ceiling and a multi-line prompt/body", async () => {
@@ -434,10 +437,7 @@ describe("loadHarness", () => {
     bundle.pages[0]!.body = "line one\nline two\n\n- bullet\n- bullet 2\n";
     bundle.agents[0]!.prompt = "Line 1.\nLine 2.\n\nLine 4 after a blank line.";
     await writeHarness(dir, bundle);
-    expect(loadHarness(dir)).toEqual({
-      ...bundle,
-      manifest: { ...bundle.manifest, artifacts: expectedArtifacts(bundle) },
-    });
+    expect(loadHarness(dir)).toEqual(expectedLoaded(bundle));
   });
 
   it("throws HarnessValidationError when manifest.json is corrupt JSON", async () => {

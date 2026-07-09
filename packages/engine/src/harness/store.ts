@@ -16,6 +16,7 @@ import {
   type Routing,
   type WikiPage,
 } from "./schema.js";
+import { upgradeHarnessV1ToV2 } from "./upgrade.js";
 
 // Thrown by loadHarness/harnessStatus when on-disk content under
 // `.openfusion/` fails to parse (bad JSON/YAML, missing frontmatter fence,
@@ -379,7 +380,10 @@ export function loadHarness(projectDir: string): HarnessBundle | null {
 
   const routing = parseRoutingFile(routingPath(projectDir));
 
-  return { manifest, pages, agents, routing };
+  // Phase 1: normalize v1 / partially-v2 on-disk bundles to the v2 shape
+  // (family, dialectPack, routeIds, manifest version pins). Pure in-memory
+  // upgrade — does not rewrite disk until the next writeHarness/generate.
+  return upgradeHarnessV1ToV2({ manifest, pages, agents, routing });
 }
 
 function parseManifestFile(mPath: string): Manifest {

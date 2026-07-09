@@ -90,8 +90,13 @@ describe("ManifestSchema", () => {
     expect(ManifestSchema.safeParse(validManifest()).success).toBe(true);
   });
 
-  it("rejects schemaVersion other than 1", () => {
-    const result = ManifestSchema.safeParse({ ...validManifest(), schemaVersion: 2 });
+  it("accepts schemaVersion 1 and 2", () => {
+    expect(ManifestSchema.safeParse({ ...validManifest(), schemaVersion: 1 }).success).toBe(true);
+    expect(ManifestSchema.safeParse({ ...validManifest(), schemaVersion: 2 }).success).toBe(true);
+  });
+
+  it("rejects schemaVersion other than 1 or 2", () => {
+    const result = ManifestSchema.safeParse({ ...validManifest(), schemaVersion: 3 });
     expect(result.success).toBe(false);
   });
 
@@ -314,8 +319,20 @@ describe("RoutingSchema", () => {
     expect(RoutingSchema.safeParse(validRouting()).success).toBe(true);
   });
 
-  it("rejects version other than 1", () => {
-    expect(RoutingSchema.safeParse({ ...validRouting(), version: 2 }).success).toBe(false);
+  it("accepts version 1 and 2", () => {
+    expect(RoutingSchema.safeParse({ ...validRouting(), version: 1 }).success).toBe(true);
+    expect(
+      RoutingSchema.safeParse({
+        version: 2,
+        taskClasses: { codegen: { agent: "codegen-worker", routeId: "tc:codegen" } },
+        escalation: { failuresBeforeFrontier: 2 },
+        defaults: { agent: "codegen-worker", routeId: "tc:default" },
+      }).success,
+    ).toBe(true);
+  });
+
+  it("rejects version other than 1 or 2", () => {
+    expect(RoutingSchema.safeParse({ ...validRouting(), version: 3 }).success).toBe(false);
   });
 
   it("accepts failuresBeforeFrontier at the 1..3 bounds", () => {

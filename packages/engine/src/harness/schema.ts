@@ -1,4 +1,10 @@
 import { z } from "zod";
+import {
+  DIALECT_PACK_CATALOG_VERSION,
+  FAMILY_CATALOG_VERSION,
+  HarnessProfileSchema,
+  getDialectPack,
+} from "../models/catalog.js";
 
 // The four frontier-generated prose pages (M4 Task 4) — each gets one page
 // per slug, written straight from the frontier's page-generation stage. Kept
@@ -37,7 +43,9 @@ const kebabString = () =>
   z.string().regex(KEBAB_RE, "must be kebab-case (lowercase alphanumeric segments joined by hyphens)");
 
 export const ManifestSchema = z.object({
-  schemaVersion: z.literal(1),
+  // Phase 1 (model-family dialect packs): 1 = legacy pre-family bundles;
+  // 2 = generated/upgraded bundles that pin catalog + profile versions.
+  schemaVersion: z.union([z.literal(1), z.literal(2)]),
   generatorVersion: z.string().min(1),
   engine: z.string().min(1),
   headSha: z.string().min(1),
@@ -75,6 +83,13 @@ export const ManifestSchema = z.object({
   // this field existed) still parse, as an empty — i.e. "prune nothing,
   // I don't know what I wrote" — list.
   artifacts: z.array(z.string()).default([]),
+  // Phase 1 additive pins (optional on v1 manifests; required on new v2
+  // generates). Eval report cards echo these so a "pass" is comparable.
+  harnessProfile: HarnessProfileSchema.optional(),
+  familyCatalogVersion: z.string().min(1).optional(),
+  dialectPackVersion: z.string().min(1).optional(),
+  // "1" | "2" matching routing.version as a string pin for reports.
+  routePolicyVersion: z.string().min(1).optional(),
 });
 export type Manifest = z.infer<typeof ManifestSchema>;
 
@@ -93,22 +108,26 @@ export const WikiPageSchema = z.object({
 });
 export type WikiPage = z.infer<typeof WikiPageSchema>;
 
-export const AgentModelSchema = z.union([
-  z.object({
-    kind: z.string().min(1),
-    model: z.string().min(1),
-    // Which configured provider (models/providers.ts's ProviderRegistry id,
-    // NOT the provider "kind") should serve this agent's model — added in
-    // M5b Task 1 so the routing layer (Task 2) can resolve a specific
-    // registered provider instead of guessing one from `kind` alone.
-    // OPTIONAL for backward compatibility: an agent def written before this
-    // field existed (on disk, or a hand-edited harness) still parses; a
-    // missing providerId is resolved by the routing layer, not rejected
-    // here.
-    providerId: z.string().optional(),
-  }),
-  z.literal("frontier"),
-]);
+export const AgentModelObjectSchema = z.object({
+  kind: z.string().min(1),
+  model: z.string().min(1),
+  // Which configured provider (models/providers.ts's ProviderRegistry id,
+  // NOT the provider "kind") should serve this agent's model — added in
+  // M5b Task 1 so the routing layer (Task 2) can resolve a specific
+  // registered provider instead of guessing one from `kind` alone.
+  // OPTIONAL for backward compatibility: an agent def written before this
+  // field existed (on disk, or a hand-edited harness) still parses; a
+  // missing providerId is resolved by the routing layer, not rejected
+  // here.
+  providerId: z.string().optional(),
+  // Phase 1: model family + dialect pack pins (optional on disk for upgraded
+  // bundles; required after generate v2). Missing values are filled by
+  // upgradeHarnessV1ToV2 / resolveFamily at load time.
+  family: kebabString().optional(),
+  dialectPack: kebabString().optional(),
+});
+
+export const AgentModelSchema = z.union([AgentModelObjectSchema, z.literal("frontier")]);
 export type AgentModel = z.infer<typeof AgentModelSchema>;
 
 export const AgentDefSchema = z.object({
@@ -124,7 +143,13 @@ export const AgentDefSchema = z.object({
 });
 export type AgentDef = z.infer<typeof AgentDefSchema>;
 
-export const RoutingSchema = z.object({
+const RoutingTaskEntrySchema = z.object({
+  agent: z.string().min(1),
+  // Stable id for telemetry; defaulted by upgrader to `tc:<taskClass>`.
+  routeId: z.string().min(1).optional(),
+});
+
+export const RoutingV1Schema = z.object({
   version: z.literal(1),
   taskClasses: z.record(z.string().min(1), z.object({ agent: z.string().min(1) })),
   escalation: z.object({
@@ -132,7 +157,31 @@ export const RoutingSchema = z.object({
   }),
   defaults: z.object({ agent: z.string().min(1) }),
 });
+
+// Ordered fallback agents for a route key (taskClass or "taskClass:difficulty").
+export const RouteChainSchema = z.object({
+  agents: z.array(z.string().min(1)).min(1),
+});
+
+export const RoutingV2Schema = z.object({
+  version: z.literal(2),
+  taskClasses: z.record(z.string().min(1), RoutingTaskEntrySchema),
+  escalation: z.object({
+    failuresBeforeFrontier: z.number().int().min(1).max(3),
+  }),
+  defaults: z.object({
+    agent: z.string().min(1),
+    routeId: z.string().min(1).optional(),
+  }),
+  // Candidate chains: keys are taskClass or "taskClass:low|mid|high".
+  // When present, orchestrate walks agents[] on failure before frontier.
+  chains: z.record(z.string().min(1), RouteChainSchema).optional(),
+});
+
+export const RoutingSchema = z.union([RoutingV1Schema, RoutingV2Schema]);
 export type Routing = z.infer<typeof RoutingSchema>;
+export type RoutingV1 = z.infer<typeof RoutingV1Schema>;
+export type RoutingV2 = z.infer<typeof RoutingV2Schema>;
 
 export const HarnessBundleSchema = z.object({
   manifest: ManifestSchema,
@@ -169,6 +218,8 @@ export interface HarnessIssue {
 //   2. every agent's declared task classes must appear as routing keys, or
 //      that agent is unreachable by the router regardless of how good its
 //      prompt is.
+// Phase 1 also checks: any explicit agent.model.dialectPack must exist in
+// the bundled catalog (unknown packs are hard structural failures).
 // Returns an empty array when the bundle is fully consistent; callers (the
 // generation pipeline, and eventually the Harness editor) treat a non-empty
 // result as a hard structural failure — see manifest.verification.structural
@@ -203,7 +254,33 @@ export function validateHarness(bundle: HarnessBundle): HarnessIssue[] {
         });
       }
     });
+
+    if (agent.model !== "frontier" && agent.model.dialectPack !== undefined) {
+      if (getDialectPack(agent.model.dialectPack) === undefined) {
+        issues.push({
+          path: `agents[${agentIndex}].model.dialectPack`,
+          message: `unknown dialect pack "${agent.model.dialectPack}"`,
+        });
+      }
+    }
   });
+
+  // Chain agent references (routing v2 only).
+  if (bundle.routing.version === 2 && bundle.routing.chains !== undefined) {
+    for (const [key, chain] of Object.entries(bundle.routing.chains)) {
+      chain.agents.forEach((name, i) => {
+        if (!agentNames.has(name)) {
+          issues.push({
+            path: `routing.chains.${key}.agents[${i}]`,
+            message: `references unknown agent "${name}"`,
+          });
+        }
+      });
+    }
+  }
 
   return issues;
 }
+
+/** Catalog version constants re-exported for generate / eval report cards. */
+export { FAMILY_CATALOG_VERSION, DIALECT_PACK_CATALOG_VERSION };
