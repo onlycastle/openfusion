@@ -102,13 +102,13 @@ export function formatBenchReportMarkdown(report: BenchReport, input: BenchRepor
     "",
     "## Per-instance",
     "",
-    "| instance_id | baseline resolved | harness resolved | baseline USD | harness USD | measurement failure |",
-    "|---|---|---|---|---|---|",
+    "| instance_id | route | family | dialect | worker model | baseline resolved | harness resolved | baseline USD | harness USD | measurement failure |",
+    "|---|---|---|---|---|---|---|---|---|---|",
   ];
   for (const t of v.perTask) {
     const row = input.rows.find((r) => r.instance_id === t.id);
     lines.push(
-      `| ${t.id} | ${t.baselinePassed} | ${t.harnessPassed} | ${t.baselineUsd ?? "null"} | ${t.harnessUsd ?? "null"} | ${row?.measurementFailure ?? false} |`,
+      `| ${t.id} | ${t.routeId ?? "null"} | ${t.family ?? "null"} | ${t.dialectPack ?? "null"} | ${t.workerModel ?? "null"} | ${t.baselinePassed} | ${t.harnessPassed} | ${t.baselineUsd ?? "null"} | ${t.harnessUsd ?? "null"} | ${row?.measurementFailure ?? false} |`,
     );
   }
   lines.push("", "## Verdict note", "", v.note, "", "## Caveats", "");

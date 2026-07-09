@@ -9,7 +9,7 @@ import type { Engine } from "../../engine.js";
 import type { FrontierSession } from "../../engines/types.js";
 import type { PricingConfidence } from "../../models/meter.js";
 import { loadHarness, writeHarness } from "../../harness/store.js";
-import { orchestrate } from "../../orchestrate/orchestrate.js";
+import { orchestrate, type OrchestrateResult } from "../../orchestrate/orchestrate.js";
 import { RunCancelledError } from "../../rpc/cancel-registry.js";
 import { RpcMethodError } from "../../rpc/errors.js";
 import { RpcErrorCodes } from "@openfusion/shared";
@@ -26,6 +26,13 @@ import { clonePath, defaultBenchRoot, harnessBundlePath, runDir } from "./paths.
 
 const FRONTIER_KIND = "claude-code";
 const DEFAULT_BASELINE_TIMEOUT_MS = 600_000;
+const CONFIDENCE_RANK: Record<PricingConfidence, number> = {
+  unpriced: 0,
+  unverified: 1,
+  secondary: 2,
+  verified: 3,
+  "provider-reported": 3,
+};
 
 export interface BenchPrediction {
   instance_id: string;
@@ -39,6 +46,10 @@ export interface BenchInstanceRow {
   harnessOutcome: PerTaskResult["harnessOutcome"];
   baselineUsd: number | null;
   harnessUsd: number | null;
+  routeId: string | null;
+  family: string | null;
+  dialectPack: string | null;
+  workerModel: string | null;
   baselinePatch: string;
   harnessPatch: string;
   measurementFailure: boolean;
@@ -73,6 +84,20 @@ export interface BenchRunOptions {
 function addCost(total: number | null, next: number | null): number | null {
   if (next === null) return total;
   return (total ?? 0) + next;
+}
+
+function orchestrationProvenance(
+  result: OrchestrateResult | null,
+): Pick<BenchInstanceRow, "routeId" | "family" | "dialectPack" | "workerModel"> {
+  if (result === null) {
+    return { routeId: null, family: null, dialectPack: null, workerModel: null };
+  }
+  return {
+    routeId: result.routeId,
+    family: result.family ?? null,
+    dialectPack: result.dialectPack ?? null,
+    workerModel: result.resolution === "frontier" ? "frontier" : result.resolution.model,
+  };
 }
 
 async function drainFrontierTurn(
@@ -142,14 +167,16 @@ async function runHarnessArm(
 ): Promise<{
   costUsd: number | null;
   outcome: PerTaskResult["harnessOutcome"];
-}> {
+} & Pick<BenchInstanceRow, "routeId" | "family" | "dialectPack" | "workerModel">> {
+  let result: OrchestrateResult | null = null;
   try {
-    const result = await orchestrate(engine, {
+    result = await orchestrate(engine, {
       projectDir: harnessDir,
       task: problemStatement,
     });
+    const provenance = orchestrationProvenance(result);
     if (result.diff.trim().length === 0) {
-      return { costUsd: result.cost.totalUsd, outcome: result.outcome };
+      return { costUsd: result.cost.totalUsd, outcome: result.outcome, ...provenance };
     }
     try {
       const response = await engine.dispatcher.dispatch({
@@ -160,19 +187,19 @@ async function runHarnessArm(
       });
       if (response !== null && response.error !== undefined) {
         engine.log(`bench: apply failed: ${response.error.message}`);
-        return { costUsd: result.cost.totalUsd, outcome: "apply-failed" };
+        return { costUsd: result.cost.totalUsd, outcome: "apply-failed", ...provenance };
       }
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       engine.log(`bench: apply failed: ${message}`);
-      return { costUsd: result.cost.totalUsd, outcome: "apply-failed" };
+      return { costUsd: result.cost.totalUsd, outcome: "apply-failed", ...provenance };
     }
-    return { costUsd: result.cost.totalUsd, outcome: result.outcome };
+    return { costUsd: result.cost.totalUsd, outcome: result.outcome, ...provenance };
   } catch (err) {
     if (err instanceof RunCancelledError) throw err;
     const message = err instanceof Error ? err.message : String(err);
     engine.log(`bench: orchestrate failed: ${message}`);
-    return { costUsd: null, outcome: "error" };
+    return { costUsd: null, outcome: "error", ...orchestrationProvenance(result) };
   }
 }
 
@@ -200,6 +227,41 @@ function loadExistingRows(rowsPath: string): BenchInstanceRow[] {
   }
 }
 
+function worsePricingConfidence(a: PricingConfidence, b: PricingConfidence): PricingConfidence {
+  const aRank = CONFIDENCE_RANK[a];
+  const bRank = CONFIDENCE_RANK[b];
+  if (aRank < bRank) return a;
+  if (bRank < aRank) return b;
+  if (a === "verified" || b === "verified") return "verified";
+  return a;
+}
+
+function loadExistingMeta(metaPath: string): {
+  hasMeta: boolean;
+  unpricedCalls: number;
+  pricingConfidence: PricingConfidence;
+  escalations: number;
+} {
+  if (!existsSync(metaPath)) {
+    return { hasMeta: false, unpricedCalls: 0, pricingConfidence: "verified", escalations: 0 };
+  }
+  try {
+    const meta = JSON.parse(readFileSync(metaPath, "utf8")) as {
+      unpricedCalls?: number;
+      pricingConfidence?: PricingConfidence;
+      escalations?: number;
+    };
+    return {
+      hasMeta: true,
+      unpricedCalls: meta.unpricedCalls ?? 0,
+      pricingConfidence: meta.pricingConfidence ?? "verified",
+      escalations: meta.escalations ?? 0,
+    };
+  } catch {
+    return { hasMeta: false, unpricedCalls: 0, pricingConfidence: "verified", escalations: 0 };
+  }
+}
+
 /**
  * Run paired arms for selected instances. Resumes by skipping instance_ids
  * already present in rows.json with both arms recorded.
@@ -219,8 +281,10 @@ export async function runBench(engine: Engine, opts: BenchRunOptions = {}): Prom
   const predictionsBaselinePath = path.join(outDir, "predictions-baseline.json");
   const predictionsHarnessPath = path.join(outDir, "predictions-harness.json");
   const rowsPath = path.join(outDir, "rows.json");
+  const metaPath = path.join(outDir, "run-meta.json");
 
   const existing = loadExistingRows(rowsPath);
+  const existingMeta = loadExistingMeta(metaPath);
   const doneIds = new Set(existing.map((r) => r.instance_id));
   const rows: BenchInstanceRow[] = [...existing];
   const baselinePreds: BenchPrediction[] = existing.map((r) => ({
@@ -288,6 +352,10 @@ export async function runBench(engine: Engine, opts: BenchRunOptions = {}): Prom
         harnessOutcome: harness.outcome,
         baselineUsd: baseline.costUsd,
         harnessUsd: harness.costUsd,
+        routeId: harness.routeId,
+        family: harness.family,
+        dialectPack: harness.dialectPack,
+        workerModel: harness.workerModel,
         baselinePatch,
         harnessPatch,
         measurementFailure,
@@ -324,14 +392,21 @@ export async function runBench(engine: Engine, opts: BenchRunOptions = {}): Prom
   writeFileSync(rowsPath, `${JSON.stringify(rows, null, 2)}\n`);
 
   const meter = engine.models.meter.totals(meterStartIndex);
+  const cumulativeUnpricedCalls = existingMeta.unpricedCalls + meter.unpricedCalls;
+  const cumulativePricingConfidence = existingMeta.hasMeta
+    ? meter.calls === 0
+      ? existingMeta.pricingConfidence
+      : worsePricingConfidence(existingMeta.pricingConfidence, meter.pricingConfidence)
+    : meter.pricingConfidence;
+  const cumulativeEscalations = existingMeta.escalations + escalations;
   writeFileSync(
-    path.join(outDir, "run-meta.json"),
+    metaPath,
     `${JSON.stringify(
       {
         runId,
-        unpricedCalls: meter.unpricedCalls,
-        pricingConfidence: meter.pricingConfidence,
-        escalations,
+        unpricedCalls: cumulativeUnpricedCalls,
+        pricingConfidence: cumulativePricingConfidence,
+        escalations: cumulativeEscalations,
         datasetSnapshotHash: dataset.snapshotHash,
         instanceCount: rows.length,
       },
@@ -347,10 +422,10 @@ export async function runBench(engine: Engine, opts: BenchRunOptions = {}): Prom
     predictionsHarnessPath,
     rowsPath,
     rows,
-    unpricedCalls: meter.unpricedCalls,
-    pricingConfidence: meter.pricingConfidence,
+    unpricedCalls: cumulativeUnpricedCalls,
+    pricingConfidence: cumulativePricingConfidence,
     datasetSnapshotHash: dataset.snapshotHash,
-    escalations,
+    escalations: cumulativeEscalations,
     meterStartIndex,
   };
 }
@@ -370,6 +445,10 @@ export function rowsToPerTask(
       harnessOutcome: r.harnessOutcome,
       baselineUsd: r.baselineUsd,
       harnessUsd: r.harnessUsd,
+      routeId: r.routeId ?? null,
+      family: r.family ?? null,
+      dialectPack: r.dialectPack ?? null,
+      workerModel: r.workerModel ?? null,
     };
   });
 }

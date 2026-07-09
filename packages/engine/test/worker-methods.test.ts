@@ -291,6 +291,27 @@ describe("engine.worker.run", () => {
     expect(worktreeList).not.toContain("worker/");
   });
 
+  it("rejects an invalid dialectPack with SERVER_ERROR and creates no worktree", async () => {
+    dir = makeRepo();
+    engine = createEngine();
+    engine.models.registry.configure({ id: "p1", kind: "deepseek", apiKey: TEST_API_KEY });
+    engine.models.registry.setTestModel("p1", makeWorkerMock());
+
+    const res = await call(engine, "engine.worker.run", {
+      projectDir: dir,
+      task: "create hello.txt",
+      providerId: "p1",
+      model: "deepseek-v4-flash",
+      dialectPack: "does-not-exist",
+    });
+
+    expect(res.result).toBeUndefined();
+    expect(res.error.code).toBe(RpcErrorCodes.SERVER_ERROR);
+    expect(String(res.error.message)).toContain("unknown dialect pack");
+    const worktreeList = git(dir, "worktree", "list", "--porcelain");
+    expect(worktreeList).not.toContain("worker/");
+  });
+
   // Final-review Fix 2 (consistency): a RAW (non-RpcMethodError) throw from
   // getManager()/manager.create() — e.g. a git failure creating the
   // worktree itself — used to fall through uncaught to the dispatcher's

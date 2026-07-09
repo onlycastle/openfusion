@@ -668,12 +668,13 @@ export async function orchestrate(engine: Engine, params: OrchestrateParams): Pr
     const reviewTimeoutMs = params.reviewTimeoutMs ?? DEFAULT_REVIEW_TIMEOUT_MS;
     const escalateTimeoutMs = params.reviewTimeoutMs ?? DEFAULT_ESCALATE_TIMEOUT_MS;
 
-    if (routed.resolution !== "frontier") {
+    let chainIndex = 0;
+    let currentAgent = routed.agent;
+    let currentResolution: WorkerResolution | "frontier" = routed.resolution;
+
+    if (currentResolution !== "frontier") {
       // Walk agentChain: each failed attempt may advance to the next chain
       // agent (cheaper → stronger) before frontier escalation.
-      let chainIndex = 0;
-      let currentAgent = routed.agent;
-      let currentResolution: WorkerResolution | "frontier" = routed.resolution;
       // Final review Fix 3: set right after the FIRST attempt completes
       // (empty or reviewed), so attempt 2+'s buildWorkerTask call below can
       // append what went wrong — attempt 1 always sees `undefined` here (no
@@ -827,7 +828,7 @@ export async function orchestrate(engine: Engine, params: OrchestrateParams): Pr
     progress(engine, "escalate", "escalating to the frontier with write access", params.runId);
     let escalation: EscalationResult;
     try {
-      escalation = await runEscalation(engine, params, routed.agent, escalateTimeoutMs, cancelSignal);
+      escalation = await runEscalation(engine, params, currentAgent, escalateTimeoutMs, cancelSignal);
     } catch (err) {
       // Mirrors the worker-attempt catch's identical lift, above.
       const worktree = liftWorktreeFromError(err);
@@ -844,9 +845,9 @@ export async function orchestrate(engine: Engine, params: OrchestrateParams): Pr
       lastWorktree = null;
       return finish(
         "failed",
-        routed.agent.name,
+        currentAgent.name,
         routed.taskClass,
-        routed.resolution,
+        currentResolution,
         "",
         "",
         null,
@@ -857,9 +858,9 @@ export async function orchestrate(engine: Engine, params: OrchestrateParams): Pr
     attempts.push({ n, kind: "frontier", summary: escalation.text });
     return finish(
       "escalated",
-      routed.agent.name,
+      currentAgent.name,
       routed.taskClass,
-      routed.resolution,
+      currentResolution,
       escalation.diff,
       escalation.diffStat,
       escalation.worktree,

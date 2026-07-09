@@ -14,7 +14,7 @@ import type {
   FrontierSession,
 } from "../src/engines/types.js";
 import type { AgentDef, HarnessBundle, Routing, WikiPage } from "../src/harness/schema.js";
-import { CARD_SLUG } from "../src/harness/schema.js";
+import { CARD_SLUG, DIALECT_PACK_CATALOG_VERSION, FAMILY_CATALOG_VERSION } from "../src/harness/schema.js";
 import { writeHarness } from "../src/harness/store.js";
 import type { CostMeter } from "../src/models/meter.js";
 
@@ -782,6 +782,78 @@ describe("engine.orchestrate — escalation", () => {
     // escalation attempt were both cleaned up.
     const manager = await engine.worker.getManager(dir);
     expect(await manager.list()).toHaveLength(0);
+  });
+
+  it("uses the active frontier chain agent for escalation after an empty worker attempt", async () => {
+    dir = makeRepo();
+    const headSha = git(dir, "rev-parse", "HEAD");
+    const cheapAgent: AgentDef = {
+      name: "cheap-worker",
+      role: "worker",
+      description: "Cheap worker.",
+      prompt: "You are the cheap worker.",
+      taskClasses: ["codegen"],
+      model: {
+        kind: "deepseek",
+        model: "deepseek-v4-flash",
+        providerId: "p1",
+        family: "deepseek",
+        dialectPack: "string-edit-default",
+      },
+      escalation: { maxAttempts: 2 },
+    };
+    const frontierAgent: AgentDef = {
+      name: "frontier-chain",
+      role: "worker",
+      description: "Frontier chain specialist.",
+      prompt: "You are the frontier chain specialist.",
+      taskClasses: ["codegen"],
+      model: "frontier",
+      escalation: { maxAttempts: 1 },
+    };
+    const routing: Routing = {
+      version: 2,
+      taskClasses: { codegen: { agent: cheapAgent.name, routeId: "tc:codegen" } },
+      escalation: { failuresBeforeFrontier: 2 },
+      defaults: { agent: cheapAgent.name, routeId: "tc:default" },
+      chains: { codegen: { agents: [frontierAgent.name] } },
+    };
+    await writeHarness(dir, {
+      manifest: {
+        schemaVersion: 2,
+        generatorVersion: "0.0.1",
+        engine: "claude-code",
+        headSha,
+        generatedAt: new Date().toISOString(),
+        verification: { structural: "pass", evals: "pending" },
+        artifacts: [],
+        harnessProfile: "openfusion-native",
+        familyCatalogVersion: FAMILY_CATALOG_VERSION,
+        dialectPackVersion: DIALECT_PACK_CATALOG_VERSION,
+        routePolicyVersion: "2",
+      },
+      pages: [TRIVIAL_PAGE],
+      agents: [cheapAgent, frontierAgent],
+      routing,
+    });
+    engine = createEngine();
+    engine.models.registry.configure({ id: "p1", kind: "deepseek", apiKey: TEST_API_KEY });
+    engine.models.registry.setTestModel("p1", makeEmptyWorkerMock("No changes"));
+    const escalationPrompts: string[] = [];
+    engine.frontier.registerAdapter(makeFakeFrontierAdapter({ escalationPrompts }));
+
+    const res = await call(engine, "engine.orchestrate", {
+      projectDir: dir,
+      task: "add a feature",
+    });
+
+    expect(res.error).toBeUndefined();
+    expect(res.result.outcome).toBe("escalated");
+    expect(res.result.agent).toBe(frontierAgent.name);
+    expect(res.result.resolution).toBe("frontier");
+    expect(escalationPrompts).toHaveLength(1);
+    expect(escalationPrompts[0]).toContain(frontierAgent.prompt);
+    expect(escalationPrompts[0]).not.toContain(cheapAgent.prompt);
   });
 });
 

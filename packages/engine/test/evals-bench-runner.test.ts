@@ -176,6 +176,10 @@ describe("runBench", () => {
     expect(result.rows[0]!.harnessPatch).toContain("solution.txt");
     expect(result.rows[0]!.baselinePatch).not.toContain("SECRET_");
     expect(result.rows[0]!.harnessPatch).not.toContain(".openfusion");
+    expect(result.rows[0]!.routeId).toBe("tc:codegen");
+    expect(result.rows[0]!.family).toBeNull();
+    expect(result.rows[0]!.dialectPack).toBeNull();
+    expect(result.rows[0]!.workerModel).toBe("frontier");
     expect(result.unpricedCalls).toBe(0);
     expect(result.pricingConfidence).toBe("provider-reported");
 
@@ -183,5 +187,52 @@ describe("runBench", () => {
     const harnessPreds = JSON.parse(readFileSync(result.predictionsHarnessPath, "utf8")) as Record<string, unknown>;
     expect(Object.keys(baselinePreds)).toEqual(["owner__repo-1"]);
     expect(Object.keys(harnessPreds)).toEqual(["owner__repo-1"]);
+  });
+
+  it("preserves cumulative run metadata when resuming completed rows", async () => {
+    const benchRoot = mkdtempSync(path.join(os.tmpdir(), "of-bench-run-"));
+    dirs.push(benchRoot);
+    const repo = "owner/repo";
+    const { baseCommit } = makeFixtureClone(benchRoot, repo);
+    const datasetPath = writeDataset(benchRoot, repo, baseCommit);
+    await writeHarness(harnessBundlePath(benchRoot, repo), frontierOnlyHarness(baseCommit));
+
+    engine = createEngine();
+    engine.frontier.registerAdapter(makeFakeBenchFrontierAdapter(engine.models.meter));
+    const first = await runBench(engine, {
+      benchRoot,
+      datasetPath,
+      runId: "resume-run",
+      log: () => {},
+    });
+    writeFileSync(
+      path.join(first.runDir, "run-meta.json"),
+      `${JSON.stringify(
+        {
+          runId: "resume-run",
+          unpricedCalls: 2,
+          pricingConfidence: "unpriced",
+          escalations: 3,
+          datasetSnapshotHash: first.datasetSnapshotHash,
+          instanceCount: 1,
+        },
+        null,
+        2,
+      )}\n`,
+    );
+    await engine.close();
+    engine = createEngine();
+
+    const resumed = await runBench(engine, {
+      benchRoot,
+      datasetPath,
+      runId: "resume-run",
+      log: () => {},
+    });
+
+    expect(resumed.rows).toHaveLength(1);
+    expect(resumed.unpricedCalls).toBe(2);
+    expect(resumed.pricingConfidence).toBe("unpriced");
+    expect(resumed.escalations).toBe(3);
   });
 });

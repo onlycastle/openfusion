@@ -18,7 +18,7 @@ import {
   type BenchDataset,
   type BenchInstance,
 } from "./dataset.js";
-import { clonePath, defaultBenchRoot, harnessBundlePath } from "./paths.js";
+import { clonePath, defaultBenchRoot, harnessBundlePath, repoDirName } from "./paths.js";
 import { materializeBaseCommit } from "./archive.js";
 import { mkdtempSync, rmSync } from "node:fs";
 import os from "node:os";
@@ -99,6 +99,59 @@ function tryLatestFromRaw(datasetPath: string, repo: string): string | null {
   }
 }
 
+function hasHarnessManifest(dir: string): boolean {
+  return existsSync(path.join(dir, "manifest.json"));
+}
+
+function assertApproveSourceMatchesRepo(source: string, repo: string): void {
+  const metaPath = path.join(source, "prepare-meta.json");
+  if (!existsSync(metaPath)) return;
+  try {
+    const meta = JSON.parse(readFileSync(metaPath, "utf8")) as { repo?: string };
+    if (meta.repo !== undefined && meta.repo !== repo) {
+      throw new Error(
+        `--approve-from repo mismatch: ${source} was prepared for ${meta.repo}, not ${repo}`,
+      );
+    }
+  } catch (err) {
+    if (err instanceof Error && err.message.includes("repo mismatch")) throw err;
+    throw new Error(`invalid prepare metadata in ${metaPath}: ${err}`);
+  }
+}
+
+function resolveApproveFromPaths(rawPath: string, repos: string[]): Map<string, string> {
+  const root = path.resolve(rawPath);
+  if (hasHarnessManifest(root)) {
+    if (repos.length !== 1) {
+      throw new Error(
+        "--approve-from points to one harness, but this dataset spans multiple repos; " +
+          "pass a directory containing per-repo harnesses named owner__repo",
+      );
+    }
+    const repo = repos[0]!;
+    assertApproveSourceMatchesRepo(root, repo);
+    return new Map([[repo, root]]);
+  }
+
+  const resolved = new Map<string, string>();
+  for (const repo of repos) {
+    const dirName = repoDirName(repo);
+    const candidates = [
+      path.join(root, dirName),
+      path.join(root, "harness", dirName),
+    ];
+    const found = candidates.find(hasHarnessManifest);
+    if (found === undefined) {
+      throw new Error(
+        `--approve-from is missing an approved harness for ${repo}; expected ${candidates.join(" or ")}`,
+      );
+    }
+    assertApproveSourceMatchesRepo(found, repo);
+    resolved.set(repo, found);
+  }
+  return resolved;
+}
+
 /**
  * Idempotent prepare. Clones django + sphinx for mini. Optionally generates
  * and interactively approves harness cards once per repo.
@@ -113,6 +166,8 @@ export async function prepareBench(
   const dataset: BenchDataset = loadBenchDataset(datasetPath);
   const repos = distinctRepos(dataset.instances);
   const promptYes = opts.promptYes ?? defaultPromptYes;
+  const approveFromPaths =
+    opts.approveFrom !== undefined ? resolveApproveFromPaths(opts.approveFrom, repos) : undefined;
 
   mkdirSync(benchRoot, { recursive: true });
   const clones: Record<string, string> = {};
@@ -145,9 +200,10 @@ export async function prepareBench(
       }
     }
 
-    if (opts.approveFrom !== undefined) {
-      log(`copying approved harness from ${opts.approveFrom} -> ${hPath}`);
-      cpSync(opts.approveFrom, hPath, { recursive: true });
+    const approveFromPath = approveFromPaths?.get(repo);
+    if (approveFromPath !== undefined) {
+      log(`copying approved harness from ${approveFromPath} -> ${hPath}`);
+      cpSync(approveFromPath, hPath, { recursive: true });
       await setCardState(hPath, "approved");
       harness[repo] = { path: hPath, card: "approved" };
       continue;

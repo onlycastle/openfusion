@@ -45,6 +45,44 @@ describe("applyPatchToWorktree", () => {
     expect(readFileSync(path.join(root, "a.ts"), "utf8")).toBe("hello\nthere\n");
   });
 
+  it("applies multiple non-adjacent hunks in one file", () => {
+    const root = mkdtempSync(path.join(os.tmpdir(), "of-patch-"));
+    writeFileSync(path.join(root, "a.ts"), "one\nold-a\nmiddle\nold-b\ntwo\n", "utf8");
+    const result = applyPatchToWorktree(
+      root,
+      `*** Begin Patch
+*** Update File: a.ts
+@@
+ one
+-old-a
++new-a
+@@
+-old-b
++new-b
+ two
+*** End Patch`,
+    );
+    expect(result.ok).toBe(true);
+    expect(readFileSync(path.join(root, "a.ts"), "utf8")).toBe(
+      "one\nnew-a\nmiddle\nnew-b\ntwo\n",
+    );
+  });
+
+  it("rejects add-file patches for existing files", () => {
+    const root = mkdtempSync(path.join(os.tmpdir(), "of-patch-"));
+    writeFileSync(path.join(root, "a.ts"), "existing\n", "utf8");
+    const result = applyPatchToWorktree(
+      root,
+      `*** Begin Patch
+*** Add File: a.ts
++replacement
+*** End Patch`,
+    );
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.errorKind).toBe("invalid_args");
+    expect(readFileSync(path.join(root, "a.ts"), "utf8")).toBe("existing\n");
+  });
+
   it("rejects non-unique hunks", () => {
     const root = mkdtempSync(path.join(os.tmpdir(), "of-patch-"));
     writeFileSync(path.join(root, "a.ts"), "x\nx\n", "utf8");

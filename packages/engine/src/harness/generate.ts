@@ -27,6 +27,7 @@ import { ENGINE_VERSION } from "../version.js";
 import {
   DIALECT_PACK_CATALOG_VERSION,
   FAMILY_CATALOG_VERSION,
+  resolveDialectPackId,
   resolveFamily,
 } from "../models/catalog.js";
 import { PRICING } from "../models/pricing.js";
@@ -320,7 +321,12 @@ function pinAgentFamilies(
     if (agent.model === "frontier") return agent;
     const family = agent.model.family ?? resolveFamily(agent.model.kind, agent.model.model).id;
     const dialectPack =
-      agent.model.dialectPack ?? resolveFamily(agent.model.kind, agent.model.model).defaultDialectPack;
+      agent.model.dialectPack ??
+      resolveDialectPackId({
+        familyId: family,
+        providerKind: agent.model.kind,
+        modelId: agent.model.model,
+      });
     return {
       ...agent,
       model: { ...agent.model, family, dialectPack },
