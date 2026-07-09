@@ -39,7 +39,7 @@ import { RpcMethodError } from "../rpc/errors.js";
 import { requireGitRepo } from "../rpc/guards.js";
 import { wikiDbPath } from "../wiki/store.js";
 import { reviewDiff, type ReviewVerdict } from "./review.js";
-import { routeTask } from "./routing.js";
+import { resolveNamedAgent, routeTask, type WorkerResolution } from "./routing.js";
 
 // The only frontier engine kind orchestration drives today — mirrors
 // engines/methods.ts's own `params.engine ?? "claude-code"` default and
@@ -112,7 +112,16 @@ export interface OrchestrateResult {
   // task class it was routed as. Kept alongside `agent`/`resolution` since
   // all three come off the same routeTask() call.
   taskClass: string;
-  resolution: { providerId: string; model: string } | "frontier";
+  resolution: WorkerResolution | "frontier";
+  // Phase 1 telemetry pins — reconstructible eval configuration.
+  routeId: string;
+  family?: string;
+  dialectPack?: string;
+  // Which always-on wiki context was injected into worker prompts.
+  contextBranch: "approved-card" | "build-and-test-fallback" | "none";
+  toolCallCounts?: Record<string, number>;
+  toolErrorCounts?: Record<string, number>;
+  editFailCount?: number;
   attempts: OrchestrateAttempt[];
   diff: string;
   diffStat: string;
@@ -199,6 +208,12 @@ interface WorkerRunResponse {
   summary: string;
   costUsd: number | null;
   worktree: { path: string; branch: string };
+  dialectPack?: string;
+  dialectPackVersion?: string;
+  editDialect?: string;
+  toolCallCounts?: Record<string, number>;
+  toolErrorCounts?: Record<string, number>;
+  editFailCount?: number;
 }
 
 // Final review Fix 3 (Important): what the PRIOR worker attempt (if any)
@@ -552,6 +567,14 @@ export async function orchestrate(engine: Engine, params: OrchestrateParams): Pr
 
   const nextAttemptNumber = (): number => attempts.length + 1;
 
+  // Accumulated across worker attempts (last successful/approved attempt wins
+  // for display; failures still contribute error counters when present).
+  let lastToolCallCounts: Record<string, number> | undefined;
+  let lastToolErrorCounts: Record<string, number> | undefined;
+  let lastEditFailCount: number | undefined;
+  let lastDialectPack: string | undefined;
+  let contextBranch: OrchestrateResult["contextBranch"] = "none";
+
   function finish(
     outcome: OrchestrateResult["outcome"],
     agentName: string,
@@ -560,13 +583,24 @@ export async function orchestrate(engine: Engine, params: OrchestrateParams): Pr
     diff: string,
     diffStat: string,
     worktree: { path: string; branch: string } | null,
+    routeId: string,
   ): OrchestrateResult {
     progress(engine, "done", `outcome: ${outcome}`, params.runId);
+    const family = resolution === "frontier" ? undefined : resolution.family;
+    const dialectPack =
+      resolution === "frontier" ? lastDialectPack : (lastDialectPack ?? resolution.dialectPack);
     return {
       outcome,
       agent: agentName,
       taskClass,
       resolution,
+      routeId,
+      family,
+      dialectPack,
+      contextBranch,
+      toolCallCounts: lastToolCallCounts,
+      toolErrorCounts: lastToolErrorCounts,
+      editFailCount: lastEditFailCount,
       attempts,
       diff,
       diffStat,
@@ -621,6 +655,7 @@ export async function orchestrate(engine: Engine, params: OrchestrateParams): Pr
     // engine.log or a notification, same posture as `params.task` and every
     // worker/frontier summary this pipeline handles.
     const workerContext = buildWorkerContext(harness);
+    contextBranch = workerContext.branch;
     progress(engine, "load", `worker context: ${workerContext.branch}`, params.runId);
 
     const maxWorkerAttempts =
@@ -634,7 +669,11 @@ export async function orchestrate(engine: Engine, params: OrchestrateParams): Pr
     const escalateTimeoutMs = params.reviewTimeoutMs ?? DEFAULT_ESCALATE_TIMEOUT_MS;
 
     if (routed.resolution !== "frontier") {
-      const { providerId, model } = routed.resolution;
+      // Walk agentChain: each failed attempt may advance to the next chain
+      // agent (cheaper → stronger) before frontier escalation.
+      let chainIndex = 0;
+      let currentAgent = routed.agent;
+      let currentResolution: WorkerResolution | "frontier" = routed.resolution;
       // Final review Fix 3: set right after the FIRST attempt completes
       // (empty or reviewed), so attempt 2+'s buildWorkerTask call below can
       // append what went wrong — attempt 1 always sees `undefined` here (no
@@ -643,17 +682,27 @@ export async function orchestrate(engine: Engine, params: OrchestrateParams): Pr
       let priorAttempt: PriorAttempt | undefined;
 
       for (let i = 0; i < maxWorkerAttempts; i++) {
+        if (currentResolution === "frontier") break;
+        // Narrowed: currentResolution is WorkerResolution past the check above.
+        const workerRes = currentResolution as WorkerResolution;
+        const { providerId, model, dialectPack } = workerRes;
         const n = nextAttemptNumber();
-        progress(engine, `worker:${n}`, `running worker attempt ${n}/${maxWorkerAttempts}`, params.runId);
+        progress(
+          engine,
+          `worker:${n}`,
+          `running worker attempt ${n}/${maxWorkerAttempts} agent=${currentAgent.name}`,
+          params.runId,
+        );
 
         let workerResult: WorkerRunResponse;
         try {
           workerResult = await callEngineMethod<WorkerRunResponse>(engine, "engine.worker.run", {
             projectDir: params.projectDir,
-            task: buildWorkerTask(routed.agent, params.task, priorAttempt),
+            task: buildWorkerTask(currentAgent, params.task, priorAttempt),
             wikiDigest: workerContext.text,
             providerId,
             model,
+            dialectPack,
             // Fix 1: unlike reviewTimeoutMs/escalateTimeoutMs above, this is
             // deliberately left as `params.workerTimeoutMs` verbatim
             // (possibly undefined) rather than defaulted here —
@@ -688,12 +737,23 @@ export async function orchestrate(engine: Engine, params: OrchestrateParams): Pr
         // Tentatively tracked as soon as it's known to exist — see the
         // `lastWorktree` doc comment above.
         lastWorktree = workerResult.worktree;
+        lastToolCallCounts = workerResult.toolCallCounts;
+        lastToolErrorCounts = workerResult.toolErrorCounts;
+        lastEditFailCount = workerResult.editFailCount;
+        lastDialectPack = workerResult.dialectPack ?? dialectPack;
 
         if (workerResult.diff.trim().length === 0) {
           attempts.push({ n, kind: "worker", summary: workerResult.summary, empty: true });
           await cleanupWorktree(engine, params.projectDir, workerResult.worktree.path);
           lastWorktree = null;
           priorAttempt = { empty: true };
+          // Advance chain on empty diff when a next agent exists.
+          if (chainIndex + 1 < routed.agentChain.length) {
+            chainIndex += 1;
+            const next = resolveNamedAgent(routed.agentChain[chainIndex]!, harness, engine.models.registry);
+            currentAgent = next.agent;
+            currentResolution = next.resolution;
+          }
           continue;
         }
 
@@ -739,18 +799,26 @@ export async function orchestrate(engine: Engine, params: OrchestrateParams): Pr
         if (verdict.decision === "approve") {
           return finish(
             "worker-approved",
-            routed.agent.name,
+            currentAgent.name,
             routed.taskClass,
-            routed.resolution,
+            currentResolution,
             workerResult.diff,
             workerResult.diffStat,
             workerResult.worktree,
+            routed.routeId,
           );
         }
 
         await cleanupWorktree(engine, params.projectDir, workerResult.worktree.path);
         lastWorktree = null;
         priorAttempt = { verdict };
+        // Advance chain on rejection when a next agent exists.
+        if (chainIndex + 1 < routed.agentChain.length) {
+          chainIndex += 1;
+          const next = resolveNamedAgent(routed.agentChain[chainIndex]!, harness, engine.models.registry);
+          currentAgent = next.agent;
+          currentResolution = next.resolution;
+        }
       }
     }
 
@@ -774,7 +842,16 @@ export async function orchestrate(engine: Engine, params: OrchestrateParams): Pr
       attempts.push({ n, kind: "frontier", summary: escalation.text, empty: true });
       await cleanupWorktree(engine, params.projectDir, escalation.worktree.path);
       lastWorktree = null;
-      return finish("failed", routed.agent.name, routed.taskClass, routed.resolution, "", "", null);
+      return finish(
+        "failed",
+        routed.agent.name,
+        routed.taskClass,
+        routed.resolution,
+        "",
+        "",
+        null,
+        routed.routeId,
+      );
     }
 
     attempts.push({ n, kind: "frontier", summary: escalation.text });
@@ -786,6 +863,7 @@ export async function orchestrate(engine: Engine, params: OrchestrateParams): Pr
       escalation.diff,
       escalation.diffStat,
       escalation.worktree,
+      routed.routeId,
     );
   } catch (err) {
     // M7b Task 2: determined by checking the resolved cancelSignal's OWN

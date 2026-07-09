@@ -449,7 +449,15 @@ describe("engine.orchestrate — happy path", () => {
 
     expect(result.outcome).toBe("worker-approved");
     expect(result.agent).toBe("codegen-worker");
-    expect(result.resolution).toEqual({ providerId: "p1", model: "deepseek-v4-flash" });
+    expect(result.resolution).toEqual({
+      providerId: "p1",
+      model: "deepseek-v4-flash",
+      family: "deepseek",
+      dialectPack: "string-edit-default",
+    });
+    expect(result.routeId).toBe("tc:codegen");
+    expect(result.dialectPack).toBe("string-edit-default");
+    expect(result.family).toBe("deepseek");
     expect(result.attempts).toHaveLength(1);
     expect(result.attempts[0]).toMatchObject({ n: 1, kind: "worker", summary: "Created hello.txt" });
     expect(result.attempts[0].verdict.decision).toBe("approve");
