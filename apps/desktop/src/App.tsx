@@ -17,6 +17,20 @@ function MainPane({ onOpenSettings }: { onOpenSettings: () => void }) {
   return <OrchestrateScreen onOpenSettings={onOpenSettings} />;
 }
 
+function WorkspaceShell({ onOpenSettings }: { onOpenSettings: () => void }) {
+  const { activeProjectDir } = useProject();
+
+  return (
+    <div className={activeProjectDir === null ? "shell shell-three-pane shell-no-project" : "shell shell-three-pane"}>
+      <AppRail onOpenSettings={onOpenSettings} />
+      {activeProjectDir !== null && <ProjectRail />}
+      <main className="content">
+        <MainPane onOpenSettings={onOpenSettings} />
+      </main>
+    </div>
+  );
+}
+
 export function App() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [lastNotification, setLastNotification] = useState<EngineNotification | null>(null);
@@ -37,13 +51,7 @@ export function App() {
   return (
     <ErrorBoundary>
       <ProjectProvider>
-        <div className="shell shell-three-pane">
-          <AppRail onOpenSettings={() => setSettingsOpen(true)} />
-          <ProjectRail />
-          <main className="content">
-            <MainPane onOpenSettings={() => setSettingsOpen(true)} />
-          </main>
-        </div>
+        <WorkspaceShell onOpenSettings={() => setSettingsOpen(true)} />
         <footer className="status-bar">
           <span>Engine events received: {notificationCount}</span>
           {lastNotification && <span className="status-bar-detail">last: {lastNotification.method}</span>}

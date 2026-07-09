@@ -1,3 +1,4 @@
+import { open } from "@tauri-apps/plugin-dialog";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useProject } from "../ProjectContext";
 import {
@@ -204,7 +205,7 @@ interface OrchestrateScreenProps {
 }
 
 export function OrchestrateScreen({ onOpenSettings }: OrchestrateScreenProps = {}) {
-  const { activeProjectDir } = useProject();
+  const { activeProjectDir, addProjectByPath } = useProject();
   const projectDir = activeProjectDir;
   const [runProjectDir, setRunProjectDir] = useState<string | null>(null);
   const [task, setTask] = useState("");
@@ -365,6 +366,14 @@ export function OrchestrateScreen({ onOpenSettings }: OrchestrateScreenProps = {
     setChatOpen(true);
   }, [harnessReady, setupReady]);
 
+  const handleAddProject = useCallback((): void => {
+    open({ directory: true })
+      .then((selected) => {
+        if (typeof selected === "string") return addProjectByPath(selected);
+      })
+      .catch(() => {});
+  }, [addProjectByPath]);
+
   const handleRun = useCallback(() => {
     if (!projectDir || !task.trim() || !chatOpen || !harnessReady || !setupReady || isBusy) return;
 
@@ -494,25 +503,25 @@ export function OrchestrateScreen({ onOpenSettings }: OrchestrateScreenProps = {
     <div className="harness-setup">
       <div className="harness-setup-inner">
         <p className="harness-kicker">Building harness</p>
-        <h2>Select your project. OpenFusion will build the harness for you.</h2>
+        <h2>{projectName ? `Build the ${projectName} harness.` : "Add a project to begin."}</h2>
 
-        {setupState.status === "checking" && (
+        {projectDir && setupState.status === "checking" && (
           <p role="status" className="harness-setup-status">
             Checking settings…
           </p>
         )}
-        {setupState.status === "error" && (
+        {projectDir && setupState.status === "error" && (
           <p role="alert" className="error-text harness-setup-status">
             {setupState.message}
           </p>
         )}
-        {setupState.status === "ready" && setupWarningList.length === 0 && (
+        {projectDir && setupState.status === "ready" && setupWarningList.length === 0 && (
           <p className="harness-setup-status">
             Claude Code connected · {setupState.modelProviderCount} model provider
             {setupState.modelProviderCount === 1 ? "" : "s"} ready
           </p>
         )}
-        {setupWarningList.length > 0 && (
+        {projectDir && setupWarningList.length > 0 && (
           <div role="alert" className="setup-warning">
             <strong>Finish setup before building.</strong>
             <ul>
@@ -533,7 +542,7 @@ export function OrchestrateScreen({ onOpenSettings }: OrchestrateScreenProps = {
           </div>
         )}
 
-        <div className="harness-panel">
+        <div className={projectDir ? "harness-panel" : "harness-panel harness-panel-empty"}>
           <div className="harness-project-static">
             <FolderGlyph />
             <span>{projectName ?? "No project selected"}</span>
@@ -541,14 +550,18 @@ export function OrchestrateScreen({ onOpenSettings }: OrchestrateScreenProps = {
 
           {projectDir && <code className="harness-project-path">{projectDir}</code>}
 
-          <div className={`harness-state harness-state-${harnessState.status}`}>
-            <span>{harnessStatusText(harnessState)}</span>
-            {wikiState.status === "ready" && (
-              <span className="harness-state-detail">
-                {wikiState.wiki.files} files · {wikiState.wiki.symbols} symbols
-              </span>
-            )}
-          </div>
+          {!projectDir && <p className="harness-empty-copy">Select a project to check its harness.</p>}
+
+          {projectDir && (
+            <div className={`harness-state harness-state-${harnessState.status}`}>
+              <span>{harnessStatusText(harnessState)}</span>
+              {wikiState.status === "ready" && (
+                <span className="harness-state-detail">
+                  {wikiState.wiki.files} files · {wikiState.wiki.symbols}
+                </span>
+              )}
+            </div>
+          )}
 
           {harnessState.status === "ready" && harnessState.harness.card === "draft" && (
             <p className="muted-text">Project Card drafted — review it in Harness setting.</p>
@@ -578,7 +591,11 @@ export function OrchestrateScreen({ onOpenSettings }: OrchestrateScreenProps = {
           )}
 
           <div className="harness-actions">
-            {harnessReady ? (
+            {!projectDir ? (
+              <button type="button" className="primary-action" onClick={handleAddProject}>
+                Add project
+              </button>
+            ) : harnessReady ? (
               <button type="button" className="primary-action" onClick={handleOpenChat} disabled={!canOpenChat}>
                 Open task chat
               </button>

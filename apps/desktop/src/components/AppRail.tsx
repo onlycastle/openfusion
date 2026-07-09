@@ -42,7 +42,11 @@ export function AppRail({ onOpenSettings }: { onOpenSettings: () => void }) {
           </li>
         ))}
       </ul>
-      <button type="button" className="project-add" onClick={onAdd}>+ Add</button>
+      {projects.length === 0 && <p className="project-list-empty">No projects yet</p>}
+      <button type="button" className="project-add" onClick={onAdd}>
+        <span aria-hidden="true">+</span>
+        <span>Add project</span>
+      </button>
       <div className="app-rail-foot">
         <button type="button" className="nav-link" onClick={onOpenSettings}>Settings</button>
       </div>

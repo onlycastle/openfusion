@@ -10,7 +10,12 @@ afterEach(cleanup);
 // it, Task 6/8) rather than an in-screen folder dialog — mocked so tests
 // can drive `activeProjectDir` directly, same pattern as
 // HarnessSettingPanel.test.tsx.
-const { useProjectMock } = vi.hoisted(() => ({ useProjectMock: vi.fn() }));
+const { addProjectByPathMock, openMock, useProjectMock } = vi.hoisted(() => ({
+  addProjectByPathMock: vi.fn(),
+  openMock: vi.fn(),
+  useProjectMock: vi.fn(),
+}));
+vi.mock("@tauri-apps/plugin-dialog", () => ({ open: openMock }));
 vi.mock("../ProjectContext", () => ({ useProject: () => useProjectMock() }));
 
 // `engineClient` (the singleton) is what OrchestrateScreen calls through
@@ -132,8 +137,10 @@ function makeControllableRun() {
 }
 
 beforeEach(() => {
+  addProjectByPathMock.mockReset();
+  openMock.mockReset();
   useProjectMock.mockReset();
-  useProjectMock.mockReturnValue({ activeProjectDir: "/r/alpha" });
+  useProjectMock.mockReturnValue({ activeProjectDir: "/r/alpha", addProjectByPath: addProjectByPathMock });
   runOrchestrateMock.mockReset();
   callMock.mockReset();
   modelsListMock.mockReset();
@@ -185,14 +192,25 @@ describe("OrchestrateScreen", () => {
   });
 
   it("renders 'No project selected' when there is no active project in context", async () => {
-    useProjectMock.mockReturnValue({ activeProjectDir: null });
+    useProjectMock.mockReturnValue({ activeProjectDir: null, addProjectByPath: addProjectByPathMock });
     render(<OrchestrateScreen />);
 
     expect(screen.getByText(/no project selected/i)).toBeTruthy();
     expect(screen.getByText(/select a project to check its harness/i)).toBeTruthy();
+    expect(screen.queryByRole("alert")).toBeNull();
     // No harness/wiki check should have fired without an active project.
     expect(wikiStatusMock).not.toHaveBeenCalled();
     expect(harnessStatusMock).not.toHaveBeenCalled();
+  });
+
+  it("adds a project from the empty Studio state", async () => {
+    useProjectMock.mockReturnValue({ activeProjectDir: null, addProjectByPath: addProjectByPathMock });
+    openMock.mockResolvedValueOnce("/r/gamma");
+    render(<OrchestrateScreen />);
+
+    fireEvent.click(screen.getByRole("button", { name: /add project/i }));
+
+    await waitFor(() => expect(addProjectByPathMock).toHaveBeenCalledWith("/r/gamma"));
   });
 
   it("checks the active project's harness on mount, streams build progress, then opens the task chat", async () => {
@@ -402,7 +420,7 @@ describe("OrchestrateScreen", () => {
   });
 
   it("changing the active project (Rail 1) after a result returns to setup and removes the old Apply action", async () => {
-    useProjectMock.mockReturnValue({ activeProjectDir: "/proj/A" });
+    useProjectMock.mockReturnValue({ activeProjectDir: "/proj/A", addProjectByPath: addProjectByPathMock });
     const { rerender } = render(<OrchestrateScreen />);
     await waitFor(() => expect(screen.getByRole("button", { name: /open task chat/i })).toBeTruthy());
     fireEvent.click(screen.getByRole("button", { name: /open task chat/i }));
@@ -418,7 +436,7 @@ describe("OrchestrateScreen", () => {
 
     // The active project changes — as Rail 1 (ProjectContext) would drive it,
     // not an in-screen picker.
-    useProjectMock.mockReturnValue({ activeProjectDir: "/proj/B" });
+    useProjectMock.mockReturnValue({ activeProjectDir: "/proj/B", addProjectByPath: addProjectByPathMock });
     rerender(<OrchestrateScreen />);
 
     await waitFor(() => {

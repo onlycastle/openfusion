@@ -41,11 +41,27 @@ async function freshApp() {
 }
 
 describe("App shell", () => {
-  it("renders both rails", async () => {
+  it("renders the project section rail after a project is selected", async () => {
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === "engine_call") return Promise.resolve({ providers: [] });
+      if (cmd === "list_projects") return Promise.resolve([{ path: "/r/alpha", name: "alpha" }]);
+      if (cmd === "list_provider_configs") return Promise.resolve([]);
+      if (cmd === "frontier_login_status") return Promise.resolve({ state: "disconnected" });
+      return Promise.resolve(undefined);
+    });
     const App = await freshApp();
     render(<App />);
     await waitFor(() => expect(screen.getByRole("navigation", { name: /projects/i })).toBeTruthy());
-    expect(screen.getByRole("navigation", { name: /project sections/i })).toBeTruthy();
+    await waitFor(() => expect(screen.getByRole("navigation", { name: /project sections/i })).toBeTruthy());
+    expect(screen.getAllByText("alpha").length).toBeGreaterThan(0);
+  });
+
+  it("does not render the empty project section rail before a project exists", async () => {
+    const App = await freshApp();
+    render(<App />);
+    await waitFor(() => expect(screen.getByRole("navigation", { name: /projects/i })).toBeTruthy());
+    expect(screen.queryByRole("navigation", { name: /project sections/i })).toBeNull();
+    expect(screen.getAllByRole("button", { name: /add project/i }).length).toBeGreaterThan(0);
   });
 
   it("subscribes to engine events exactly once", async () => {
