@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Copies Task 1's compiled engine sidecar binary (+ its `.assets` sibling
+// Copies the compiled engine sidecar binary (+ its `.assets` sibling
 // directory) from packages/engine/dist-sidecar/ into
 // apps/desktop/src-tauri/binaries/, where Tauri's `bundle.externalBin`
 // convention (tauri.conf.json: `"externalBin": ["binaries/openfusion-engine"]`)
@@ -27,8 +27,7 @@
 // NOTE on the `.assets` dir specifically: the engine binary self-locates its
 // runtime assets (better-sqlite3's native addon, tree-sitter wasm files,
 // tags.scm queries) via `${process.execPath}.assets` (see
-// packages/engine/src/util/sidecar-runtime.ts and
-// .superpowers/sdd/m7a-task-1-report.md). In `tauri dev`, Tauri spawns the
+// packages/engine/src/util/sidecar-runtime.ts). In `tauri dev`, Tauri spawns the
 // sidecar directly from src-tauri/binaries/<name>-<triple>, so
 // process.execPath matches the triple-suffixed filename we stage here and
 // self-location works unmodified. Once M8 does real `.app` bundling, Tauri

@@ -43,7 +43,7 @@ case "$cmd" in
     pnpm --filter @openfusion/desktop test:rust
     bold "✓ all headless suites passed" ;;
 
-  check)   # CI-equivalent: build + typecheck + full test
+  check)   # local full check: build + typecheck + TS + Rust tests
     bold "build…";     pnpm build
     bold "typecheck…"; pnpm typecheck
     "$0" test ;;
@@ -113,7 +113,7 @@ OpenFusion dev.sh — testing & local run
 
   Tier 1 (no setup):
     ./dev.sh test        headless suites: TS (712) + Rust (59)
-    ./dev.sh check       build + typecheck + test  (CI-equivalent)
+    ./dev.sh check       build + typecheck + TS + Rust tests
 
   Tier 2 (toolchain only, no keys):
     ./dev.sh sidecar     compile the engine binary, stage it, ping it

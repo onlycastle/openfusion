@@ -2,9 +2,7 @@
 // Compiles @openfusion/engine into a self-contained sidecar binary that
 // speaks the engine's JSON-RPC-over-stdio protocol — the artifact Tauri's
 // `bundle.externalBin` spawns as a subprocess (M8's desktop shell). See
-// docs/research/2026-07-04-m7-tauri-verification.md for the wider context
-// and .superpowers/sdd/m7a-task-1-report.md for the full writeup of every
-// dead end this script's shape represents the SURVIVOR of.
+// docs/research/2026-07-04-m7-tauri-verification.md for the wider context.
 //
 // Pipeline: tsc build → esbuild single-file bundle (works around @yao-pkg/
 // pkg's poor resolution of pnpm-workspace `exports`-only package.json fields

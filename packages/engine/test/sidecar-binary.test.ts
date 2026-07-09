@@ -27,8 +27,7 @@ import { afterEach, describe, expect, it } from "vitest";
 // long enough, and needs enough network access on a cold cache, that running
 // it automatically from every `pnpm test` would make the suite flaky/slow
 // for no benefit — run `pnpm --filter @openfusion/engine build:sidecar`
-// first, then this test runs for real instead of skipping. See
-// .superpowers/sdd/m7a-task-1-report.md for the full build-tool writeup.
+// first, then this test runs for real instead of skipping.
 const engineRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
 // Mirrors build-sidecar.mjs's targetTriple() (Rust/Tauri naming). Kept as an
