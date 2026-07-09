@@ -199,7 +199,13 @@ describe("routeTask", () => {
 
     expect(routed.taskClass).toBe("docs");
     expect(routed.agent.name).toBe("docs-worker");
-    expect(routed.resolution).toEqual({ providerId: "docs-provider", model: "glm-docs" });
+    expect(routed.routeId).toBe("tc:docs");
+    expect(routed.resolution).toEqual({
+      providerId: "docs-provider",
+      model: "glm-docs",
+      family: "glm",
+      dialectPack: "string-edit-default",
+    });
   });
 
   it("throws SERVER_ERROR when the agent's explicit providerId is not configured", () => {
@@ -228,7 +234,13 @@ describe("routeTask", () => {
 
     expect(routed.taskClass).toBe("tests");
     expect(routed.agent.name).toBe("tests-worker");
-    expect(routed.resolution).toEqual({ providerId: "ds-1", model: "deepseek-tests" });
+    expect(routed.routeId).toBe("tc:tests");
+    expect(routed.resolution).toEqual({
+      providerId: "ds-1",
+      model: "deepseek-tests",
+      family: "deepseek",
+      dialectPack: "string-edit-default",
+    });
   });
 
   it("throws SERVER_ERROR when zero providers of the required kind are configured", () => {
@@ -299,7 +311,13 @@ describe("routeTask", () => {
 
     expect(routed.taskClass).toBe("__default__");
     expect(routed.agent.name).toBe("fallback-worker");
-    expect(routed.resolution).toEqual({ providerId: "ds-1", model: "deepseek-chat" });
+    expect(routed.routeId).toBe("tc:default");
+    expect(routed.resolution).toEqual({
+      providerId: "ds-1",
+      model: "deepseek-chat",
+      family: "deepseek",
+      dialectPack: "string-edit-default",
+    });
   });
 
   it("resolves a frontier agent to the 'frontier' sentinel without touching the registry", () => {

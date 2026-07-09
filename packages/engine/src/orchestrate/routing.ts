@@ -5,6 +5,11 @@
 // only decides WHICH provider/model a run should use.
 import { RpcErrorCodes } from "@openfusion/shared";
 import type { AgentDef, HarnessBundle, Routing } from "../harness/schema.js";
+import { upgradeRouting } from "../harness/upgrade.js";
+import {
+  resolveDialectPackId,
+  resolveFamily,
+} from "../models/catalog.js";
 import type { ProviderRegistry } from "../models/providers.js";
 import { RpcMethodError } from "../rpc/errors.js";
 
@@ -14,6 +19,15 @@ import { RpcMethodError } from "../rpc/errors.js";
 // found": fall back to routing.defaults.agent.
 export const DEFAULT_TASK_CLASS = "__default__";
 
+export interface WorkerResolution {
+  providerId: string;
+  model: string;
+  family: string;
+  dialectPack: string;
+}
+
+export type TaskDifficulty = "low" | "mid" | "high";
+
 export interface RoutedAgent {
   agent: AgentDef;
   // The raw classifyTask() result, INCLUDING the DEFAULT_TASK_CLASS
@@ -22,7 +36,88 @@ export interface RoutedAgent {
   // specific class" apart from "this task fell through to defaults" for
   // logging/observability.
   taskClass: string;
-  resolution: { providerId: string; model: string } | "frontier";
+  // Stable route id from routing v2 (or upgraded v1) for telemetry.
+  routeId: string;
+  difficulty: TaskDifficulty;
+  // Ordered agent names to try (includes the primary agent first). When a
+  // chain is configured, subsequent names are cheaper/stronger fallbacks
+  // before frontier escalation.
+  agentChain: string[];
+  resolution: WorkerResolution | "frontier";
+}
+
+/** Keyword difficulty heuristic — free, no model call. */
+export function classifyDifficulty(task: string): TaskDifficulty {
+  const lower = task.toLowerCase();
+  const tokens = lower.split(/[^a-z0-9]+/).filter((t) => t.length > 0);
+  const has = (...kws: string[]) => kws.some((kw) => tokens.includes(kw));
+  if (has("trivial", "typo", "rename", "docs", "readme", "comment", "format", "lint")) {
+    return "low";
+  }
+  if (
+    has(
+      "architecture",
+      "migrate",
+      "migration",
+      "security",
+      "auth",
+      "concurrency",
+      "race",
+      "refactor",
+      "redesign",
+      "hard",
+      "complex",
+    )
+  ) {
+    return "high";
+  }
+  return "mid";
+}
+
+function resolveAgentModel(
+  agent: AgentDef,
+  registry: ProviderRegistry,
+): WorkerResolution | "frontier" {
+  if (agent.model === "frontier") return "frontier";
+  const { kind, model, providerId, family: pinnedFamily, dialectPack: pinnedPack } = agent.model;
+  const family = pinnedFamily ?? resolveFamily(kind, model).id;
+  const dialectPack = resolveDialectPackId({
+    explicit: pinnedPack,
+    familyId: family,
+    providerKind: kind,
+    modelId: model,
+  });
+  if (providerId !== undefined) {
+    const configured = registry.list().some((p) => p.id === providerId);
+    if (!configured) {
+      throw new RpcMethodError(
+        RpcErrorCodes.SERVER_ERROR,
+        `agent ${agent.name} requires provider ${providerId} which is not configured`,
+      );
+    }
+    return { providerId, model, family, dialectPack };
+  }
+  const providersOfKind = registry.list().filter((p) => p.kind === kind);
+  if (providersOfKind.length === 0) {
+    throw new RpcMethodError(
+      RpcErrorCodes.SERVER_ERROR,
+      `no configured provider of kind ${kind} for agent ${agent.name}`,
+    );
+  }
+  if (providersOfKind.length > 1) {
+    throw new RpcMethodError(
+      RpcErrorCodes.SERVER_ERROR,
+      `ambiguous provider kind ${kind} for agent ${agent.name}; specify providerId`,
+    );
+  }
+  const [provider] = providersOfKind;
+  if (provider === undefined) {
+    throw new RpcMethodError(
+      RpcErrorCodes.SERVER_ERROR,
+      `no configured provider of kind ${kind} for agent ${agent.name}`,
+    );
+  }
+  return { providerId: provider.id, model, family, dialectPack };
 }
 
 // v1 task classifier: a small deterministic keyword heuristic, NOT a model
@@ -102,70 +197,67 @@ export function routeTask(
   harness: HarnessBundle,
   registry: ProviderRegistry,
 ): RoutedAgent {
-  const taskClass = classifyTask(task, harness.routing);
-  const entry = harness.routing.taskClasses[taskClass];
-  const agentName = taskClass === DEFAULT_TASK_CLASS || entry === undefined
-    ? harness.routing.defaults.agent
-    : entry.agent;
+  // Normalize routing to v2 shape so routeId is always available for
+  // telemetry, even when the on-disk harness is still version 1.
+  const routing = upgradeRouting(harness.routing);
+  const taskClass = classifyTask(task, routing);
+  const difficulty = classifyDifficulty(task);
+  const entry = routing.taskClasses[taskClass];
+  const agentName =
+    taskClass === DEFAULT_TASK_CLASS || entry === undefined
+      ? routing.defaults.agent
+      : entry.agent;
+  const routeId =
+    taskClass === DEFAULT_TASK_CLASS || entry === undefined
+      ? (routing.defaults.routeId ?? "tc:default")
+      : (entry.routeId ?? `tc:${taskClass}`);
+
+  // Chain lookup: prefer "taskClass:difficulty", then "taskClass", then primary alone.
+  const chainKeySpecific =
+    taskClass === DEFAULT_TASK_CLASS ? undefined : `${taskClass}:${difficulty}`;
+  const chainKeyClass = taskClass === DEFAULT_TASK_CLASS ? undefined : taskClass;
+  const chainFromConfig =
+    (chainKeySpecific !== undefined ? routing.chains?.[chainKeySpecific]?.agents : undefined) ??
+    (chainKeyClass !== undefined ? routing.chains?.[chainKeyClass]?.agents : undefined);
+  const agentChain =
+    chainFromConfig !== undefined && chainFromConfig.length > 0
+      ? [...new Set([agentName, ...chainFromConfig])]
+      : [agentName];
 
   const agent = harness.agents.find((a) => a.name === agentName);
   if (agent === undefined) {
-    // Shouldn't happen if validateHarness() passed at generation time (it
-    // checks exactly this referential integrity) — guarded here anyway
-    // since routeTask has no guarantee the harness it was handed went
-    // through that check (e.g. a hand-edited harness loaded straight off
-    // disk).
     throw new RpcMethodError(
       RpcErrorCodes.SERVER_ERROR,
       `routing references unknown agent: ${agentName}`,
     );
   }
 
-  if (agent.model === "frontier") {
-    return { agent, taskClass, resolution: "frontier" };
-  }
+  // Validate chain names exist (soft: drop unknown names with log-free skip)
+  const validChain = agentChain.filter((name) => harness.agents.some((a) => a.name === name));
+  const finalChain = validChain.length > 0 ? validChain : [agentName];
 
-  const { kind, model, providerId } = agent.model;
+  return {
+    agent,
+    taskClass,
+    routeId,
+    difficulty,
+    agentChain: finalChain,
+    resolution: resolveAgentModel(agent, registry),
+  };
+}
 
-  if (providerId !== undefined) {
-    const configured = registry.list().some((p) => p.id === providerId);
-    if (!configured) {
-      throw new RpcMethodError(
-        RpcErrorCodes.SERVER_ERROR,
-        `agent ${agent.name} requires provider ${providerId} which is not configured`,
-      );
-    }
-    return { agent, taskClass, resolution: { providerId, model } };
-  }
-
-  // No providerId pinned on the agent: deterministic fallback — resolve to
-  // whichever configured provider serves this model `kind`, but only if
-  // there's exactly one. Zero or more than one is a configuration problem
-  // routeTask refuses to guess through; the fix in both cases is to
-  // configure/qualify providers, not to pick one arbitrarily.
-  const providersOfKind = registry.list().filter((p) => p.kind === kind);
-  if (providersOfKind.length === 0) {
+/** Resolve a named agent from the harness to a model resolution. */
+export function resolveNamedAgent(
+  agentName: string,
+  harness: HarnessBundle,
+  registry: ProviderRegistry,
+): { agent: AgentDef; resolution: WorkerResolution | "frontier" } {
+  const agent = harness.agents.find((a) => a.name === agentName);
+  if (agent === undefined) {
     throw new RpcMethodError(
       RpcErrorCodes.SERVER_ERROR,
-      `no configured provider of kind ${kind} for agent ${agent.name}`,
+      `routing references unknown agent: ${agentName}`,
     );
   }
-  if (providersOfKind.length > 1) {
-    throw new RpcMethodError(
-      RpcErrorCodes.SERVER_ERROR,
-      `ambiguous provider kind ${kind} for agent ${agent.name}; specify providerId`,
-    );
-  }
-  const [provider] = providersOfKind;
-  if (provider === undefined) {
-    // Unreachable — the length checks above guarantee exactly one element
-    // — but noUncheckedIndexedAccess still types destructuring as
-    // possibly-undefined, so this satisfies strict TS without an
-    // assertion.
-    throw new RpcMethodError(
-      RpcErrorCodes.SERVER_ERROR,
-      `no configured provider of kind ${kind} for agent ${agent.name}`,
-    );
-  }
-  return { agent, taskClass, resolution: { providerId: provider.id, model } };
+  return { agent, resolution: resolveAgentModel(agent, registry) };
 }
