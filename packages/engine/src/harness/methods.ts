@@ -5,6 +5,8 @@ import { RpcMethodError } from "../rpc/errors.js";
 import { resolveProjectKey } from "../rpc/guards.js";
 import { registerMethod } from "../rpc/register.js";
 import { HarnessGenError } from "./driver.js";
+import { resolveDialectPackId, resolveFamily } from "../models/catalog.js";
+import { recordRun } from "../runs/ledger.js";
 import { exportHarness } from "./exporters.js";
 import { generateHarness, type GenerateHarnessResult } from "./generate.js";
 import { AgentModelSchema, CARD_SLUG, validateHarness, type HarnessBundle } from "./schema.js";
@@ -14,7 +16,7 @@ const ProjectParamsSchema = z.object({ projectDir: z.string().min(1) });
 
 const ExportParamsSchema = z.object({
   projectDir: z.string().min(1),
-  format: z.enum(["agents-md", "claude-subagents"]),
+  format: z.enum(["agents-md", "claude-subagents", "opencode"]),
 });
 
 const UpdateAgentModelParamsSchema = z.object({
@@ -128,9 +130,27 @@ export class HarnessService {
 
 export function registerHarnessMethods(engine: Engine): void {
   registerMethod(engine.dispatcher, "engine.harness.generate", ProjectParamsSchema, async ({ projectDir }) => {
+    const startedAt = Date.now();
     try {
       const result = await engine.harness.generate(engine, projectDir);
       engine.log(`harness.generate ${projectDir}: ${result.pages} pages, ${result.agents} agents`);
+      let headSha = "unknown";
+      try {
+        headSha = harnessStatus(projectDir).headSha ?? "unknown";
+      } catch {
+        /* ignore */
+      }
+      recordRun(engine, projectDir, {
+        v: 1,
+        kind: "generate",
+        at: new Date().toISOString(),
+        pages: result.pages,
+        agents: result.agents,
+        estimatedCostUsd: result.estimatedCostUsd,
+        headSha,
+        cardStripped: result.cardStripped.map((s) => ({ item: s.item, reason: s.reason })),
+        durationMs: Date.now() - startedAt,
+      });
       return result;
     } catch (err) {
       // HarnessGenError (driver.ts, or thrown directly by generateHarness's
@@ -282,7 +302,20 @@ export function registerHarnessMethods(engine: Engine): void {
         if (agent === undefined) {
           throw new RpcMethodError(RpcErrorCodes.SERVER_ERROR, `unknown agent "${agentName}"`);
         }
-        agent.model = model;
+        // Phase 1: pin family + dialectPack from the catalog whenever a
+        // concrete worker model is assigned (frontier stays a sentinel).
+        if (model === "frontier") {
+          agent.model = "frontier";
+        } else {
+          const family = model.family ?? resolveFamily(model.kind, model.model).id;
+          const dialectPack = resolveDialectPackId({
+            explicit: model.dialectPack,
+            familyId: family,
+            providerKind: model.kind,
+            modelId: model.model,
+          });
+          agent.model = { ...model, family, dialectPack };
+        }
       });
     });
     return { updated: true };
@@ -325,6 +358,12 @@ export function registerHarnessMethods(engine: Engine): void {
         bundle.manifest.verification.card = "draft";
       });
     });
+    recordRun(engine, projectDir, {
+      v: 1,
+      kind: "card",
+      at: new Date().toISOString(),
+      action: "update",
+    });
     return { updated: true };
   });
 
@@ -363,6 +402,12 @@ export function registerHarnessMethods(engine: Engine): void {
         throw new RpcMethodError(RpcErrorCodes.SERVER_ERROR, "no project card; regenerate the harness first");
       }
       await setCardState(projectDir, "approved");
+    });
+    recordRun(engine, projectDir, {
+      v: 1,
+      kind: "card",
+      at: new Date().toISOString(),
+      action: "approve",
     });
     return { approved: true };
   });

@@ -11,7 +11,7 @@ import { CARD_SLUG, type AgentDef, type HarnessBundle, type WikiPage } from "./s
 // write is transactional the way store.ts's writeHarness is (see that
 // module's header comment): these are user-facing export targets a human
 // may hand-edit afterward, not the harness itself.
-export type HarnessExportFormat = "agents-md" | "claude-subagents";
+export type HarnessExportFormat = "agents-md" | "claude-subagents" | "opencode";
 
 export interface HarnessExportResult {
   files: string[];
@@ -192,6 +192,65 @@ async function exportClaudeSubagents(projectDir: string, bundle: HarnessBundle):
   return { files };
 }
 
+/**
+ * OpenCode-style project config: opencode.json with per-agent model
+ * bindings + instruction pointers. Pure derivation of the harness bundle.
+ */
+function renderOpencodeJson(bundle: HarnessBundle): string {
+  const agents: Record<string, unknown> = {};
+  for (const agent of bundle.agents) {
+    const model =
+      agent.model === "frontier"
+        ? { provider: "frontier", model: "default" }
+        : {
+            provider: agent.model.kind,
+            model: agent.model.model,
+            ...(agent.model.providerId !== undefined ? { providerId: agent.model.providerId } : {}),
+            ...(agent.model.family !== undefined ? { family: agent.model.family } : {}),
+            ...(agent.model.dialectPack !== undefined
+              ? { dialectPack: agent.model.dialectPack }
+              : {}),
+          };
+    agents[agent.name] = {
+      description: agent.description,
+      prompt: agent.prompt,
+      taskClasses: agent.taskClasses,
+      model,
+    };
+  }
+
+  const config = {
+    $schema: "https://opencode.ai/config.json",
+    // OpenFusion provenance — not load-bearing for OpenCode itself.
+    openfusion: {
+      schemaVersion: bundle.manifest.schemaVersion,
+      harnessProfile: bundle.manifest.harnessProfile ?? "openfusion-native",
+      familyCatalogVersion: bundle.manifest.familyCatalogVersion,
+      dialectPackVersion: bundle.manifest.dialectPackVersion,
+      evals: bundle.manifest.verification.evals,
+      note:
+        bundle.manifest.verification.evals !== "pass"
+          ? "UNVERIFIED: harness has not passed evals"
+          : undefined,
+    },
+    default_agent: bundle.routing.defaults.agent,
+    agents,
+    instructions: ["AGENTS.md"],
+  };
+  return `${JSON.stringify(config, null, 2)}\n`;
+}
+
+async function exportOpencode(projectDir: string, bundle: HarnessBundle): Promise<HarnessExportResult> {
+  // Always emit AGENTS.md alongside opencode.json so OpenCode has the card-
+  // led project instructions OpenFusion already generates.
+  const agentsResult = await exportAgentsMd(projectDir, bundle);
+  const opencodePath = path.join(projectDir, "opencode.json");
+  await writeFile(opencodePath, renderOpencodeJson(bundle), "utf8");
+  return {
+    files: [...agentsResult.files, path.relative(projectDir, opencodePath)],
+  };
+}
+
 // Entry point for `engine.harness.export` (methods.ts). Callers are
 // responsible for loading and structurally validating the bundle first
 // (loadHarness + validateHarness) — this function assumes `bundle` is
@@ -202,5 +261,6 @@ export async function exportHarness(
   format: HarnessExportFormat,
 ): Promise<HarnessExportResult> {
   if (format === "agents-md") return exportAgentsMd(projectDir, bundle);
+  if (format === "opencode") return exportOpencode(projectDir, bundle);
   return exportClaudeSubagents(projectDir, bundle);
 }

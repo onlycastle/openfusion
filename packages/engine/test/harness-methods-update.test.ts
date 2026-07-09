@@ -135,7 +135,13 @@ describe("engine.harness.updateAgentModel", () => {
     });
     expect(res.error).toBeUndefined();
     expect(res.result).toEqual({ updated: true });
-    expect(loadHarness(dir)!.agents[0]!.model).toEqual({ kind: "moonshot", model: "kimi-k2.7-code", providerId: "moonshot" });
+    expect(loadHarness(dir)!.agents[0]!.model).toEqual({
+      kind: "moonshot",
+      model: "kimi-k2.7-code",
+      providerId: "moonshot",
+      family: "kimi",
+      dialectPack: "string-edit-default",
+    });
   });
 
   it("accepts the frontier sentinel", async () => {
@@ -192,8 +198,15 @@ describe("engine.harness.updateAgentModel", () => {
     const reloaded = loadHarness(dir)!;
     const coder = reloaded.agents.find((a) => a.name === "coder")!;
     const reviewer = reloaded.agents.find((a) => a.name === "reviewer")!;
-    expect(coder.model).toEqual({ kind: "moonshot", model: "kimi-k2.7-code", providerId: "moonshot" });
-    expect(reviewer.model).toEqual({ kind: "moonshot", model: "kimi-k2.7-code", providerId: "moonshot" });
+    const expected = {
+      kind: "moonshot",
+      model: "kimi-k2.7-code",
+      providerId: "moonshot",
+      family: "kimi",
+      dialectPack: "string-edit-default",
+    };
+    expect(coder.model).toEqual(expected);
+    expect(reviewer.model).toEqual(expected);
   });
 });
 

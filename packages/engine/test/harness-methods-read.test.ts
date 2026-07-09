@@ -70,7 +70,13 @@ describe("engine.harness.read", () => {
     expect(res.result.agents).toHaveLength(2);
     expect(res.result.agents[0]).toEqual({
       name: "coder", role: "writes code", taskClasses: ["codegen"],
-      model: { kind: "deepseek", model: "deepseek-v4-flash", providerId: "deepseek" },
+      model: {
+        kind: "deepseek",
+        model: "deepseek-v4-flash",
+        providerId: "deepseek",
+        family: "deepseek",
+        dialectPack: "string-edit-default",
+      },
     });
     expect(res.result.agents[1].model).toBe("frontier");
     // prompt/body are NOT leaked into the read shape

@@ -24,6 +24,11 @@ import { RpcMethodError } from "../rpc/errors.js";
 import { requireGitRepo } from "../rpc/guards.js";
 import { wikiDbPath } from "../wiki/store.js";
 import { ENGINE_VERSION } from "../version.js";
+import {
+  DIALECT_PACK_CATALOG_VERSION,
+  FAMILY_CATALOG_VERSION,
+  resolveFamily,
+} from "../models/catalog.js";
 import { PRICING } from "../models/pricing.js";
 import {
   CardContentSchema,
@@ -39,11 +44,12 @@ import {
   CARD_SLUG,
   HarnessBundleSchema,
   PROSE_PAGE_SLUGS,
-  RoutingSchema,
+  RoutingV2Schema,
   validateHarness,
   type WikiPage,
 } from "./schema.js";
 import { harnessStatus, writeHarness } from "./store.js";
+import { upgradeRouting } from "./upgrade.js";
 
 // The only frontier engine kind generation drives today — mirrors
 // engines/methods.ts's own `params.engine ?? "claude-code"` default. Not
@@ -90,7 +96,16 @@ const PageContentSchema = z.object({
 
 const AgentsRoutingSchema = z.object({
   agents: z.array(AgentDefSchema).min(2).max(5),
-  routing: RoutingSchema,
+  // Accept v1 or v2 from the model; we normalize to v2 before write.
+  routing: z.union([
+    RoutingV2Schema,
+    z.object({
+      version: z.literal(1),
+      taskClasses: z.record(z.string().min(1), z.object({ agent: z.string().min(1) })),
+      escalation: z.object({ failuresBeforeFrontier: z.number().int().min(1).max(3) }),
+      defaults: z.object({ agent: z.string().min(1) }),
+    }),
+  ]),
 });
 
 const PAGE_FOCUS: Record<(typeof PROSE_PAGE_SLUGS)[number], string> = {
@@ -110,6 +125,11 @@ interface WorkerModelOption {
   model: string;
   inputPerMtok: number;
   outputPerMtok: number;
+  family: string;
+  dialectPack: string;
+  costTier: string;
+  bestFor: string[];
+  avoidFor: string[];
 }
 
 // Cross-references configured providers (engine.models.registry.list(): id +
@@ -117,7 +137,8 @@ interface WorkerModelOption {
 // to build the agents-routing stage's model menu — the registry alone
 // doesn't carry a specific model id (that's chosen per engine.models.complete
 // call), so PRICING's keyspace is what actually enumerates candidate models
-// for a configured provider kind.
+// for a configured provider kind. Phase 1: each option is annotated with
+// family + default dialect pack from the bundled catalog.
 function listWorkerModelOptions(engine: Engine): WorkerModelOption[] {
   const providers = engine.models.registry.list();
   const options: WorkerModelOption[] = [];
@@ -128,12 +149,20 @@ function listWorkerModelOptions(engine: Engine): WorkerModelOption[] {
       const kind = key.slice(0, slashIdx);
       const model = key.slice(slashIdx + 1);
       if (kind !== provider.kind) continue;
+      // Skip reference/* rows — not callable worker presets (pricing-only).
+      if (kind.startsWith("reference")) continue;
+      const family = resolveFamily(kind, model);
       options.push({
         providerId: provider.id,
         kind,
         model,
         inputPerMtok: pricing.inputPerMtok,
         outputPerMtok: pricing.outputPerMtok,
+        family: family.id,
+        dialectPack: family.defaultDialectPack,
+        costTier: family.costTier,
+        bestFor: family.bestFor,
+        avoidFor: family.avoidFor,
       });
     }
   }
@@ -232,7 +261,9 @@ function buildAgentsRoutingPrompt(overview: Overview, workerModels: WorkerModelO
       ? workerModels
           .map(
             (m) =>
-              `- providerId: ${m.providerId}, kind: ${m.kind}, model: ${m.model} — $${m.inputPerMtok}/Mtok in, $${m.outputPerMtok}/Mtok out`,
+              `- providerId: ${m.providerId}, kind: ${m.kind}, model: ${m.model}, family: ${m.family}, dialectPack: ${m.dialectPack}, costTier: ${m.costTier} — $${m.inputPerMtok}/Mtok in, $${m.outputPerMtok}/Mtok out` +
+              (m.bestFor.length > 0 ? `; bestFor: ${m.bestFor.join(", ")}` : "") +
+              (m.avoidFor.length > 0 ? `; avoidFor: ${m.avoidFor.join(", ")}` : ""),
           )
           .join("\n")
       : '(no worker models are configured — assign "frontier" to every agent)';
@@ -241,10 +272,10 @@ function buildAgentsRoutingPrompt(overview: Overview, workerModels: WorkerModelO
     "You are designing the specialist-agent routing table for this repository's AI coding harness.",
     "Repository overview:",
     "```json\n" + JSON.stringify(overview, null, 2) + "\n```",
-    "Configured worker models (cost is per million tokens):",
+    "Configured worker models (cost is per million tokens; family + dialectPack come from the engine catalog — copy them when assigning a model):",
     modelMenu,
-    "Propose 2 to 5 specialist agents, each mapped to one or more task classes (cover at minimum: codegen, docs, tests, search, refactor), each assigned the CHEAPEST worker model adequate for its task classes — including that model's providerId from the menu above — or the literal string \"frontier\" if no configured worker model is adequate.",
-    "Also produce the routing.yaml content: every task class maps to exactly one agent, escalation.failuresBeforeFrontier defaults to 2, and defaults.agent names a sensible fallback agent.",
+    "Propose 2 to 5 specialist agents, each mapped to one or more task classes (cover at minimum: codegen, docs, tests, search, refactor), each assigned the CHEAPEST worker model adequate for its task classes — including that model's providerId, family, and dialectPack from the menu above — or the literal string \"frontier\" if no configured worker model is adequate.",
+    "Also produce the routing.yaml content: version 2, every task class maps to exactly one agent (with optional routeId), escalation.failuresBeforeFrontier defaults to 2, and defaults.agent names a sensible fallback agent.",
     "Respond with ONLY a single JSON code block matching this exact shape:",
     "```json\n" +
       JSON.stringify(
@@ -256,23 +287,45 @@ function buildAgentsRoutingPrompt(overview: Overview, workerModels: WorkerModelO
               description: "string",
               prompt: "string — the system prompt this agent will run with",
               taskClasses: ["codegen"],
-              model: { kind: "string", model: "string", providerId: "string" },
+              model: {
+                kind: "string",
+                model: "string",
+                providerId: "string",
+                family: "string",
+                dialectPack: "string",
+              },
               escalation: { maxAttempts: 2 },
             },
           ],
           routing: {
-            version: 1,
-            taskClasses: { codegen: { agent: "kebab-case-name" } },
+            version: 2,
+            taskClasses: { codegen: { agent: "kebab-case-name", routeId: "tc:codegen" } },
             escalation: { failuresBeforeFrontier: 2 },
-            defaults: { agent: "kebab-case-name" },
+            defaults: { agent: "kebab-case-name", routeId: "tc:default" },
           },
         },
         null,
         2,
       ) +
       "\n```",
-    'model may also be the literal string "frontier" instead of an object. providerId is optional but should be set to the providerId from the model menu above whenever a specific worker model is assigned.',
+    'model may also be the literal string "frontier" instead of an object. providerId/family/dialectPack should be set from the model menu whenever a specific worker model is assigned.',
   ].join("\n\n");
+}
+
+/** Fill missing family/dialectPack on agent models from the catalog (post-LLM). */
+function pinAgentFamilies(
+  agents: z.infer<typeof AgentsRoutingSchema>["agents"],
+): z.infer<typeof AgentsRoutingSchema>["agents"] {
+  return agents.map((agent) => {
+    if (agent.model === "frontier") return agent;
+    const family = agent.model.family ?? resolveFamily(agent.model.kind, agent.model.model).id;
+    const dialectPack =
+      agent.model.dialectPack ?? resolveFamily(agent.model.kind, agent.model.model).defaultDialectPack;
+    return {
+      ...agent,
+      model: { ...agent.model, family, dialectPack },
+    };
+  });
 }
 
 // Mirrors engine.wiki.status's own built/stale gate (wiki/methods.ts):
@@ -395,18 +448,23 @@ export async function generateHarness(engine: Engine, projectDir: string): Promi
       },
     );
     costUsd = addCost(costUsd, agentsResult.costUsd);
-    const { agents, routing } = agentsResult.value;
+    const agents = pinAgentFamilies(agentsResult.value.agents);
+    const routing = upgradeRouting(agentsResult.value.routing);
 
     notify("write", "assembling and structurally validating the harness bundle");
     const candidateBundle = {
       manifest: {
-        schemaVersion: 1 as const,
+        schemaVersion: 2 as const,
         generatorVersion: ENGINE_VERSION,
         engine: FRONTIER_KIND,
         headSha,
         generatedAt: new Date().toISOString(),
         verification: { structural: "pass" as const, evals: "pending" as const, card: "draft" as const },
         artifacts: [],
+        harnessProfile: "openfusion-native" as const,
+        familyCatalogVersion: FAMILY_CATALOG_VERSION,
+        dialectPackVersion: DIALECT_PACK_CATALOG_VERSION,
+        routePolicyVersion: "2",
       },
       pages,
       agents,
