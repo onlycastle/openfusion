@@ -225,6 +225,10 @@ import { RpcErrorCodes } from "@openfusion/shared";
 import type { Engine } from "../engine.js";
 import type { FrontierSession } from "../engines/types.js";
 import type { PricingConfidence } from "../models/meter.js";
+import {
+  DIALECT_PACK_CATALOG_VERSION,
+  FAMILY_CATALOG_VERSION,
+} from "../models/catalog.js";
 import { validateHarness } from "../harness/schema.js";
 import { HarnessValidationError, loadHarness, setEvalsVerdict, writeHarness } from "../harness/store.js";
 import { orchestrate, type OrchestrateResult } from "../orchestrate/orchestrate.js";
@@ -233,6 +237,14 @@ import { RpcMethodError } from "../rpc/errors.js";
 import { requireGitRepo } from "../rpc/guards.js";
 import type { EvalTask } from "./tasks.js";
 import { runOracle } from "./tasks.js";
+import { computeEvalsVerdict } from "./verdict.js";
+
+// Local addCost for baseline/harness arm cost accumulation — same null-skip
+// semantics as verdict.addCost / orchestrate.ts.
+function addCost(total: number | null, next: number | null): number | null {
+  if (next === null) return total;
+  return (total ?? 0) + next;
+}
 
 const execFileAsync = promisify(execFile);
 
@@ -245,61 +257,6 @@ const FRONTIER_KIND = "claude-code";
 // since the baseline primitive IS "a frontier does the task directly",
 // structurally identical to escalation.
 const DEFAULT_BASELINE_TIMEOUT_MS = 600_000;
-
-// Anthropic eval guidance (docs/research/2026-07-04-m6-pricing-eval-
-// verification.md, "Sample size"): the LOW floor -- below it, no
-// consequential verdict is grounded, full stop; a run this small is a demo,
-// not a claim. Post-M6.1 (see MIN_TASK_COUNT_FOR_SAVINGS_PASS just below),
-// this constant no longer gates a savings PASS by itself -- it now gates
-// only the cost-hazard FAIL flag (a harm signal, flagged readily at the low
-// floor), while a savings PASS must clear the separate, higher 20-task floor.
-const MIN_TASK_COUNT_FOR_VERDICT = 5;
-
-// Research 2026-07-07 (docs/research/2026-07-07-harness-composition.md §4.2,
-// arXiv:2602.07150 power table): a hazard FLAG and a savings CLAIM need
-// different sample sizes. MIN_TASK_COUNT_FOR_VERDICT (5, above) is the low
-// floor below which even a demo can't ground any consequential verdict; it
-// still gates the cost-hazard flag (a harm signal — flag readily). A savings
-// PASS is a positive claim and demands more: ~20–50 paired tasks (the range
-// this module's own note text already cites). 20 is the conservative lower
-// bound; 30–50 is better for detecting sub-10pp effects. Below this, a
-// priced, quality-held, positive-savings run is still only "inconclusive".
-const MIN_TASK_COUNT_FOR_SAVINGS_PASS = 20;
-
-// Task 4 Fix 2: the fraction of ALL tasks (not just the ones on the "wrong"
-// side of a raw quality gap) that hit a measurement failure before the
-// pipeline stops trusting that run's OWN "fail" conclusion, even if the raw
-// gap happens to survive excluding those tasks. Chosen as a conservative,
-// clearly-documented threshold rather than a tuned constant: at 20%+
-// measurement-failure tasks, a materially large slice of the run's own data
-// is not a genuine quality read at all, so an ETH-hazard "fail" — the most
-// consequential verdict this pipeline can produce — should not be asserted
-// off a run that unreliable, regardless of how the arithmetic on the
-// remaining "clean" tasks happens to come out.
-const MATERIAL_MEASUREMENT_FAILURE_FRACTION = 0.2;
-
-// Research 2026-07-07 (§3.3, arXiv:2602.07150): single-run pass@1 varies
-// 2.2–6.0pp and has std >1.5pp even at temperature 0, so a clean-subset
-// quality gap SMALLER than this fraction of the clean task count is
-// indistinguishable from measurement noise and must NOT be reported as an
-// ETH-hazard "fail". Above it, the gap is treated as a genuine quality
-// regression. On tiny suites any gap is a large fraction (e.g. 1/2 = 50pp),
-// so aggressive flagging is preserved exactly where the sample is too small
-// to explain the gap as noise. Single-run heuristic; multi-run averaging to
-// buy significance for smaller effects is a deferred follow-up.
-const QUALITY_NOISE_BAND = 0.05;
-
-// Research 2026-07-07 (§0/§4.3, arXiv:2602.11988): the eval gate is
-// two-dimensional. A harness that HOLDS quality but costs materially MORE
-// than the no-harness baseline is an ETH COST hazard (the study's exact
-// failure mode: quality held, cost +~20%), not a neutral result. When the
-// clean-subset savings is at or below -this fraction (i.e. the harness is
-// >=10% MORE expensive) at held quality, priced, and above the low hazard
-// floor, the verdict is "fail". A milder increase (between this and 0) stays
-// "inconclusive" ("quality held but not worth it"). Uses the LOW floor
-// (MIN_TASK_COUNT_FOR_VERDICT) not the savings-PASS floor — a harm signal is
-// flagged readily, asymmetric with the higher bar a positive claim must clear.
-const COST_REGRESSION_FAIL_FRACTION = 0.10;
 
 export interface EvalsRunParams {
   projectDir: string;
@@ -349,6 +306,17 @@ export interface PerTaskResult {
   harnessUsd: number | null;
 }
 
+/** Phase 1: published harness configuration for eval reproducibility. */
+export interface EvalsHarnessConfig {
+  schemaVersion: 1 | 2;
+  harnessProfile: string;
+  familyCatalogVersion: string;
+  dialectPackVersion: string;
+  routePolicyVersion: string;
+  // Honest pin: generate/review/escalate still use this frontier engine only.
+  frontierEngine: string;
+}
+
 export interface EvalsReportCard {
   taskCount: number;
   baseline: { passed: number; costUsd: number | null };
@@ -392,17 +360,8 @@ export interface EvalsReportCard {
   // band (research 2026-07-07 §3.3) — i.e. any harness<baseline gap present
   // was too small to ground an ETH-hazard "fail". Purely informational.
   qualityGapWithinNoise: boolean;
-}
-
-// Null-safe running total — same shape as orchestrate.ts's own addCost (and
-// harness/driver.ts's/harness/generate.ts's copies): null contributes
-// nothing; the running total only becomes (and then stays) a number once
-// ANY addend is one. Duplicated locally rather than exported/shared, per
-// this codebase's own established precedent for this exact three-line
-// helper (see orchestrate.ts's doc comment on its own copy).
-function addCost(total: number | null, next: number | null): number | null {
-  if (next === null) return total;
-  return (total ?? 0) + next;
+  // Phase 1: model+harness configuration pins (Zhang et al. arXiv:2605.23950).
+  harnessConfig?: EvalsHarnessConfig;
 }
 
 // M7c Task 5: `runId`, when supplied (the same batch-level runId this run's
@@ -684,34 +643,6 @@ async function runHarnessTask(
   return { passed: oracle.passed, costUsd: result.cost.totalUsd, outcome: result.outcome };
 }
 
-function buildNote(opts: {
-  taskCount: number;
-  pricingConfidence: PricingConfidence;
-  sampleNote?: string;
-  extraNotes?: string[];
-}): string {
-  const parts: string[] = [];
-  parts.push(
-    opts.taskCount < MIN_TASK_COUNT_FOR_SAVINGS_PASS
-      ? `Sample size ${opts.taskCount} task(s) is below the ${MIN_TASK_COUNT_FOR_SAVINGS_PASS}-task floor for a credible savings claim (docs/research/2026-07-07-harness-composition.md §4.2) -- a hazard flag can still fire, but a savings PASS cannot. This is a demo, not a claim.`
-      : `Sample size: ${opts.taskCount} task(s) (a credible claim wants 20-50 paired tasks; treat this as directional).`,
-  );
-  parts.push("Cost figures are estimate-class (see engine.orchestrate's own cost.note) -- directional, not exact.");
-  parts.push(`Pricing confidence: ${opts.pricingConfidence} (the worst confidence across every cost record this run produced).`);
-  for (const note of opts.extraNotes ?? []) {
-    parts.push(note);
-  }
-  parts.push(
-    "Eval integrity assumes a NON-ADVERSARIAL worker: a worker that deliberately reaches outside its scratch " +
-      "directory (e.g. git-fetching the real project directory, or a raw filesystem read) could defeat this " +
-      "run's isolation -- full worker process sandboxing is deferred to M7.",
-  );
-  if (opts.sampleNote !== undefined && opts.sampleNote.length > 0) {
-    parts.push(opts.sampleNote);
-  }
-  return parts.join(" ");
-}
-
 // The pipeline itself: guard -> per-task (baseline + harness, both scored by
 // the same oracle) -> aggregate -> verdict -> manifest flip. See this
 // module's header comment for the full baseline-vs-harness wiring rationale.
@@ -756,10 +687,6 @@ export async function runEvals(engine: Engine, params: EvalsRunParams): Promise<
   // downstream `cancelSignal?.` check below degrades to a no-op.
   const cancelSignal = params.runId !== undefined ? engine.cancelRegistry.get(params.runId)?.signal : undefined;
 
-  let baselinePassed = 0;
-  let harnessPassed = 0;
-  let baselineCostTotal: number | null = null;
-  let harnessCostTotal: number | null = null;
   let escalations = 0;
   const perTask: PerTaskResult[] = [];
 
@@ -796,11 +723,7 @@ export async function runEvals(engine: Engine, params: EvalsRunParams): Promise<
 
         progress(engine, "scored", task.id, params.runId);
 
-        if (baseline.passed) baselinePassed += 1;
-        if (harnessResult.passed) harnessPassed += 1;
         if (harnessResult.outcome === "escalated") escalations += 1;
-        baselineCostTotal = addCost(baselineCostTotal, baseline.costUsd);
-        harnessCostTotal = addCost(harnessCostTotal, harnessResult.costUsd);
 
         perTask.push({
           id: task.id,
@@ -836,215 +759,37 @@ export async function runEvals(engine: Engine, params: EvalsRunParams): Promise<
 
   progress(engine, "done", undefined, params.runId);
 
-  const taskCount = params.tasks.length;
   // Run-scoped (C1 / I2): everything this run's own task loop added to the
   // meter, and nothing else — see runMeterStartIndex's own doc comment
-  // above.
+  // above. Pure verdict math lives in ./verdict.ts (shared with the bench).
   const runMeterTotals = engine.models.meter.totals(runMeterStartIndex);
-  const pricingConfidence = runMeterTotals.pricingConfidence;
-  const runUnpricedCalls = runMeterTotals.unpricedCalls;
-  const savingsPct =
-    baselineCostTotal !== null && harnessCostTotal !== null && baselineCostTotal > 0
-      ? (baselineCostTotal - harnessCostTotal) / baselineCostTotal
-      : null;
-  const qualityHeld = harnessPassed >= baselinePassed;
-
-  // Fix 2 (measurement failures vs. quality failures — see this module's
-  // header comment): a task counts as a MEASUREMENT failure if EITHER side
-  // failed to produce a genuine, oracle-scoreable attempt at the task —
-  // harness "apply-failed"/"error", or baseline "error" (Fix 3's own
-  // baseline/harness symmetry). These are tallied and named in the report's
-  // note regardless of verdict, for transparency.
-  const isHarnessMeasurementFailure = (outcome: HarnessTaskOutcome): boolean =>
-    outcome === "apply-failed" || outcome === "error";
-  const measurementFailureIds = new Set(
-    perTask
-      .filter((t) => isHarnessMeasurementFailure(t.harnessOutcome) || t.baselineOutcome === "error")
-      .map((t) => t.id),
-  );
-  const harnessApplyFailedCount = perTask.filter((t) => t.harnessOutcome === "apply-failed").length;
-  const harnessErrorCount = perTask.filter((t) => t.harnessOutcome === "error").length;
-  const baselineErrorCount = perTask.filter((t) => t.baselineOutcome === "error").length;
-  const measurementFailureCount = measurementFailureIds.size;
-
-  const extraNotes: string[] = [];
-  if (measurementFailureCount > 0) {
-    extraNotes.push(
-      `${measurementFailureCount} of ${taskCount} task(s) hit a measurement failure rather than a genuine, ` +
-        `oracle-scoreable quality result (harness: ${harnessApplyFailedCount} apply-failed, ${harnessErrorCount} ` +
-        `error; baseline: ${baselineErrorCount} error) -- see the verdict note below for exactly how this run's ` +
-        `pass/fail/inconclusive determination accounts for them.`,
-    );
-  }
-
-  // Review-round-2 fix (symmetric measurement-failure gate): the clean
-  // subset (tasks where NEITHER side hit a measurement failure) and the
-  // materiality fraction are computed ONCE, up front, and applied
-  // IDENTICALLY regardless of which direction the raw qualityHeld
-  // comparison points. Before this fix, the clean-subset recheck lived
-  // ONLY inside the `!qualityHeld` branch below (see git history) — so a
-  // baseline-side measurement failure (deflating baselinePassed, never
-  // baselineOutcome "error" tasks) could inflate the harness's RAW pass
-  // count over a genuine clean-subset quality gap and flip the manifest to
-  // a "pass" that a 40%-measurement-failure run has no business earning.
-  // A run too corrupted to trust for a "fail" is equally too corrupted to
-  // trust for a "pass" — see this module's test suite ("measurement-failure
-  // gate applies symmetrically to pass and fail") for the exact scenario
-  // this closes. Both `savingsPct` used for the fail/pass DECISION below
-  // and the pass-count comparison itself are recomputed on this same clean
-  // subset; the report card's own top-level `qualityHeld`/`savingsPct`
-  // fields stay RAW (all-task) figures, per their own doc comments — only
-  // the verdict uses the clean-subset numbers.
-  const cleanTasks = perTask.filter((t) => !measurementFailureIds.has(t.id));
-  const cleanBaselinePassed = cleanTasks.filter((t) => t.baselinePassed).length;
-  const cleanHarnessPassed = cleanTasks.filter((t) => t.harnessPassed).length;
-  const qualityHeldClean = cleanHarnessPassed >= cleanBaselinePassed;
-  const measurementFailureFractionIsMaterial =
-    measurementFailureCount / taskCount >= MATERIAL_MEASUREMENT_FAILURE_FRACTION;
-  let cleanBaselineCostTotal: number | null = null;
-  let cleanHarnessCostTotal: number | null = null;
-  for (const t of cleanTasks) {
-    cleanBaselineCostTotal = addCost(cleanBaselineCostTotal, t.baselineUsd);
-    cleanHarnessCostTotal = addCost(cleanHarnessCostTotal, t.harnessUsd);
-  }
-  const cleanSavingsPct =
-    cleanBaselineCostTotal !== null && cleanHarnessCostTotal !== null && cleanBaselineCostTotal > 0
-      ? (cleanBaselineCostTotal - cleanHarnessCostTotal) / cleanBaselineCostTotal
-      : null;
-
-  // Research 2026-07-07 §3.3: is the clean-subset quality gap large enough to
-  // be a genuine regression rather than single-run noise? A negative gap
-  // (harness >= baseline) is trivially within noise. Guards the ETH-hazard
-  // branch below so a large suite's 1-task wobble can't false-fail.
-  const cleanQualityGap = cleanBaselinePassed - cleanHarnessPassed; // >0 when harness worse
-  const qualityGapWithinNoise =
-    cleanTasks.length === 0 || cleanQualityGap / cleanTasks.length <= QUALITY_NOISE_BAND;
-  if (!qualityHeldClean && qualityGapWithinNoise) {
-    extraNotes.push(
-      `The harness scored below baseline on the clean subset, but the gap ` +
-        `(${cleanBaselinePassed - cleanHarnessPassed}/${cleanTasks.length}) is within the ` +
-        `${Math.round(QUALITY_NOISE_BAND * 100)}% single-run noise band -- treated as quality held, not an ETH hazard.`,
-    );
-  }
-
-  let verdict: EvalsReportCard["verdict"];
-  if (measurementFailureFractionIsMaterial) {
-    // Too corrupted to ground EITHER a "pass" or a "fail" (spec §12.1's own
-    // ETH-hazard concern cuts both ways here): checked BEFORE the
-    // clean-subset quality comparison below, regardless of which way that
-    // comparison would come out. See MATERIAL_MEASUREMENT_FAILURE_FRACTION's
-    // own doc comment for why this threshold exists at all.
-    verdict = "inconclusive";
-    extraNotes.push(
-      `${measurementFailureCount} of ${taskCount} task(s) (>= the ` +
-        `${Math.round(MATERIAL_MEASUREMENT_FAILURE_FRACTION * 100)}% materiality threshold) hit a measurement ` +
-        "failure -- this run is too corrupted to ground a \"pass\" or a \"fail\" verdict in either direction; " +
-        "reported as inconclusive rather than trusting the raw pass counts.",
-    );
-  } else if (!qualityHeldClean && !qualityGapWithinNoise) {
-    // ETH HAZARD (spec §12.1): the harness produced tested, applied,
-    // oracle-scored fixes that scored worse than baseline on the clean subset
-    // by MORE than the noise band (research 2026-07-07 §3.3). A within-noise
-    // gap falls through and is treated as quality held.
-    verdict = "fail";
-    if (measurementFailureCount > 0) {
-      extraNotes.push(
-        "The quality gap above survives excluding every measurement failure -- the harness genuinely produced " +
-          "worse fixes on the clean subset of tasks. Reported as an ETH-hazard fail.",
-      );
-    }
-  } else if (cleanBaselinePassed === 0) {
-    // Fix 3, now checked on the CLEAN subset: harnessPassed >= baselinePassed
-    // is trivially true at 0 >= 0 -- "savings at held quality" is
-    // meaningless when the baseline solved NOTHING (among the tasks that
-    // actually produced a genuine result on both sides) to hold quality
-    // against. Never a "pass" on a 0-vs-0 (or N-vs-0) clean-subset count,
-    // however good the savings arithmetic looks.
-    verdict = "inconclusive";
-    extraNotes.push(
-      measurementFailureCount > 0
-        ? "The baseline solved 0 of the clean (non-measurement-failed) tasks in this run -- there is nothing to " +
-            "measure quality against."
-        : "The baseline solved 0 of the tasks in this run -- there is nothing to measure quality against.",
-    );
-  } else if (runUnpricedCalls > 0) {
-    // C1 (final review, CRITICAL — the false-pass path): addCost's own
-    // null-skip semantics (this module's own addCost doc comment, and
-    // orchestrate.ts's identical copy) mean an unpriced COMPONENT of a cost
-    // total is silently dropped rather than making the whole total null —
-    // e.g. a harness task with a priced review but an UNPRICED worker call
-    // still gets a non-null `harnessUsd` (review cost only), so
-    // `cleanSavingsPct` below can come out positive and pass-shaped even
-    // though it rests on an undercounted harness cost. The
-    // `cleanSavingsPct === null` branch below only ever catches the
-    // ALL-unpriced case (every component null, so addCost never had a priced
-    // sibling to hide behind) — it can never catch this MIXED case, which is
-    // exactly the false "pass" this gate exists to close. Checked AFTER the
-    // ETH-fail and zero-baseline checks above (a genuine quality failure, or
-    // nothing to hold quality against, is real regardless of pricing — this
-    // gate only ever downgrades what would otherwise become a "pass") and
-    // BEFORE the sample-size/null-savings and "pass" branches below (the
-    // savings claim itself is untrustworthy, so it must never reach "pass").
-    verdict = "inconclusive";
-    extraNotes.push(
-      `${runUnpricedCalls} model call(s) were unpriced -- savings cannot be computed; run with priced models for ` +
-        "a savings claim.",
-    );
-  } else if (
-    (qualityHeldClean || qualityGapWithinNoise) &&
-    cleanSavingsPct !== null &&
-    cleanSavingsPct <= -COST_REGRESSION_FAIL_FRACTION &&
-    taskCount >= MIN_TASK_COUNT_FOR_VERDICT
-  ) {
-    // ETH COST HAZARD (research 2026-07-07 §0/§4.3): quality is held (or the
-    // gap is within noise) yet the harness is materially MORE expensive than
-    // the no-harness baseline on the clean subset. The harness is failing its
-    // cost-savings purpose while charging more -> "fail", not a silent
-    // "inconclusive". Fires at the LOW floor (a harm flag), asymmetric with
-    // the savings-PASS floor below.
-    verdict = "fail";
-    extraNotes.push(
-      `The harness held quality but cost ${Math.round(-cleanSavingsPct * 100)}% MORE than the no-harness ` +
-        `baseline on the clean subset (>= the ${Math.round(COST_REGRESSION_FAIL_FRACTION * 100)}% cost-regression ` +
-        `threshold) -- reported as an ETH cost-hazard fail.`,
-    );
-  } else if (taskCount < MIN_TASK_COUNT_FOR_SAVINGS_PASS || cleanSavingsPct === null) {
-    // Too few tasks for a savings CLAIM (a demo, not a claim) or an unpriced
-    // clean-subset cost (the savings arithmetic itself is meaningless).
-    verdict = "inconclusive";
-  } else if (cleanSavingsPct > 0) {
-    verdict = "pass";
-  } else {
-    // Quality held (on the clean subset), priced, enough samples -- but the
-    // harness didn't actually save money there (cleanSavingsPct <= 0). Not a
-    // hazard (quality is fine), but not a "saves cost" claim either.
-    verdict = "inconclusive";
-  }
+  const m = harnessBundle.manifest;
+  const report = computeEvalsVerdict({
+    perTask,
+    unpricedCalls: runMeterTotals.unpricedCalls,
+    pricingConfidence: runMeterTotals.pricingConfidence,
+    escalations,
+    sampleNote: params.sampleNote,
+    harnessConfig: {
+      schemaVersion: m.schemaVersion,
+      harnessProfile: m.harnessProfile ?? "openfusion-native",
+      familyCatalogVersion: m.familyCatalogVersion ?? FAMILY_CATALOG_VERSION,
+      dialectPackVersion: m.dialectPackVersion ?? DIALECT_PACK_CATALOG_VERSION,
+      routePolicyVersion: m.routePolicyVersion ?? String(harnessBundle.routing.version),
+      frontierEngine: FRONTIER_KIND,
+    },
+  });
 
   // engine.evals.run flips the manifest on a definitive verdict only — an
   // "inconclusive" run leaves manifest.verification.evals exactly as it was
-  // (typically "pending" from generation).
-  if (verdict === "pass") {
+  // (typically "pending" from generation). The pure computeEvalsVerdict
+  // never touches disk — this side effect stays here so the bench path
+  // cannot flip a throwaway django/sphinx manifest.
+  if (report.verdict === "pass") {
     await setEvalsVerdict(params.projectDir, "pass");
-  } else if (verdict === "fail") {
+  } else if (report.verdict === "fail") {
     await setEvalsVerdict(params.projectDir, "fail");
   }
 
-  return {
-    taskCount,
-    baseline: { passed: baselinePassed, costUsd: baselineCostTotal },
-    harness: { passed: harnessPassed, costUsd: harnessCostTotal, escalations },
-    savingsPct,
-    qualityHeld,
-    verdict,
-    pricingConfidence,
-    perTask,
-    note: buildNote({ taskCount, pricingConfidence, sampleNote: params.sampleNote, extraNotes }),
-    cleanTaskCount: cleanTasks.length,
-    cleanBaselinePassed,
-    cleanHarnessPassed,
-    cleanSavingsPct,
-    measurementFailureCount,
-    qualityGapWithinNoise,
-  };
+  return report;
 }
