@@ -5,8 +5,18 @@ import { describe, expect, it } from "vitest";
 import { createWorkerRuntime } from "../src/worker/runtime.js";
 import { createWorkerTools, type ToolEvent } from "../src/worker/tools.js";
 
+const FAKE_OPTS = { toolCallId: "test-call", messages: [], context: {} };
+
 function makeRoot(): string {
   return mkdtempSync(path.join(tmpdir(), "of-runtime-"));
+}
+
+function getExecute(
+  t: { execute?: unknown } | undefined,
+): (input: unknown, opts: unknown) => Promise<{ error?: string; ok?: true }> {
+  const exec = t?.execute;
+  if (typeof exec !== "function") throw new Error("tool has no execute");
+  return exec as (input: unknown, opts: unknown) => Promise<{ error?: string; ok?: true }>;
 }
 
 describe("createWorkerRuntime", () => {
@@ -58,15 +68,10 @@ describe("tool error telemetry", () => {
       onToolEvent: (e) => events.push(e),
     });
 
-    const edit = tools.edit as {
-      execute: (
-        args: { path: string; find: string; replace: string },
-        opts: { abortSignal?: AbortSignal },
-      ) => Promise<{ error?: string; ok?: true }>;
-    };
+    const edit = getExecute(tools.edit);
 
-    await edit.execute({ path: "f.txt", find: "missing", replace: "x" }, {});
-    await edit.execute({ path: "f.txt", find: "hello", replace: "x" }, {});
+    await edit({ path: "f.txt", find: "missing", replace: "x" }, FAKE_OPTS);
+    await edit({ path: "f.txt", find: "hello", replace: "x" }, FAKE_OPTS);
 
     expect(events.some((e) => e.tool === "edit" && e.errorKind === "not_found" && !e.ok)).toBe(
       true,
