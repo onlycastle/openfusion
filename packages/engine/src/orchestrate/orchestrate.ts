@@ -117,6 +117,17 @@ export interface OrchestrateResult {
   diff: string;
   diffStat: string;
   worktree: { path: string; branch: string } | null;
+  // Task 3 (run ledger): which worker-context injection branch this run
+  // took — buildWorkerContext's own return value, computed once per run
+  // (see the call site below) and threaded through every finish() path so
+  // the ledger write point (orchestrate/methods.ts) can bucket runs by it
+  // without re-deriving it from the harness bundle a second time.
+  contextBranch: WorkerContextBranch;
+  // Task 3 (run ledger): tool NAME -> call COUNT, summed across every worker
+  // attempt's own toolCallCounts (worker/methods.ts's Task 7 telemetry).
+  // Stays undefined when routing resolved straight to "frontier" — no
+  // worker attempt ever ran to report counts from.
+  toolCallCounts?: Record<string, number>;
   cost: {
     workerUsd: number | null;
     // M6 Task 2: frontier cost split by WHERE it was spent — reviewUsd is
@@ -151,6 +162,24 @@ export interface OrchestrateResult {
 function addCost(total: number | null, next: number | null): number | null {
   if (next === null) return total;
   return (total ?? 0) + next;
+}
+
+// Task 3: same "undefined until the first real addend" shape as addCost
+// above, but per-tool-name rather than a single running scalar — merges one
+// worker attempt's own toolCallCounts (worker/methods.ts's Task 7 telemetry)
+// into the run-wide running total. `total` stays undefined (never `{}`)
+// until the FIRST worker attempt reports counts, matching
+// OrchestrateResult.toolCallCounts's own "undefined when no worker attempt
+// ran" contract.
+function mergeToolCallCounts(
+  total: Record<string, number> | undefined,
+  next: Record<string, number>,
+): Record<string, number> {
+  const merged: Record<string, number> = { ...total };
+  for (const [tool, count] of Object.entries(next)) {
+    merged[tool] = (merged[tool] ?? 0) + count;
+  }
+  return merged;
 }
 
 // Mirrors engines/methods.ts's own private isWikiBuilt predicate exactly
@@ -199,6 +228,10 @@ interface WorkerRunResponse {
   summary: string;
   costUsd: number | null;
   worktree: { path: string; branch: string };
+  // Task 3: worker/methods.ts's Task 7 telemetry tally (tool NAME -> call
+  // COUNT for this one attempt only), surfaced on the RPC result — aggregated
+  // across every attempt into OrchestrateResult.toolCallCounts below.
+  toolCallCounts: Record<string, number>;
 }
 
 // Final review Fix 3 (Important): what the PRIOR worker attempt (if any)
@@ -549,6 +582,16 @@ export async function orchestrate(engine: Engine, params: OrchestrateParams): Pr
   // for backward compatibility — see finish() below).
   let reviewUsd: number | null = null;
   let escalateUsd: number | null = null;
+  // Task 3: read directly by finish() below via closure, same convention as
+  // workerUsd/reviewUsd/escalateUsd above — set exactly once, right after
+  // buildWorkerContext runs (below), and never changes again for the rest of
+  // this run, so every finish() call site sees the same value without having
+  // to thread it through as its own parameter.
+  let contextBranch: WorkerContextBranch = "none";
+  // Task 3: summed across every worker attempt's own toolCallCounts as the
+  // loop below runs — stays undefined for the whole run when routing
+  // resolves straight to "frontier" (no worker attempt ever executes).
+  let toolCallCounts: Record<string, number> | undefined;
 
   const nextAttemptNumber = (): number => attempts.length + 1;
 
@@ -571,6 +614,8 @@ export async function orchestrate(engine: Engine, params: OrchestrateParams): Pr
       diff,
       diffStat,
       worktree,
+      contextBranch,
+      ...(toolCallCounts !== undefined ? { toolCallCounts } : {}),
       cost: {
         workerUsd,
         reviewUsd,
@@ -621,6 +666,10 @@ export async function orchestrate(engine: Engine, params: OrchestrateParams): Pr
     // engine.log or a notification, same posture as `params.task` and every
     // worker/frontier summary this pipeline handles.
     const workerContext = buildWorkerContext(harness);
+    // Task 3: the outer `contextBranch` closure var finish() reads — set
+    // once, here, immediately alongside the (unrelated) progress notify that
+    // already carries this same branch name.
+    contextBranch = workerContext.branch;
     progress(engine, "load", `worker context: ${workerContext.branch}`, params.runId);
 
     const maxWorkerAttempts =
@@ -685,6 +734,11 @@ export async function orchestrate(engine: Engine, params: OrchestrateParams): Pr
           throw err;
         }
         workerUsd = addCost(workerUsd, workerResult.costUsd);
+        // Task 3: every worker attempt's own tally is folded into the
+        // run-wide total here, regardless of whether this attempt's diff
+        // ends up empty/rejected below — a worker can make real tool calls
+        // (reads, bash) without ever producing a diff.
+        toolCallCounts = mergeToolCallCounts(toolCallCounts, workerResult.toolCallCounts);
         // Tentatively tracked as soon as it's known to exist — see the
         // `lastWorktree` doc comment above.
         lastWorktree = workerResult.worktree;

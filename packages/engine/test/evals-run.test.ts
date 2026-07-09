@@ -14,6 +14,7 @@ import type { CostMeter } from "../src/models/meter.js";
 import { goldenTaskFromCommit, synthEvalTask, type EvalTask } from "../src/evals/tasks.js";
 import { runEvals } from "../src/evals/run.js";
 import { RpcMethodError } from "../src/rpc/errors.js";
+import { readRuns } from "../src/runs/ledger.js";
 
 // Fixture literal only — must never appear outside test files (mirrors
 // orchestrate.test.ts's identical TEST_API_KEY constant/rationale).
@@ -1476,6 +1477,29 @@ describe("engine.evals.run (RPC wire layer) — golden task descriptors", () => 
     // 1 task never clears the sample-size gate, regardless of quality.
     expect(report.verdict).toBe("inconclusive");
     expect(harnessStatus(dir).evals).toBe("pending");
+
+    // Task 4 (run ledger write point): engine.evals.run's own RPC handler
+    // records exactly one "evals" run, on success, whose verdict/taskCount
+    // mirror the report this call actually returned -- and whose perTask
+    // entries carry NO baselineUsd/harnessUsd keys (spec §3 drops per-task
+    // USD from the ledger).
+    const { records } = readRuns(dir, { kind: "evals" });
+    expect(records).toHaveLength(1);
+    const record = records[0]!;
+    if (record.kind !== "evals") throw new Error(`expected an "evals" record, got "${record.kind}"`);
+    expect(record.taskCount).toBe(report.taskCount);
+    expect(record.verdict).toBe(report.verdict);
+    expect(record.perTask).toHaveLength(1);
+    expect(record.perTask[0]).not.toHaveProperty("baselineUsd");
+    expect(record.perTask[0]).not.toHaveProperty("harnessUsd");
+    expect(record.perTask[0]).toEqual({
+      id: report.perTask[0]!.id,
+      baselinePassed: report.perTask[0]!.baselinePassed,
+      harnessPassed: report.perTask[0]!.harnessPassed,
+      harnessOutcome: report.perTask[0]!.harnessOutcome,
+      baselineOutcome: report.perTask[0]!.baselineOutcome,
+    });
+    expect(record.durationMs).toBeGreaterThanOrEqual(0);
   });
 
   it("rejects an empty tasks array at the schema level", async () => {

@@ -6,6 +6,7 @@ import { registerCoreMethods } from "./methods.js";
 import { ModelsService, registerModelsMethods } from "./models/methods.js";
 import { OrchestrateService, registerOrchestrateMethods } from "./orchestrate/methods.js";
 import { CancelRegistry, registerCancelMethod } from "./rpc/cancel-registry.js";
+import { RunsService, registerRunsMethods } from "./runs/methods.js";
 import { WikiService, registerWikiMethods } from "./wiki/methods.js";
 import { WorkerService, registerWorkerMethods } from "./worker/methods.js";
 
@@ -30,6 +31,7 @@ export class Engine {
   readonly worker = new WorkerService();
   readonly orchestrate = new OrchestrateService();
   readonly evals = new EvalsService();
+  readonly runs = new RunsService();
   // M7b Task 2: runId (string) -> AbortController, so engine.cancel {runId}
   // can reach whichever sub-operation (worker attempt / review / escalation /
   // eval baseline turn) is currently in flight for that run, however deep it
@@ -46,6 +48,12 @@ export class Engine {
     registerFrontierMethods(this);
     registerHarnessMethods(this);
     registerWorkerMethods(this);
+    // engine.runs.list is a plain read over the run ledger (runs/ledger.ts)
+    // with no dependency on any other service and no git guard (an absent
+    // ledger/dir is a normal empty state) — registered here alongside the
+    // other standalone services, ahead of the two "composes other engine.*
+    // methods" services below.
+    registerRunsMethods(this);
     registerCancelMethod(this);
     // Registered LAST: engine.orchestrate composes engine.worker.run through
     // the dispatcher itself (see orchestrate/orchestrate.ts's header

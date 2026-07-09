@@ -229,6 +229,11 @@ describe("engine.worker.run", () => {
     // content the mock's write_file call actually carried).
     expect(toolCallLog).not.toContain("hello.txt");
     expect(toolCallLog).not.toContain("HELLO FROM WORKER");
+
+    // Task 3 (orchestrate run ledger): the same names+counts-only tally is
+    // ALSO surfaced on the RPC result itself (not just logged), so
+    // orchestrate.ts can aggregate it across worker attempts.
+    expect(res.result.toolCallCounts).toEqual({ write_file: 1 });
   });
 
   it("engine.worker.cleanup removes the worktree from disk", async () => {

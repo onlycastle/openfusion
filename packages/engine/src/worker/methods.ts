@@ -310,6 +310,12 @@ export function registerWorkerMethods(engine: Engine): void {
         usage: loopResult.usage,
         costUsd,
         worktree: { path: worktree.path, branch: worktree.branch },
+        // Task 3 (orchestrate run ledger): the same names+counts-only tally
+        // logged above, now also surfaced on the RPC result itself so
+        // orchestrate.ts (this method's own in-process caller, via
+        // callEngineMethod) can aggregate it across worker attempts without
+        // re-deriving it from the log line.
+        toolCallCounts,
       };
     } catch (err) {
       // The worktree (and any partial edits already on disk) is

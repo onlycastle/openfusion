@@ -20,6 +20,7 @@ import { RpcErrorCodes } from "@openfusion/shared";
 import type { Engine } from "../engine.js";
 import { RpcMethodError } from "../rpc/errors.js";
 import { registerMethod } from "../rpc/register.js";
+import { recordRun } from "../runs/ledger.js";
 import { goldenTaskFromCommit, type EvalTask } from "./tasks.js";
 import { runEvals, type EvalsReportCard } from "./run.js";
 
@@ -60,6 +61,11 @@ export function registerEvalsMethods(engine: Engine): void {
         throw new RpcMethodError(RpcErrorCodes.SERVER_ERROR, `failed to construct golden task: ${message}`);
       }
 
+      // Task 4 (run ledger write point): captured immediately before
+      // runEvals itself runs (the brief's own placement) -- durationMs below
+      // measures this WHOLE eval run, mirroring orchestrate/methods.ts's own
+      // startedAt capture in front of its own pipeline call.
+      const startedAt = Date.now();
       const report: EvalsReportCard = await runEvals(engine, {
         projectDir: params.projectDir,
         tasks,
@@ -70,6 +76,46 @@ export function registerEvalsMethods(engine: Engine): void {
         `evals.run ${params.projectDir}: verdict=${report.verdict} taskCount=${report.taskCount} ` +
           `savingsPct=${report.savingsPct ?? "null"}`,
       );
+
+      // Recorded on SUCCESS only -- unlike engine.orchestrate's own write
+      // point (orchestrate/methods.ts), this handler deliberately mirrors NO
+      // error-path record. A thrown runEvals (a guard failure, a genuine
+      // engine.cancel-driven cancellation — see run.ts's own cancelled-error
+      // wrapping — or an unclassified infra crash) produced no report card
+      // at all: there is no verdict, no taskCount, no perTask outcomes, no
+      // pricingConfidence — nothing trustworthy this handler could summarize
+      // the way engine.orchestrate's own error record summarizes a thrown
+      // orchestrate() via a coarse, content-free errorCategory. AWAITED for
+      // the same settled-before-response reason as every other ledger write
+      // point (recordRun's own doc comment): a client calling
+      // engine.runs.list right after this RPC must see the eval it just ran.
+      await recordRun(engine, params.projectDir, {
+        v: 1,
+        kind: "evals",
+        at: new Date().toISOString(),
+        taskCount: report.taskCount,
+        verdict: report.verdict,
+        savingsPct: report.savingsPct,
+        cleanSavingsPct: report.cleanSavingsPct,
+        qualityHeld: report.qualityHeld,
+        qualityGapWithinNoise: report.qualityGapWithinNoise,
+        pricingConfidence: report.pricingConfidence,
+        measurementFailureCount: report.measurementFailureCount,
+        // Per-task USD deliberately dropped (spec §3) -- only the pass/fail
+        // + outcome shape a weakness-mining pass would need, never the
+        // dollar figures.
+        perTask: report.perTask.map(({ id, baselinePassed, harnessPassed, harnessOutcome, baselineOutcome }) => ({
+          id,
+          baselinePassed,
+          harnessPassed,
+          harnessOutcome,
+          baselineOutcome,
+        })),
+        note: report.note,
+        durationMs: Date.now() - startedAt,
+        ...(params.runId !== undefined ? { runId: params.runId } : {}),
+      });
+
       return report;
     } finally {
       if (runId !== undefined) engine.cancelRegistry.deregister(runId);

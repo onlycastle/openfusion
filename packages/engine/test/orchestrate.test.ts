@@ -17,6 +17,8 @@ import type { AgentDef, HarnessBundle, Routing, WikiPage } from "../src/harness/
 import { CARD_SLUG } from "../src/harness/schema.js";
 import { writeHarness } from "../src/harness/store.js";
 import type { CostMeter } from "../src/models/meter.js";
+import { orchestrate } from "../src/orchestrate/orchestrate.js";
+import { readRuns } from "../src/runs/ledger.js";
 
 // Fixture literal only — must never appear outside test files.
 const TEST_API_KEY = "sk-test-fixture-never-real-1234567890";
@@ -841,7 +843,15 @@ describe("engine.orchestrate — worker context injection swap (Task 6, ETH anti
   async function runAndCapture(
     pages: WikiPage[],
     card: "draft" | "approved" | undefined,
-  ): Promise<{ run: { task: string; wikiDigest?: string }; progressDetails: string[] }> {
+  ): Promise<{
+    run: { task: string; wikiDigest?: string };
+    progressDetails: string[];
+    // Task 3: OrchestrateResult.contextBranch off the SAME call — asserted
+    // alongside the pre-existing progress-notification/wikiDigest checks
+    // below so each of the three branches is pinned on the RETURNED result
+    // too, not just the notification/worker-param side effects.
+    contextBranch: string;
+  }> {
     dir = makeRepo();
     await writeTestHarness(dir, { pages, card });
     const notifications: Array<{ method: string; params: unknown }> = [];
@@ -861,11 +871,11 @@ describe("engine.orchestrate — worker context injection swap (Task 6, ETH anti
       .filter((n) => n.method === "orchestrate.progress")
       .map((n) => (n.params as { detail: string }).detail);
 
-    return { run: capturedRuns[0]!, progressDetails };
+    return { run: capturedRuns[0]!, progressDetails, contextBranch: res.result.contextBranch };
   }
 
   it("approved card present -> only the card digest reaches the worker; branch 'approved-card'", async () => {
-    const { run, progressDetails } = await runAndCapture([CARD_PAGE, ARCH_PAGE], "approved");
+    const { run, progressDetails, contextBranch } = await runAndCapture([CARD_PAGE, ARCH_PAGE], "approved");
 
     expect(run.wikiDigest).toContain(CARD_DIGEST);
     expect(run.wikiDigest).toContain("## Project card");
@@ -874,10 +884,11 @@ describe("engine.orchestrate — worker context injection swap (Task 6, ETH anti
     expect(run.task).not.toContain(CARD_DIGEST);
 
     expect(progressDetails).toContain("worker context: approved-card");
+    expect(contextBranch).toBe("approved-card");
   });
 
   it("draft card + a build-and-test page -> the build-and-test digest reaches the worker, not the card; branch 'build-and-test-fallback'", async () => {
-    const { run, progressDetails } = await runAndCapture([CARD_PAGE, BUILD_AND_TEST_PAGE], "draft");
+    const { run, progressDetails, contextBranch } = await runAndCapture([CARD_PAGE, BUILD_AND_TEST_PAGE], "draft");
 
     expect(run.wikiDigest).toContain(BT_DIGEST);
     expect(run.wikiDigest).toContain("## Project knowledge (from the harness wiki)");
@@ -885,15 +896,17 @@ describe("engine.orchestrate — worker context injection swap (Task 6, ETH anti
     expect(run.task).not.toContain(BT_DIGEST);
 
     expect(progressDetails).toContain("worker context: build-and-test-fallback");
+    expect(contextBranch).toBe("build-and-test-fallback");
   });
 
   it("no card, no build-and-test page (legacy harness) -> no worker context at all; branch 'none'", async () => {
-    const { run, progressDetails } = await runAndCapture([ARCH_PAGE], undefined);
+    const { run, progressDetails, contextBranch } = await runAndCapture([ARCH_PAGE], undefined);
 
     expect(run.wikiDigest).toBeUndefined();
     expect(run.task).not.toContain("## Project");
 
     expect(progressDetails).toContain("worker context: none");
+    expect(contextBranch).toBe("none");
   });
 
   // Final review Fix 6 (seam test): every test above writes the manifest's
@@ -930,6 +943,191 @@ describe("engine.orchestrate — worker context injection swap (Task 6, ETH anti
     expect(capturedRuns[0]!.wikiDigest).toContain(CARD_DIGEST);
     expect(capturedRuns[0]!.wikiDigest).toContain("## Project card");
     expect(capturedRuns[0]!.wikiDigest).not.toContain(ARCH_DIGEST);
+    expect(res.result.contextBranch).toBe("approved-card");
+  });
+});
+
+// Task 3: engine.orchestrate's own run-ledger write point (runs/ledger.ts's
+// recordRun, AWAITED by the handler — see the settled-before-response pins
+// below). Dispatches THROUGH the real RPC dispatcher (not a direct
+// orchestrate() call) since the write point lives in
+// orchestrate/methods.ts's handler, not in orchestrate.ts's own pipeline —
+// evals/run.ts's nested orchestrate() calls bypass this handler entirely
+// and are therefore never recorded (see that write point's own doc
+// comment).
+describe("engine.orchestrate — run ledger write point (Task 3)", () => {
+  const CARD_DIGEST_MARKER = "LEDGER-CARD-DIGEST-MARKER";
+  const LEDGER_CARD_PAGE: WikiPage = {
+    slug: CARD_SLUG,
+    title: "Project Card",
+    digest: CARD_DIGEST_MARKER,
+    body: "# Project Card\n",
+  };
+
+  it("records exactly one orchestrate record with contextBranch/reviews/workerModel/durationMs; never carries the task text or an attempt summary (content pin)", async () => {
+    dir = makeRepo();
+    await writeTestHarness(dir, { failuresBeforeFrontier: 2, pages: [LEDGER_CARD_PAGE], card: "approved" });
+    engine = createEngine();
+    engine.models.registry.configure({ id: "p1", kind: "deepseek", apiKey: TEST_API_KEY });
+
+    // A distinctive task string and two distinctive per-attempt summary
+    // strings — the content pin below asserts NONE of these ever reach the
+    // serialized ledger record.
+    const TASK_TEXT = "UNIQUE-TASK-MARKER-XYZ";
+    const SUMMARY_MARKER_1 = "ATTEMPT-1-SUMMARY-MARKER-XYZ";
+    const SUMMARY_MARKER_2 = "ATTEMPT-2-SUMMARY-MARKER-XYZ";
+    let step = 0;
+    engine.models.registry.setTestModel(
+      "p1",
+      new MockLanguageModelV4({
+        doGenerate: async () => {
+          step++;
+          if (step === 1) return toolCallStep("attempt1.txt", "first try");
+          if (step === 2) return textStep(SUMMARY_MARKER_1);
+          if (step === 3) return toolCallStep("attempt2.txt", "second try");
+          return textStep(SUMMARY_MARKER_2);
+        },
+      }),
+    );
+    engine.frontier.registerAdapter(
+      makeFakeFrontierAdapter({
+        reviewVerdicts: [
+          { decision: "request-changes", reasons: ["needs a null check"], severity: "minor" },
+          { decision: "approve", reasons: [], severity: "none" },
+        ],
+      }),
+    );
+
+    const res = await call(engine, "engine.orchestrate", { projectDir: dir, task: TASK_TEXT });
+    expect(res.error).toBeUndefined();
+    expect(res.result.outcome).toBe("worker-approved");
+    expect(res.result.contextBranch).toBe("approved-card");
+    expect(res.result.toolCallCounts).toEqual({ write_file: 2 });
+
+    // Read IMMEDIATELY — no polling. The write point AWAITS recordRun
+    // (orchestrate/methods.ts), so the append has settled before the RPC
+    // response resolves; this line deliberately pins that
+    // settled-before-response contract. It matters beyond read-after-write
+    // UX: an unawaited (fire-and-forget) append here once kept running on
+    // the libuv threadpool PAST the response, racing this suite's own
+    // afterEach rmSync teardown — re-creating .openfusion/cache mid-walk
+    // and flaking unrelated tests in this file with ENOTEMPTY.
+    const { records } = readRuns(dir);
+    expect(records).toHaveLength(1);
+
+    const record = records[0]!;
+    if (record.kind !== "orchestrate") throw new Error(`expected an "orchestrate" record, got "${record.kind}"`);
+    expect(record.outcome).toBe("worker-approved");
+    expect(record.contextBranch).toBe("approved-card");
+    expect(record.workerModel).toBe("deepseek-v4-flash");
+    expect(record.taskClass).toBe("codegen");
+    expect(record.agent).toBe("codegen-worker");
+    expect(record.attempts).toBe(2);
+    expect(record.escalated).toBe(false);
+    expect(record.durationMs).toBeGreaterThanOrEqual(0);
+    expect(record.reviews).toEqual([
+      { decision: "request-changes", reasons: ["needs a null check"] },
+      { decision: "approve", reasons: [] },
+    ]);
+    expect(record.toolCallCounts).toEqual({ write_file: 2 });
+
+    // The content pin: the record's own content-line rule (runs/ledger.ts's
+    // header comment) — task text, attempt summaries, and the card digest
+    // itself must never appear in the serialized record.
+    const serialized = JSON.stringify(record);
+    expect(serialized).not.toContain(TASK_TEXT);
+    expect(serialized).not.toContain(SUMMARY_MARKER_1);
+    expect(serialized).not.toContain(SUMMARY_MARKER_2);
+    expect(serialized).not.toContain(CARD_DIGEST_MARKER);
+  });
+
+  it("error path: dispatching against a projectDir with no harness records one 'error' outcome with errorCategory 'no-harness'", async () => {
+    dir = makeRepo();
+    engine = createEngine();
+
+    const res = await call(engine, "engine.orchestrate", { projectDir: dir, task: "do something" });
+    expect(res.result).toBeUndefined();
+    expect(res.error.code).toBe(RpcErrorCodes.SERVER_ERROR);
+    expect(res.error.message).toContain("no harness");
+
+    // Immediate read — same settled-before-response pin as the success-path
+    // test above: the error record too must be durable by the time the RPC
+    // rejection reaches the caller.
+    const { records } = readRuns(dir);
+    expect(records).toHaveLength(1);
+
+    const record = records[0]!;
+    if (record.kind !== "orchestrate") throw new Error(`expected an "orchestrate" record, got "${record.kind}"`);
+    expect(record.outcome).toBe("error");
+    expect(record.errorCategory).toBe("no-harness");
+    expect(record.taskClass).toBe("unknown");
+    expect(record.agent).toBe("unknown");
+    expect(record.workerModel).toBe("unknown");
+    expect(record.attempts).toBe(0);
+    expect(record.escalated).toBe(false);
+    expect(record.reviews).toEqual([]);
+    expect(record.contextBranch).toBe("none");
+  });
+
+  // Final-review Fix 3: the ledger append itself can fail (disk full,
+  // permission error, ENOTDIR — anything appendRun's mkdir/appendFile or its
+  // Fix-1 ensureGitignoreGuard call can throw) on an orchestrate run that
+  // otherwise SUCCEEDED. `recordRun`'s never-rejects contract must hold even
+  // then: the RPC still resolves with its normal result, and the failure is
+  // only ever visible as a single kind-only engine.log line.
+  it("a ledger append failure during a SUCCESSFUL orchestrate still resolves the RPC, and logs the append-failed line", async () => {
+    dir = makeRepo();
+    await writeTestHarness(dir);
+    const logs: string[] = [];
+    engine = createEngine({ log: (m) => logs.push(m) });
+    engine.models.registry.configure({ id: "p1", kind: "deepseek", apiKey: TEST_API_KEY });
+    engine.models.registry.setTestModel("p1", makeWorkerMock("hello.txt", "hi", "done"));
+    engine.frontier.registerAdapter(
+      makeFakeFrontierAdapter({ reviewVerdicts: [{ decision: "approve", reasons: [], severity: "none" }] }),
+    );
+
+    // Force appendRun's own mkdir to fail WITHOUT taking the harness fixture
+    // down with it: writeTestHarness's manifest.json/wiki/agents/routing.yaml
+    // all live directly under `.openfusion/`, so making `.openfusion` itself
+    // a non-directory (the mechanism runs-ledger.test.ts's unit-level fs
+    // failure test uses) would make loadHarness fail too, which is a
+    // different, uninteresting failure mode. Instead, make `.openfusion/cache`
+    // — a sibling appendRun creates on demand, never touched by writeHarness
+    // — a FILE. Fix 1's ensureGitignoreGuard call (targeting `.openfusion`
+    // itself, still a real directory here, already carrying the
+    // `.gitignore` writeTestHarness wrote) runs first and succeeds; only the
+    // `mkdir(dirname(runs.jsonl))` call just past it hits the FILE and fails.
+    writeFileSync(path.join(dir, ".openfusion", "cache"), "not a directory");
+
+    const res = await call(engine, "engine.orchestrate", { projectDir: dir, task: "add hello.txt" });
+    expect(res.error).toBeUndefined();
+    expect(res.result.outcome).toBe("worker-approved");
+
+    expect(logs).toContain("run-ledger: append failed (orchestrate)");
+  });
+
+  it("evals-internal orchestrate() calls (bypassing the RPC dispatcher) are never written to the ledger", async () => {
+    // Regression guard for the "evals excluded" contract: calling the plain
+    // orchestrate() pipeline function directly — exactly what
+    // evals/run.ts's runHarnessTask does — must leave the ledger untouched,
+    // since the write point lives in orchestrate/methods.ts's RPC handler,
+    // not in orchestrate() itself.
+    dir = makeRepo();
+    await writeTestHarness(dir);
+    engine = createEngine();
+    engine.models.registry.configure({ id: "p1", kind: "deepseek", apiKey: TEST_API_KEY });
+    engine.models.registry.setTestModel("p1", makeWorkerMock("hello.txt", "hi", "done"));
+    engine.frontier.registerAdapter(
+      makeFakeFrontierAdapter({ reviewVerdicts: [{ decision: "approve", reasons: [], severity: "none" }] }),
+    );
+
+    const result = await orchestrate(engine, { projectDir: dir, task: "add hello.txt" });
+    expect(result.outcome).toBe("worker-approved");
+
+    // Give any (incorrectly present) fire-and-forget write a moment to land
+    // before asserting it never did.
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(readRuns(dir).records).toHaveLength(0);
   });
 });
 

@@ -666,6 +666,76 @@ input[type="checkbox"] {
   background: var(--sunk);
 }
 
+/* -------------------------------------------------------------- evals history -- */
+/* Compact past-verdicts strip (Task 5) — same bordered-row-list shape as
+   `.key-list`/`.orchestrator-list` above, colored with the SAME semantic
+   tokens `.verdict-banner-{pass,fail,inconclusive}` already use, so a glance
+   down the list reads with the identical pass/fail/inconclusive vocabulary
+   as the report card above it. */
+.evals-history-list {
+  list-style: none;
+  margin: 8px 0;
+  padding: 0;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  overflow: hidden;
+}
+.evals-history-row {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 9px 12px;
+  background: var(--panel);
+  font-family: var(--mono);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+.evals-history-row + .evals-history-row {
+  border-top: 1px solid var(--line);
+}
+.evals-history-date {
+  color: var(--ink-2);
+  flex-shrink: 0;
+}
+.evals-history-savings {
+  margin-left: auto;
+  color: var(--ink);
+}
+.evals-history-tasks {
+  color: var(--ink-2);
+}
+.evals-history-verdict-pass {
+  background: var(--pass-bg);
+  color: var(--pass-fg);
+  border-color: var(--pass-line);
+}
+.evals-history-verdict-fail {
+  background: var(--fail-bg);
+  color: var(--fail-fg);
+  border-color: var(--fail-line);
+}
+.evals-history-verdict-inconclusive {
+  background: var(--caveat-bg);
+  color: var(--caveat-fg);
+  border-color: var(--caveat-line);
+}
+
+/* ------------------------------------------------------- recent outcomes -- */
+/* OrchestrateScreen's compact recent-outcomes row (Task 6) — a horizontal
+   strip of the last few ledger records as `OutcomeBadge` chips, sitting
+   directly above the composer. Deliberately terser than the evals-history
+   list above (no savings figure/task count here, just the outcome pill
+   plus a taskClass/time tooltip on hover). */
+.recent-runs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 0 0 10px;
+}
+.recent-run-chip {
+  cursor: help;
+}
+
 /* --------------------------------------------------------- telemetry strip -- */
 
 .status-bar {

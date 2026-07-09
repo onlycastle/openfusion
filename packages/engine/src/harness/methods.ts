@@ -4,6 +4,7 @@ import type { Engine } from "../engine.js";
 import { RpcMethodError } from "../rpc/errors.js";
 import { resolveProjectKey } from "../rpc/guards.js";
 import { registerMethod } from "../rpc/register.js";
+import { recordRun } from "../runs/ledger.js";
 import { HarnessGenError } from "./driver.js";
 import { exportHarness } from "./exporters.js";
 import { generateHarness, type GenerateHarnessResult } from "./generate.js";
@@ -128,9 +129,36 @@ export class HarnessService {
 
 export function registerHarnessMethods(engine: Engine): void {
   registerMethod(engine.dispatcher, "engine.harness.generate", ProjectParamsSchema, async ({ projectDir }) => {
+    // Task 4 (run ledger write point): captured before the pipeline runs, so
+    // durationMs below measures this whole RPC call, mirroring
+    // orchestrate/methods.ts's own startedAt capture.
+    const startedAt = Date.now();
     try {
       const result = await engine.harness.generate(engine, projectDir);
       engine.log(`harness.generate ${projectDir}: ${result.pages} pages, ${result.agents} agents`);
+      // Recorded on SUCCESS only, after generation's own success point — a
+      // failed generation writes nothing to disk at all (generateHarness's
+      // own "write"-stage structural gate), so there is nothing to
+      // summarize on failure. AWAITED for the same settled-before-response
+      // reason as every other ledger write point (recordRun's own doc
+      // comment): a client calling engine.runs.list right after
+      // engine.harness.generate must see this generation.
+      await recordRun(engine, projectDir, {
+        v: 1,
+        kind: "generate",
+        at: new Date().toISOString(),
+        pages: result.pages,
+        agents: result.agents,
+        estimatedCostUsd: result.estimatedCostUsd,
+        // Re-reads manifest.json fresh off disk (just written by
+        // writeHarness inside engine.harness.generate above) rather than
+        // trusting any headSha this handler might otherwise cache —
+        // "unknown" is a defensive fallback that should be unreachable
+        // immediately after a successful generate.
+        headSha: harnessStatus(projectDir).headSha ?? "unknown",
+        cardStripped: result.cardStripped,
+        durationMs: Date.now() - startedAt,
+      });
       return result;
     } catch (err) {
       // HarnessGenError (driver.ts, or thrown directly by generateHarness's
@@ -325,6 +353,12 @@ export function registerHarnessMethods(engine: Engine): void {
         bundle.manifest.verification.card = "draft";
       });
     });
+    // Task 4 (run ledger write point): recorded ONLY after the serialized
+    // write above has actually succeeded — a thrown error (the
+    // approval-gate-bypass guard, "no project card", or a validateHarness
+    // failure) propagates out of serializeWrite and this line is never
+    // reached. AWAITED per recordRun's own settled-before-response contract.
+    await recordRun(engine, projectDir, { v: 1, kind: "card", at: new Date().toISOString(), action: "update" });
     return { updated: true };
   });
 
@@ -364,6 +398,11 @@ export function registerHarnessMethods(engine: Engine): void {
       }
       await setCardState(projectDir, "approved");
     });
+    // Task 4 (run ledger write point): recorded ONLY after the serialized
+    // write above has actually succeeded — see engine.harness.card.update's
+    // identical write point above for why a thrown error never reaches this
+    // line. AWAITED per recordRun's own settled-before-response contract.
+    await recordRun(engine, projectDir, { v: 1, kind: "card", at: new Date().toISOString(), action: "approve" });
     return { approved: true };
   });
 }
