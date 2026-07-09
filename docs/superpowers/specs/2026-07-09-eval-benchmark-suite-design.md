@@ -1,225 +1,249 @@
-# Eval Benchmark Suite v1: Verified Golden-Task Mining + Bench CLI — Design
+# Eval Benchmark Suite v1: SWE-bench Verified Mini + Bench CLI — Design
 
 **Date:** 2026-07-09 · **Status:** approved, awaiting implementation plan
+**Supersedes:** the same-day first draft (mined-OSS-repo golden tasks). The user's
+direction: benchmark against a **public dataset**, not a self-curated exam. The
+run-side structure (paired arms, cost metering, verdict, CLI) carries over; the
+task-supply and scoring halves are replaced.
 **Purpose decision (user-locked):** validate the product's core claim — harness
-orchestration holds quality while cutting cost, measured by the existing M6/M6.1
-eval gate — with a real, reproducible **30-task** suite mined from **pinned
-external OSS repos**.
+orchestration holds quality while cutting cost vs a direct frontier baseline —
+on tasks nobody can accuse us of writing ourselves, with numbers additionally
+comparable to public leaderboards.
 
 ## 1. Problem
 
 The measurement machinery is finished; the benchmark is not. `runEvals`
 (`packages/engine/src/evals/run.ts`, hardened in M6.1) issues a two-dimensional
-quality+cost verdict, requires ≥20 tasks for a savings PASS, and guards against
-noise and measurement failures. But its input — `EvalTask[]` built from
-`{commitSha, testCommand}` descriptors — has no supply line:
+quality+cost verdict with task floors and noise guards — but nothing supplies
+it trusted tasks, and its repo-tests oracle (`runOracle`) is the wrong oracle
+for a public benchmark: SWE-bench instances are scored by a *hidden* test patch
+applied inside a pinned Docker environment, not by whatever tests sit in the
+worktree. A self-mined task suite would also invite "you wrote your own exam"
+criticism and produce numbers comparable to nothing.
 
-- Task selection is explicitly the **caller's** responsibility
-  (`tasks.ts` v1 scope constraint): a golden commit must be a *pure
-  fail-to-pass fix against tests that already existed at the parent commit*.
-  Nothing enforces or discovers this today; a hand-picked commit that violates
-  it silently corrupts the pass-rate.
-- The only trigger is the desktop RPC (`engine.evals.run`) with hand-typed
-  SHAs. There is no curated suite, no reproducible manifest, no script.
-- OpenFusion's own history is heavily TDD (tests land with fixes), so it
-  cannot supply 20+ valid golden commits — hence external repos.
+## 2. Dataset (user-locked)
 
-## 2. Design at a glance
+**SWE-bench Verified Mini** (HuggingFace: `MariusHobbhahn/swe-bench-verified-mini`):
+a canonical 50-instance subset of SWE-bench Verified (500 human-validated real
+GitHub issues across ~12 Python repos), selected to preserve the full set's
+difficulty/pass-rate distribution, with its own public leaderboard (Princeton
+HAL). Why it fits:
 
-The benchmark is a **composition layer over existing, tested primitives**
-(`goldenTaskFromCommit`, `runOracle`, `runEvals`, `engine.harness.generate`).
-The verdict engine, RPC surface, and desktop app are untouched.
+- **Canonical, pinned, small.** No invented sampling; ~5GB of eval images vs
+  130GB for full Verified; 50 instances comfortably clears the existing
+  20-task verdict floor.
+- **Repo-level agentic tasks** — exercises repo analysis, wiki retrieval, and
+  routing, unlike function-level datasets (HumanEval et al.).
+- **All-Python** — a deliberately hard generality test for a TS-first product
+  (§8, caveat 1).
+
+The dataset snapshot (instance ids + fields used) is vendored into
+`benchmarks/swe-bench-verified-mini.json` at implementation time, so runs
+never depend on HuggingFace availability and the exam is git-sealed in-repo.
+
+## 3. Design at a glance
+
+The benchmark produces **patches**; the official harness produces truth;
+OpenFusion's verdict math turns paired truth + metered cost into the product
+claim.
 
 ```
-pinned OSS repos ──► bench mine ──► verified candidates ──► human curation
-                     (local CPU only,                            │
-                      empirical fail→pass)                       ▼
-                                                   benchmarks/suite-v1.json
-                                                   (committed, git-sealed)
-                                                                 │
-real keys (env + subscription OAuth) ──► bench run ──► runEvals (unchanged)
-                                         │                       │
-                          clone @ pinned SHA,                    ▼
-                          frozen install,          benchmarks/results/<run-id>.json
-                          harness gen +                        + .md summary
-                          terminal card approval
+SWE-bench Verified Mini (50 pinned instances, ~10 Python repos)
+        │
+  bench prepare: clone each repo, generate harness ONCE PER REPO,
+                 card approval = interactive terminal gate
+        │
+  bench run: per instance, TWO metered arms on identical checkouts
+        ├── baseline arm: direct frontier turn  → patch A
+        └── harness arm:  full orchestrate loop → patch B
+        │
+  two predictions.jsonl files ──► official scoring: sb-cli (cloud)
+                                  or local Docker harness (fallback)
+        │
+  bench report: ① resolved-rate per arm (externally comparable)
+                ② M6.1 two-dimensional cost/quality verdict computed
+                   over official resolved-status + metered USD
 ```
 
-## 3. Components
+New code lives in `packages/engine/src/evals/bench/` plus a second `bin`
+(`openfusion-bench`). Desktop app and RPC surface untouched.
 
-All new code lives in `packages/engine/src/evals/bench/` plus one committed
-data file and a second `bin` entry in the engine package.
+## 4. Components
 
-### 3.1 Miner (`mine.ts`)
+### 4.1 Dataset module (`dataset.ts`)
 
-Finds golden commits **empirically**, so every task in the suite is
-machine-verified fail→pass. Two stages:
+Loads and zod-validates the vendored instance file. Per instance it exposes:
+`instance_id`, `repo`, `base_commit`, `problem_statement`, plus the fields the
+predictions file needs. The hidden test patch is deliberately **not** consumed
+by the run pipeline — agents must never see it (that would be answer leakage;
+scoring alone uses it, inside the official harness).
 
-1. **Cheap deterministic filters** (no test execution): non-merge commits
-   whose diff touches source files and adds **no new test files** (the
-   golden-task constraint — a commit that ships its own test leaves the parent
-   state without that test). Bounded diff size. Commits that only touch
-   docs/config are skipped.
-2. **Empirical verification** per surviving candidate: build the parent-state
-   tree (reusing `goldenTaskFromCommit(...).setup`), run the repo's install
-   command, run the test command → **must fail** (nonzero exit — an ENOENT or
-   install error discards the candidate as a setup problem, mirroring
-   `runOracle`'s ENOENT-vs-nonzero distinction); rebuild at the fix commit →
-   **must pass**. Only commits that demonstrably flip fail→pass are emitted.
+### 4.2 Prepare (`prepare.ts`) — idempotent, one-time per machine
 
-Output: a candidate report (commit sha, subject, diff stats, test runtime) for
-human curation. Mining costs zero API tokens — it is git + local test runs.
+1. Clone each distinct repo into `~/.openfusion/bench/<repo>/` (outside any
+   source repo, per `tasks.ts`'s security note on eval directories).
+2. **Harness generation once per repo**, at that repo's most recent instance
+   `base_commit`, reused across the repo's instances (~10 generations, not
+   50). Approximation accepted for v1: card content (build/test commands,
+   invariants) is the stable-per-repo layer; per-instance regeneration is a
+   v2 refinement if per-repo cards prove stale on old base commits.
+3. **Card approval is a mandatory interactive terminal gate**: the CLI prints
+   each drafted card digest and requires an explicit `y` before approving via
+   the same `HarnessService` path the desktop uses. No `--yes` flag; the
+   human gate is relocated, never bypassed.
+4. Best-effort per-instance Python env provisioning with `uv` (see §8
+   caveat 2): create the venv, editable-install the repo. Failure to
+   provision is recorded but does not exclude the instance — agents can still
+   patch without running tests locally.
 
-Flaky-suite immunity falls out for free: a commit whose fail→pass cannot be
-reproduced deterministically in one verification pass never enters the suite.
+### 4.3 Run (`runner.ts`, `cli.ts`)
 
-### 3.2 Suite manifest (`benchmarks/suite-v1.json`)
+`bench run [--limit N] [--instance <id>]`:
 
-The git-sealed benchmark definition, zod-validated (`manifest.ts`):
+1. Per instance, materialize a fresh checkout at `base_commit` using the
+   SAME history-strip mechanism as `goldenTaskFromCommit` (`tasks.ts`):
+   `git archive` the `base_commit` tree from the prepared clone into a fresh
+   directory + from-scratch `git init`. This matters because the real fix
+   exists in the repo's LATER history — a plain clone reset to `base_commit`
+   would leave the answer one `git log --all` away. The stripped checkout
+   shares no objects/refs with the clone; the fix and hidden test patch are
+   unreachable by construction.
+2. **Baseline arm**: direct frontier turn (same primitive `runEvals` uses)
+   with the `problem_statement` as the task, cwd-pinned to the checkout.
+   Diff the working tree → patch A.
+3. **Harness arm**: copy the repo's approved harness bundle into the
+   checkout (same `writeHarness` mechanism `runEvals` uses), run the full
+   orchestrate loop (route → worker attempts → review → escalate) → patch B.
+4. Both arms metered per instance (existing meter infrastructure); the report
+   records USD per arm per instance.
+5. Emit `predictions-baseline.jsonl` and `predictions-harness.jsonl` in the
+   official format (`instance_id`, `model_name_or_path`, `model_patch`).
 
-```json
-{
-  "suite": "v1",
-  "repos": [
-    {
-      "id": "zod",
-      "gitUrl": "https://github.com/colinhacks/zod.git",
-      "pinnedSha": "<full sha>",
-      "install": ["pnpm", "install", "--frozen-lockfile"],
-      "test": ["pnpm", "test"]
-    }
-  ],
-  "tasks": [
-    { "repo": "zod", "commitSha": "<full sha>", "promptOverride": null }
-  ]
-}
-```
+Arm order per instance is fixed (baseline first) and both arms always run —
+no `--baseline-only`/`--harness-only`: the verdict is only meaningful paired,
+and partial sweeps invite cherry-picking. `--limit` preserves pairing at
+reduced scale.
 
-- **30 tasks** across 2–3 repos (comfortably above the 20-task savings-PASS
-  floor so a few dropped tasks cannot void a sweep).
-- `promptOverride` (optional, default null): the golden prompt is the commit
-  subject (`goldenTaskFromCommit`'s existing behavior); curation may override
-  when a subject is too cryptic to serve as a task statement. Overrides are
-  visible in the committed manifest — no hidden prompt engineering.
-- Repo entries listed above are **illustrative**; final repo picks are made
-  during implementation by mining yield against the selection criteria (§6).
-- Validation rejects duplicate `(repo, commitSha)` pairs and tasks referencing
-  unknown repo ids.
+### 4.4 Scoring (`score.ts`)
 
-### 3.3 Runner + CLI (`runner.ts`, `cli.ts`)
+Default: submit both predictions files via **sb-cli** (official cloud
+evaluation — no local Docker needed on macOS/arm64). Fallback: the official
+local containerized harness behind `--local-docker` for offline use. Scoring
+consumes the run's predictions and returns per-instance resolved status per
+arm. The bench never re-implements the oracle.
 
-A second bin (`openfusion-bench`) beside the sidecar entry. Subcommands:
+### 4.5 Verdict + report (`report.ts`) — one small engine change
 
-- **`bench mine --repo <id> [--max N]`** — stage 1+2 above, prints the
-  candidate report. Repos are declared in the manifest **before** tasks exist
-  (a manifest with repos and an empty `tasks` array is valid); mining reads
-  the repo's `gitUrl`/`pinnedSha`/`install`/`test` from there, so install and
-  test commands are stated exactly once.
-- **`bench run [--limit N] [--task <id>]`** — the measured sweep:
-  1. **Prepare** (idempotent): clone each repo at `pinnedSha` into
-     `~/.openfusion/bench/<repo-id>/` — outside any source repo, per
-     `tasks.ts`'s security note that eval dirs must live away from `repoDir` —
-     then run the frozen install.
-  2. **Harness ensure**: if the clone has no `.openfusion/` harness, run
-     `engine.harness.generate`. Card approval is a **mandatory interactive
-     terminal gate**: the CLI prints the drafted card digest and requires an
-     explicit `y` before approving via the same `HarnessService` path the
-     desktop uses. The human gate is relocated, never bypassed; there is no
-     `--yes` flag for card approval in v1.
-  3. **Task construction**: for each manifest task, build the `EvalTask` via
-     `goldenTaskFromCommit`, then **wrap** its `setup` closure to append the
-     repo's install command (external repos need dependencies inside the
-     history-stripped eval worktree; `EvalTask.setup` being a plain closure
-     means `runEvals` needs no change).
-  4. **Measure**: call `runEvals` in-process with all (or `--limit`ed) tasks.
-  5. **Report**: write `benchmarks/results/<run-id>.json` (full
-     `EvalsReportCard` + per-task table + environment record) and a
-     human-readable `.md` summary (verdict, pass rates, savings %, metered
-     USD). `benchmarks/results/` is gitignored; a summary is committed
-     manually when the user wants to seal a milestone number.
+The M6.1 verdict math (savings-PASS ≥20-task floor, hazard floor, quality
+noise band 0.05, ≥10% cost-regression → fail) is currently embedded in
+`runEvals`. **Extract it into a pure shared function** (inputs: per-task
+`{passedA, passedB, usdA, usdB, measurementFailure}` rows; output: the
+existing verdict/report-card shape). `runEvals` calls the extracted function
+with oracle-sourced rows (behavior identical, its existing tests keep
+guarding the math); the bench calls it with official-resolved-status rows.
+One verdict definition, two oracles.
 
-Engine construction mirrors `main.ts` (`createEngine({log, notify})`), with
-notifications logged to stderr. BYOK worker providers are registered at
-startup from a gitignored JSON file of `ProviderConfig` entries (same shape
-the desktop registers over RPC), located via the `OPENFUSION_BENCH_PROVIDERS`
-env var — one mechanism, no per-provider env-var sprawl. The frontier
-baseline rides the operator's existing subscription OAuth through the
-embedded engines.
+Report output: `benchmarks/results/<run-id>.json` (per-instance table:
+resolved per arm, USD per arm, outcomes) + a human-readable `.md` summary
+(both arms' resolved-rate vs the public leaderboard context, savings %,
+verdict, metered spend, environment record). `benchmarks/results/` is
+gitignored; summaries are committed manually to seal milestone numbers.
 
-## 4. Error handling
+## 5. Error handling
 
 Guiding rule inherited from M6.1: **infrastructure failures are measurement
 failures, never quality evidence.**
 
-- **Mining:** parent-state test *errors* (ENOENT, install failure, timeout)
-  discard the candidate; they are never counted as the required "fail" leg.
-- **Run setup:** clone/install/harness-generation failures abort **before any
-  API spend**, with the failing phase named in the error.
-- **Per-task infra errors during a sweep:** already handled inside `runEvals`
-  (`"error"` / `"apply-failed"` outcomes are measurement failures). The bench
-  layer adds nothing here.
-- **Floor interaction:** if dropped tasks push a sweep below the 20-task
-  floor, the existing verdict engine already refuses a savings PASS; the
-  summary surfaces this state explicitly rather than re-implementing a guard.
+- **Prepare:** clone/harness-generation failures abort before any per-instance
+  API spend, naming the failing phase. `uv` env-provisioning failure is
+  recorded metadata, not an exclusion.
+- **Run:** a per-instance arm error (frontier turn threw, orchestrate threw,
+  empty diff produced by an error path) marks that instance's row as a
+  measurement failure for the extracted verdict function — exactly how
+  `runEvals` treats `"error"`/`"apply-failed"` today. An empty patch that the
+  agent *deliberately* produced still goes to scoring (it will simply not
+  resolve).
+- **Scoring:** sb-cli submission/retrieval failures are retryable without
+  re-running arms — predictions files are durable artifacts; scoring is a
+  separate subcommand (`bench score`) so a scoring hiccup never wastes agent
+  spend.
+- **Floor interaction:** if measurement failures push valid pairs below the
+  20-task floor, the extracted verdict function already refuses a savings
+  PASS; the summary surfaces this explicitly.
 
-## 5. Determinism & reproducibility
+## 6. Determinism & reproducibility
 
-- Pinned full SHAs for repos and task commits; frozen-lockfile installs.
-- The report records Node version, engine version, model roster, and pricing
-  snapshot alongside results.
-- Suite manifest committed in-repo → any future run is the exact same exam.
-- Single-run pass@1 remains the v1 measurement (multi-run significance is a
-  deferred pillar pending user sign-off; see §8).
-
-## 6. Repo selection criteria
-
-Candidate repos must be: TypeScript/JavaScript; test suite fast (<5 min) and
-deterministic; **no network access in tests**; installable offline-ish via a
-committed lockfile at the pinned SHA; rich non-merge history (several hundred
-commits) with fix-shaped commits. 2–3 repos diversify codebase style without
-multiplying install surface. Final picks are an implementation-time decision
-driven by actual mining yield.
+- Vendored dataset snapshot; pinned instance `base_commit`s (from the dataset
+  itself); single-run pass@1 (multi-run significance stays deferred).
+- The report records Node version, engine version, model roster, pricing
+  snapshot, dataset snapshot hash, and sb-cli/harness version.
+- Scoring authority is the official harness — our numbers are comparable to
+  the HAL Verified-Mini leaderboard and directionally to full-Verified
+  numbers (with the subset caveat stated in every summary).
 
 ## 7. Testing & cost controls
 
-**CI-safe tests (no keys, no network):**
-- Miner unit tests against synthetic on-the-fly git fixture repos: a
-  known-good pure fail→pass fix survives; adds-test-with-fix, merge commits,
-  and erroring suites are rejected — asserting exactly which candidates emerge.
-- Manifest schema tests: round-trip, malformed entries, duplicate detection.
-- Runner dry-run: full `bench run` wiring against a `synthEvalTask`-style
-  fixture repo with a stub model layer — workspace layout, setup wrapping,
-  report emission — zero tokens.
+**CI-safe tests (no keys, no network, no Docker):**
+- Dataset module: schema round-trip on a 2-instance fixture; rejection of
+  malformed instances; assertion that the test-patch field is never exposed
+  to run-side types.
+- Verdict extraction: the decisive test is that `runEvals`'s existing suite
+  passes unchanged after the refactor; plus direct unit tests of the pure
+  function on synthetic rows (floors, noise band, cost regression).
+- Runner dry-run: full per-instance flow against a synthetic local fixture
+  repo with a stub model layer — checkout reset, harness copy, predictions
+  format — zero tokens.
+- Scoring module: parses recorded sb-cli response fixtures; never re-derives
+  pass/fail itself.
 
-**Env-gated smoke (real keys, operator-run):** one `OPENFUSION_BENCH_SMOKE=1`
-test running a single task end-to-end, following the existing env-gated
-generate-smoke pattern.
+**Env-gated smoke (real keys, operator-run):** `OPENFUSION_BENCH_SMOKE=1`
+runs ONE instance end-to-end (both arms + sb-cli scoring), following the
+existing env-gated generate-smoke pattern.
 
 **Cost controls:**
-- `--limit N` / `--task <id>` validate plumbing on 2–3 tasks before a full
-  sweep. No `--baseline-only` / `--harness-only` flags: the verdict is only
-  meaningful paired, and partial sweeps invite cherry-picking; `--limit`
-  reduces scale while preserving pairing.
-- Every report prints metered spend (existing meter infrastructure), so a
-  small run extrapolates the cost of a full sweep before you commit to one.
-- Mining and curation are API-free by construction.
+- `--limit N` / `--instance <id>` validate plumbing on 1–3 instances before a
+  50-instance sweep; every report prints metered USD so a small run
+  extrapolates a full sweep's cost.
+- Harness generation is once per repo (~10 total), at prepare time, metered.
+- Scoring via sb-cli is free of model spend; mini's image footprint (~5GB)
+  only matters in the `--local-docker` fallback.
 
-## 8. Non-goals (v1)
+**BYOK/keys:** worker providers registered at startup from a gitignored JSON
+file of `ProviderConfig` entries located via `OPENFUSION_BENCH_PROVIDERS`;
+the frontier baseline rides the operator's existing subscription OAuth
+through the embedded engines.
 
-Explicitly out of scope, aligned with the deferred-pending-sign-off list:
-multi-run statistical significance; wiki-on/off ablation arms; difficulty
-stratification; non-JS/TS repos; CI-scheduled sweeps; public benchmark
-adapters (SWE-bench et al. — a different question: model capability, not the
-harness cost/quality claim).
+## 8. Caveats (accepted for v1, stated in every report)
 
-## 9. Open items resolved during design
+1. **Python repos, TS-first product.** Verified is all-Python; the card's
+   deterministic command miner leans on tox/CI configs instead of
+   package.json. This is a deliberate generality stress, not home turf.
+2. **Agents work on plain local checkouts** with best-effort `uv` envs; some
+   instances' tests won't run locally mid-task, so agents get weaker test
+   feedback than container-native setups. Scoring is still always sound (the
+   official Docker oracle is the authority). Container-native worker
+   execution is v2.
+3. **Per-repo (not per-instance) harness generation** — card staleness on old
+   base commits is possible; per-instance generation is the v2 refinement if
+   it shows up in results.
 
-- **Purpose:** validate the core claim (not CI regression, not public
-  numbers, not smoke-only) — user-locked.
-- **Task source:** pinned external OSS repos — user-locked. OpenFusion's own
-  TDD-heavy history cannot reach the task floor.
-- **Scale:** 30 tasks — user-locked.
-- **Approach:** verified-mining CLI over manual curation or SWE-bench
-  adaptation — user-locked.
-- **Card gate:** interactive terminal approval, never auto-approve.
+## 9. Non-goals (v1)
+
+Full 500-instance Verified sweeps; leaderboard submission automation;
+multi-run statistical significance; wiki-on/off ablation arms (both deferred
+pending user sign-off); container-native agent execution; non-SWE-bench
+datasets; CI-scheduled sweeps.
+
+## 10. Decisions resolved during design
+
+- **Purpose:** validate the core claim, with externally comparable numbers —
+  user-locked.
+- **Task source:** public dataset, not self-mined OSS repos — user-locked
+  (supersedes the first draft).
+- **Dataset:** SWE-bench Verified Mini (50, canonical subset) — user-locked.
+- **Scoring:** official harness only; sb-cli cloud default, local Docker
+  fallback. The bench never re-implements the oracle.
+- **Verdict:** M6.1 math extracted to a pure shared function; one verdict
+  definition across both oracles.
+- **Card gate:** interactive terminal approval, never auto.
 - **Workspace:** `~/.openfusion/bench/`, outside any source repo.
