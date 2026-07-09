@@ -352,7 +352,7 @@ commented out pending empirical verification against a signed build.
   `Contents/Resources/assets/{better_sqlite3.node,wasm/*.wasm,queries/**}`
   exactly as expected, and launching that `.app` directly showed the engine
   sidecar spawning from the packaged path and exiting cleanly (no orphan) on
-  quit — see `.superpowers/sdd/m8-task-2-report.md` for the full account.
+  quit.
 - **Nested code signing — DONE (M8 Task 3).** `scripts/presign-sidecar-assets.mjs`
   runs automatically as `tauri.conf.json`'s `beforeBundleCommand`: it finds
   every Mach-O under the staged, triple-less `binaries/openfusion-engine.assets/`

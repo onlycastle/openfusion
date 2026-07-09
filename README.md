@@ -1,383 +1,309 @@
-# OpenFusion (working name)
+# OpenFusion
 
-Open-source macOS app that analyzes your repo with a frontier model and
-generates a dedicated multi-model harness: an LLM wiki, specialist agents,
-and a cost-optimizing routing policy — frontier orchestration, open-model
-workers.
+OpenFusion is an open-source macOS app and local engine for building an
+AI coding harness around a repository.
 
-- Design spec: `docs/superpowers/specs/2026-07-03-harness-fusion-app-design.md`
-- Roadmap: `docs/superpowers/plans/2026-07-03-roadmap.md`
-- Landscape research: `docs/research/2026-07-03-oss-landscape.md`
+It indexes your codebase, asks a frontier model to generate project-specific
+working knowledge, then uses that knowledge to route coding tasks to cheaper
+worker models with frontier review before anything is applied.
 
-Status: the engine indexes TypeScript/JavaScript/Python/Go/Rust/Java git
-repositories into a per-project symbol store, serves a token-budgeted
-PageRank repo map, and exposes `wiki_query`/`wiki_map` to MCP clients over
-loopback HTTP (M1b complete). Frontier sessions now exist (M3) over a
-concurrency-bounded RPC protocol; the engine is auth-agnostic. OpenFusion
-never handles frontier credentials — the embedded official CLI uses whatever
-login you have configured; review your provider's terms for subscription use.
-Harness generation (M4) drives a frontier session over the indexed repo to
-produce a committable `.openfusion/` harness — an LLM wiki, a specialist
-agent roster, and a routing policy — gated by structural validation at
-generation time; the eval loop that flips `verification.evals` from
-`"pending"` to `"pass"` lands in M6. Generation also mines commands
-deterministically (`package.json` scripts, Makefile/justfile targets, CI
-workflow steps), then a frontier model selects and annotates them into a
-**Project Card** — a wiki page that starts in `"draft"` state and is
-statically validated (unresolvable paths/symbols/scripts are stripped, not
-silently kept). A draft card is a proposal only: it must be reviewed and
-explicitly **approved** in the desktop app's Harness setting panel before it
-is ever injected into a worker prompt. Two exporters turn the harness into
-interop artifacts other tools can read: an `AGENTS.md` project brief (led by
-the approved card, when there is one, plus a ground-truth directive) and
-per-agent Claude Code subagents under `.claude/agents/`. Orchestration (M5b)
-now composes that harness into the full harness-fusion loop end to end:
-`engine.orchestrate` classifies a task, routes it to a specialist agent,
-runs an open model worker inside an isolated git worktree — handing it
-**only** the approved Project Card's digest as repo context (a draft or
-legacy harness without a card falls back to the build-and-test page digest
-alone; a harness with neither injects nothing), plus on-demand `wiki_query`/
-`wiki_map` tools against the symbol index — and gates the resulting diff
-behind a frontier review — retrying once before escalating to a
-write-scoped frontier session — and `engine.orchestrate.apply` lands an
-approved diff into the base tree. That injection design is deliberate, not
-minimal-effort: an ETH Zurich + DeepMind study (arXiv:2602.11988) found that
-blanket LLM-generated context injection measurably hurts both success rate
-and inference cost, so only human-approved content is trusted unconditionally
-— everything else is retrieval-on-demand. See "How the loop works" below for
-the full flow and its caveats (cost estimates are directional, the harness
-driving it is unverified until M6, and nothing ever auto-merges).
+Put more simply:
 
-## Generating a harness
+1. Build a symbol-aware wiki for a local git repo.
+2. Generate a `.openfusion/` harness: project notes, specialist agents, and a routing policy.
+3. Run tasks through the harness: classify -> worker model -> frontier review -> optional retry/escalation.
+4. Measure whether the harness preserves quality while reducing estimated model cost.
 
-    engine.harness.generate     { "projectDir": "/path/to/repo" }
-    engine.harness.status       { "projectDir": "/path/to/repo" }
-    engine.harness.card.update  { "projectDir": "/path/to/repo", "digest": "<edited card digest>" }
-    engine.harness.card.approve { "projectDir": "/path/to/repo" }
-    engine.harness.export       { "projectDir": "/path/to/repo", "format": "agents-md" }
-    engine.harness.export       { "projectDir": "/path/to/repo", "format": "claude-subagents" }
+OpenFusion never commits or merges on your behalf. It returns diffs for review,
+and `engine.orchestrate.apply` only applies a reviewed diff with `git apply --3way`.
 
-`generate` requires a git repository and a registered frontier adapter; it
-writes `.openfusion/` (wiki pages, agent defs, `routing.yaml`, `manifest.json`)
-and is safe to re-run — regeneration prunes only the artifacts the prior
-generation itself wrote, never hand-edited additions, and always resets the
-Project Card back to `"draft"` (a regenerated card is a new proposal, never
-carried forward as pre-approved). `status` is a cheap, poll-friendly read of
-`manifest.json` alone, including `verification.card` (`"draft"`, `"approved"`,
-or absent for a harness with no card). `engine.harness.card.update` lets an
-operator edit the draft digest before approving it; `engine.harness.card.approve`
-flips `verification.card` to `"approved"`, the only state from which the card
-is ever injected into a worker prompt. `export` requires a harness that is
-both present and structurally valid (else `SERVER_ERROR`); `agents-md` writes
-`<projectDir>/AGENTS.md` — leading with the approved card (when present) and
-a directive to treat it as ground truth over guesswork — `claude-subagents`
-writes one file per agent under `<projectDir>/.claude/agents/`. **Unverified
-until the eval gate passes**: every exported harness is marked `UNVERIFIED`
-in `AGENTS.md` (and the eval status is visible via `engine.harness.status`)
-until `manifest.verification.evals` reads `"pass"` — treat agent prompts and
-routing as unproven against your project until then.
+## Status
 
-## How the loop works
+OpenFusion is usable, but still early. Treat it as an alpha developer tool.
 
-    engine.orchestrate       { "projectDir": "/path/to/repo", "task": "add input validation to the signup form" }
-    engine.orchestrate.apply { "projectDir": "/path/to/repo", "diff": "<diff from the orchestrate result>" }
-    engine.worker.list       { "projectDir": "/path/to/repo" }
-    engine.worker.gc         { "projectDir": "/path/to/repo", "keep": ["/path/to/repo/.openfusion/worktrees/<id>"] }
+What works today:
 
-## Measuring the harness
+| Area | Status |
+|---|---|
+| Repo wiki | Indexes TypeScript, JavaScript, Python, Go, Rust, and Java repositories into a per-project symbol store. |
+| Wiki tools | Serves `wiki_query` and `wiki_map` over a local MCP server for model sessions. |
+| Harness generation | Generates `.openfusion/` with wiki pages, agents, `routing.yaml`, and `manifest.json`. |
+| Project Card | Drafts a human-reviewable project summary. It must be approved before it is trusted in worker prompts. |
+| Exports | Writes `AGENTS.md` and Claude Code subagents from a valid harness. |
+| Orchestration | Routes a task to a worker model in an isolated git worktree, reviews the diff with a frontier session, retries once, then escalates if needed. |
+| Evals | Compares baseline frontier runs against harness runs and reports quality, estimated cost, and pass/fail/inconclusive verdicts. |
+| Desktop app | Tauri 2 app with Project, Keys, Orchestrate, and Evals screens. Secrets are stored in macOS Keychain. |
+| Bench CLI | Includes a SWE-bench Verified Mini workflow for paired baseline-vs-harness experiments. |
 
-    engine.evals.run { "projectDir": "/path/to/repo", "tasks": [/* ... */] }
+Important caveats:
 
-`engine.evals.run` produces a baseline-vs-harness report card: a direct frontier session
-(no harness, no wiki) solves each task alongside the full orchestrate loop, both scored
-by the same oracle (the repo's own test suite). The verdict is **two-dimensional** (quality
-*and* cost, per `docs/research/2026-07-07-harness-composition.md` §0/§4) and
-**significance-aware** (a single-run quality wobble inside a noise band is not treated as
-a regression). The report card carries three verdicts:
+- Cost numbers are estimates from token usage and pricing tables, not billed amounts.
+- A generated harness is marked unverified until evals pass.
+- The Project Card approval gate is intentional: the card is not trusted in worker prompts until a human approves it.
+- Desktop signing and notarization require your own Apple Developer credentials.
+- Live smokes require real model access, for example a logged-in frontier CLI and/or an open-model API key.
 
-- **pass**: the harness held quality on the clean subset (no measurement failures) — or
-  the quality gap was within the single-run noise band — actually cost less than the
-  baseline, every cost figure is priced, and the sample size is ≥20 tasks (a credible claim
-  wants 20–50; see "Sample size guidance" below). Manifest flips to verified. This is the
-  only report that ships as a savings win.
-- **fail**: an ETH hazard on either axis, flagged and never shipped:
-  - *quality hazard* — the harness *degraded* quality below baseline on the clean subset by
-    more than a 5-percentage-point single-run noise band (single-run pass@1 has std >1.5pp
-    even at temperature 0 — a smaller gap reads as noise, not a real regression). This check
-    deliberately ignores the task-count floor entirely: a quality regression is worth
-    flagging even on a small run, since it only ever blocks a claim, never inflates one.
-  - *cost hazard* — the harness held quality (or was within the noise band) but cost ≥10%
-    **more** than the no-harness baseline on the clean subset, at ≥5 priced tasks. Holding
-    quality while costing materially more is the ETH failure mode itself (the study's own
-    finding: quality held, cost +~20%), not a neutral result — flagged even though nothing
-    about quality "failed."
-- **inconclusive**: one of: (1) fewer than 20 tasks (a hazard flag can still fire on a
-  smaller run — the quality hazard has no floor at all, the cost hazard needs ≥5 — but a
-  savings *pass* cannot); (2) unpriced cost figures (an unknown model or no cost data → no
-  savings number → no claim); (3) baseline solved zero tasks (nothing to hold quality
-  against); (4) ≥20% of tasks hit measurement failures (infra hiccups, apply mismatches —
-  the run is too corrupted to ground a verdict in either direction); (5) quality held (or
-  within noise), priced, ≥20 tasks, but the harness didn't actually save money (a real cost
-  increase under the 10% hazard threshold, or no savings at all) — not a hazard, but not a
-  "saves cost" claim either.
+## Quick Start
 
-**Cost figures are estimate-class** — computed from the pricing table and reported token
-usage, not a billed amount. Treat as directional. They carry a `pricingConfidence` field
-(worst across the run; see `packages/engine/src/models/meter.ts`): `verified` (from the
-provider's API), `provider-reported` (official docs), `secondary` (research), `unverified`
-(guess), or `unpriced` (unknown model). A single unpriced call taints the savings claim
-to `inconclusive`.
+Prerequisites:
 
-**Sample size guidance** (Anthropic evaluation practice, sharpened by
-`docs/research/2026-07-07-harness-composition.md` §4.2): 20–50 paired tasks make a
-credible *savings* claim; the hazard-flag floor is deliberately lower (≥5 for the cost
-hazard, no floor at all for the quality hazard) because a harm signal should be flagged
-readily while a positive claim needs enough tasks to clear the noise band. A v1 CI smoke
-run uses synthetic fixture tasks (mechanics verification); a real savings claim requires
-the operator smoke (`OPENFUSION_EVALS_SMOKE=1 pnpm test`) over ≥20 repo-mined golden tasks
-(commits adding code without tests, or tests verifying a bug fix).
+- macOS for the desktop app.
+- Node.js `>=22`.
+- `pnpm` through Corepack.
+- Rust toolchain for the Tauri desktop shell.
+- Optional: a logged-in Claude Code CLI for frontier smokes and harness generation.
+- Optional: an open-model API key for worker, orchestration, and eval smokes.
 
-**Two documented residual biases** (both directions, so numbers are read honestly):
+Install dependencies:
 
-1. **Against the harness**: eval harness runs execute WITHOUT the wiki MCP server
-   attached — the symbol-index SQLite db isn't copied into the eval directory. So the
-   measured harness is a conservatively degraded variant; it lacks a tool that deployed
-   instances would have. This biases against.
-2. **Toward the harness** (golden tasks only): golden-task wiki bundles are generated at
-   the real project's current HEAD, which for a golden task is at or after the fix commit.
-   The bundle can already describe the post-fix world — answer-adjacent context the
-   baseline never sees. This biases toward on golden tasks specifically.
+```sh
+corepack enable
+pnpm install
+```
 
-Net: treat v1 savings numbers as directional, not precise. A "pass" run
-(quality held, savings > 0, 20+ tasks) understates what a deployment with the wiki MCP
-server would measure; a synthetic-task run is a mechanics proof, not a credibility claim.
+Run the headless checks:
 
-**Eval integrity** against an adversarial worker (one that could `git fetch` the parent
-repo for the answer) relies on the worker sandbox, whose full process isolation is
-deferred to M7. v1 assumes non-adversarial workers; both baseline and harness scratch
-directories are placed under `os.tmpdir()`, isolated from the project directory.
+```sh
+./dev.sh check
+```
 
-`engine.orchestrate` requires a generated harness (`engine.harness.generate`
-first) and drives one task through the full pipeline:
+Build and stage the engine sidecar:
 
-1. **Classify** — a keyword heuristic (no model call) maps the free-text task
-   onto one of the harness's `routing.yaml` task classes (tests, docs,
-   refactor, fix, codegen, …), falling back to `routing.defaults.agent` when
-   nothing matches.
-2. **Route** — the classified task resolves to a specialist agent and either
-   a concrete `(providerId, model)` pair or the sentinel `"frontier"`,
-   per that agent's `routing.yaml` entry.
-3. **Worker** — for a model resolution, `engine.worker.run` creates a fresh,
-   isolated git worktree (`WorktreeManager`, under
-   `.openfusion/worktrees/`), runs the open model through a minimal
-   bash/read/write/edit tool loop scoped to that worktree, and returns a
-   diff plus a summary.
-4. **Frontier review** — a read-only frontier session (no write access) is
-   handed the task, the worker's summary, and the diff, and returns a
-   structured verdict: `approve`, or `request-changes` with specific reasons
-   and a severity.
-5. **Retry once, then escalate** — a rejected or empty-diff worker attempt
-   has its worktree cleaned up and gets one more try (up to
-   `routing.escalation.failuresBeforeFrontier`, default 2 attempts total).
-   If every worker attempt fails, or routing resolved straight to
-   `"frontier"`, the task is escalated: a write-scoped frontier session
-   (tool access limited to a fresh worktree) does the task directly.
-6. **Apply** — `engine.orchestrate` never touches the base repo's working
-   tree itself; it only returns a diff (worker-approved or escalated) for
-   the caller to inspect. `engine.orchestrate.apply` is the only method that
-   writes to the base tree, and it does so via `git apply --3way` against a
-   diff the caller has already reviewed — **it never commits and never
-   merges**; the applied change is left staged/working for a human (or the
-   shell's approval gate) to commit.
+```sh
+./dev.sh sidecar
+```
 
-Caveats:
+Launch the desktop cockpit:
 
-- **Cost is estimate-class.** `engine.orchestrate`'s `cost.workerUsd` /
-  `frontierUsd` / `totalUsd` (tagged `note: "estimate-class"`) are computed
-  from the pricing table (`packages/engine/src/models/pricing.ts`) applied to
-  reported token usage — not a billed amount. Treat them as directional
-  savings signal, not an invoice.
-- **The harness is UNVERIFIED until M6.** Orchestration routes and prompts
-  using whatever harness `engine.harness.generate` produced; until the eval
-  gate (`manifest.verification.evals === "pass"`) lands, treat routing
-  decisions and specialist prompts as unproven, same as the harness itself
-  (see above).
-- **Diff-apply, never merge.** No method in this loop runs `git commit` or
-  `git merge`/`git checkout` against the base repo on the caller's behalf —
-  `engine.orchestrate.apply`'s `git apply --3way` is the only base-tree
-  write, and it's inert until a caller explicitly calls it with a diff
-  they've reviewed.
+```sh
+./dev.sh app
+```
 
-### Worktree lifecycle
+The Project screen can build a repo wiki without model keys. Harness generation,
+orchestration, and evals need the model access described above.
 
-Worker and escalation worktrees are not always cleaned up automatically:
-`engine.worker.run` deliberately leaves BOTH successful and failed worktrees
-on disk (so partial work is never silently destroyed — see
-`packages/engine/src/worker/worktree.ts`); `engine.orchestrate` cleans up
-only the worktrees for its OWN rejected or empty-diff attempts as it goes,
-and deliberately leaves the surviving approved/escalated worktree in place
-for `engine.orchestrate.apply` to read the diff from. That leaves one gap: a
-worktree abandoned by a crash (the engine process killed mid-run, before any
-of the above cleanup logic runs) is never swept automatically.
-`engine.worker.list` (discovery) and `engine.worker.gc` (sweep, with an
-optional `keep` list of paths still legitimately in flight) exist to close
-that gap — call `gc` after a session ends, or periodically, to remove
-everything this manager knows about except what you explicitly keep. `gc` on
-a project with no worker worktrees is a no-op.
+## Common Commands
 
-## Engine Protocol
+`dev.sh` is the recommended local entry point.
 
-The engine exposes its capabilities over stdio via ndjson-encoded JSON-RPC 2.0.
-Responses are written in completion order (correlate by request `id`). The
-server issues notifications to the client (`frontier.event {sessionId, seq, event}`)
-for async events. **Concurrency ownership:** the client is responsible for
-bounding in-flight expensive calls (`engine.models.complete`, `engine.frontier.prompt`);
-the pipeline itself intentionally carries no cap.
+| Command | What it does |
+|---|---|
+| `./dev.sh test` | Runs the TypeScript suites and Rust desktop host tests. |
+| `./dev.sh check` | Runs build, typecheck, and all headless tests. |
+| `./dev.sh sidecar` | Builds the standalone engine binary, stages it for Tauri, and pings it. |
+| `./dev.sh ping` | Sends `engine.ping` and `engine.info` to the staged sidecar. |
+| `./dev.sh app` | Starts the Tauri desktop app in dev mode. |
+| `./dev.sh smoke:frontier` | Runs frontier adapter and harness generation smokes. Requires Claude CLI login. |
+| `OF_API_KEY=... ./dev.sh smoke:worker` | Runs one real open-model worker in a git worktree. |
+| `OF_API_KEY=... ./dev.sh smoke:orchestrate` | Runs the full route -> worker -> frontier-review loop. Also requires Claude CLI login. |
+| `OF_API_KEY=... OF_COMMIT=<sha> OF_TEST_COMMAND="pnpm test" ./dev.sh smoke:evals` | Runs a real baseline-vs-harness eval on a golden task. |
 
-## Desktop app (M7)
+Raw workspace commands are also available:
 
-`apps/desktop` is a Tauri 2 shell (Rust + system webview) that runs the
-engine as a supervised sidecar process and speaks the same stdio JSON-RPC
-protocol described above to it — Rust owns the sidecar's lifecycle (spawn on
-launch, explicit bounded shutdown on app exit so no engine process is ever
-orphaned) and bridges it to the webview via `invoke`/`Channel`. The shell is
-deliberately dumb: all intelligence stays in the engine, unchanged.
+```sh
+pnpm build
+pnpm typecheck
+pnpm test
+pnpm --filter @openfusion/desktop test:rust
+```
 
-### The Cockpit UI (M7c)
+## How It Works
 
-The shell exposes four cockpit screens:
+```text
+local git repo
+  |
+  v
+wiki index
+  - symbols
+  - references
+  - token-budgeted repo map
+  |
+  v
+harness generation
+  - Project Card
+  - wiki pages
+  - specialist agents
+  - routing policy
+  |
+  v
+orchestration
+  - classify task
+  - pick agent and model
+  - run worker in isolated worktree
+  - review diff with frontier model
+  - retry or escalate
+  - return diff for human review
+```
 
-1. **Project** — discover and index a repo: open a project directory and
-   build its wiki (`wiki.build`) with live progress. The eval report card
-   (pass/fail/inconclusive, savings %, per-task results) lives on its own
-   Evals screen, below — not here.
-2. **Keys** — configure frontier engine (Claude Code/Codex) and open-model
-   providers (BYOK: Moonshot, Z.ai, DeepSeek, generic OpenAI-compatible);
-   all secrets stored in macOS Keychain.
-3. **Orchestrate** — the "route → cheap-worker diff → frontier review →
-   escalate → apply" loop live. Streams progress, shows routed model, worker
-   diff, review verdict, cost breakdown (estimate-class, tagged with
-   `pricingConfidence`). Apply button stages the diff (never commits). Cancel
-   button calls `engine.cancel({runId})`, rendering "Cancelled" (distinct from
-   "Failed") once settled. When a just-generated harness has a Project Card
-   still in `"draft"`, a nudge — "Project Card drafted — review it in Harness
-   setting." — appears alongside the harness status; it is informational
-   only and never gates the Run button. The card itself is reviewed
-   (view/edit/approve) in the Harness setting panel.
-4. **Evals** — baseline-vs-harness report card. Runs real evals, displays
-   honest verdict (pass green / **fail = ETH-HAZARD: harness degraded quality,
-   flagged and never shipped as a win** / inconclusive amber), savings % with
-   pricing caveat or "not computable" (never a fake number), per-task results,
-   and clean-subset counts. Cancel button with the same runId-based semantics.
+The key design choice is selective context. Workers get the approved Project
+Card when one exists. Without one, they may receive a narrow build-and-test
+digest fallback. Broader project knowledge stays available through on-demand
+wiki lookup tools instead of being blindly injected into every prompt.
 
-**Honesty notes:**
-- Displayed savings are **estimate-class** (computed from pricing table +
-  reported token usage, not a billed amount) and carry a `pricingConfidence`
-  caveat (verified/provider-reported/secondary/unverified/unpriced). An unpriced
-  model taints the entire run to "inconclusive," never inflating a savings claim.
-- An **ETH-HAZARD "fail" verdict** means the harness produced WORSE quality than
-  the baseline on the clean subset — a genuine risk, flagged in the UI and never
-  shipped as a savings win, regardless of cost.
-- **Cancel semantics:** every long-running call mints a UUID `runId` and cancels
-  via `engine.cancel({runId})` — the true stop mechanism on the engine side.
-  The app never uses a per-call timeout on long runs (a timeout would abandon
-  the promise while the run continues on the engine). Cancelled is a distinct
-  state from Failed.
+## Engine RPC Examples
 
-**CSP:** The app runs under a strict, local-only Content-Security-Policy
-(production mode). It permits scripts and styles only from the bundled code
-(no inline scripts/styles, no external CDNs), and network connections only to
-`ipc:` (Tauri's IPC) and `http://ipc.localhost` (the engine sidecar). A dev-only
-relaxation allows `ws://localhost:*` for the dev server. CSP correctness is
-verified as an operator smoke: a running `tauri build` app with no console
-CSP violation logs confirms the policy is live.
+The engine speaks newline-delimited JSON-RPC 2.0 over stdio. The desktop app
+uses this protocol through a supervised sidecar, and other clients can use the
+same methods.
 
-See `apps/desktop/README.md` for the architecture, how to build/stage the
-sidecar and run `tauri dev`, the four cockpit screens in detail, and the
-day-to-day (unsigned) operator smoke checklist. Packaging a distributable,
-signed and notarized `.dmg` is M8 scope — see the next section.
+Build and query a wiki:
 
-## Distribution: building a signed DMG (M8)
+```text
+engine.wiki.build  { "projectDir": "/path/to/repo" }
+engine.wiki.status { "projectDir": "/path/to/repo" }
+engine.wiki.map    { "projectDir": "/path/to/repo", "budgetTokens": 2048 }
+engine.wiki.query  { "projectDir": "/path/to/repo", "symbol": "createEngine" }
+engine.mcp.start   { "projectDir": "/path/to/repo" }
+```
 
-OpenFusion is signed-DMG-buildable: `apps/desktop/BUILDING.md` is the
-complete operator runbook for producing a `.dmg` that installs on a clean
-Mac with no Gatekeeper right-click dance. That document covers prerequisites
-(an Apple Developer account, a Developer ID Application certificate,
-notarization credentials), the exact environment variables, the build
-sequence (`build:sidecar` → `stage-sidecar` → `tauri build`, which
-auto-signs the sidecar's native addon via a `beforeBundleCommand` and
-notarizes the `.app` inline → `notarize-staple-dmg.mjs` to staple the
-`.dmg` itself), verification steps, the JIT-entitlement empirical check,
-and notarization troubleshooting.
+Configure and inspect model providers:
 
-**This step requires the operator's own Apple Developer credentials** —
-nothing in this repository holds or can supply a signing certificate or
-notarization credentials, so a signed artifact has never been produced in
-this development environment or in CI. The signing pipeline itself
-(sidecar asset resolution, packaged-path dispatch, the presign/notarize
-scripts) is fully built and tested; running it against a real certificate
-is the one remaining, credential-gated step before a public release.
+```text
+engine.models.configure { ...provider config... }
+engine.models.list      {}
+engine.models.complete  { "providerId": "deepseek", "model": "deepseek-v4-flash", "prompt": "Hello" }
+engine.models.usage     {}
+```
 
-### Before you trust / ship this: the consolidated operator smoke checklist
+Generate and manage a harness:
 
-Everything below requires a display, live credentials, or both — none of it
-runs in CI. Work through it in order before trusting a build enough to ship:
+```text
+engine.harness.generate     { "projectDir": "/path/to/repo" }
+engine.harness.status       { "projectDir": "/path/to/repo" }
+engine.harness.read         { "projectDir": "/path/to/repo" }
+engine.harness.card.update  { "projectDir": "/path/to/repo", "digest": "<edited card digest>" }
+engine.harness.card.approve { "projectDir": "/path/to/repo" }
+engine.harness.export       { "projectDir": "/path/to/repo", "format": "agents-md" }
+engine.harness.export       { "projectDir": "/path/to/repo", "format": "claude-subagents" }
+```
 
-**1. The five engine operator smokes** (each env-gated, skipped in CI;
-run from the repo root):
+Run the harness loop:
 
-| # | Milestone | Command | Proves |
-|---|---|---|---|
-| 1 | M3 — frontier session | `OPENFUSION_CLAUDE_SMOKE=1 pnpm --filter @openfusion/engine test -- frontier-claude-smoke` | A real embedded `claude` session answers a repo question via the wiki MCP tools (needs `claude` logged in). |
-| 2 | M4 — harness generation | `OPENFUSION_CLAUDE_SMOKE=1 pnpm --filter @openfusion/engine test -- harness-generate-smoke` | A real frontier session generates a valid, committable `.openfusion/` harness for this repo (needs `claude` logged in). |
-| 3 | M5a — worker run | `OPENFUSION_WORKER_SMOKE=1 pnpm --filter @openfusion/engine test -- worker-run-smoke` | A real open model writes a file inside an isolated git worktree (needs a real open-model provider key). |
-| 4 | M5b — orchestrate | `OPENFUSION_ORCHESTRATE_SMOKE=1 pnpm --filter @openfusion/engine test -- orchestrate-smoke` | The full route → worker → frontier-review loop end to end, both backends real (needs an open-model key + `claude` logged in). |
-| 5 | M6 — evals | `OPENFUSION_EVALS_SMOKE=1 pnpm --filter @openfusion/engine test -- evals-run-smoke` | **The first real savings number**: a baseline-vs-harness report card over golden tasks mined from this repo's own commits (needs an open-model key + `claude` logged in). |
+```text
+engine.orchestrate       { "projectDir": "/path/to/repo", "task": "add input validation to the signup form" }
+engine.orchestrate.apply { "projectDir": "/path/to/repo", "diff": "<reviewed diff>" }
+engine.cancel            { "runId": "<client-generated run id>" }
+```
 
-**2. The desktop cockpit batch** (see `apps/desktop/README.md`'s "OPERATOR
-SMOKES" section for full detail):
+Clean up worker worktrees:
 
-- `tauri dev` (or a built app) launches: window titled "OpenFusion",
-  1024×720, no console errors.
-- Project screen: build the wiki for a real repo, live progress renders.
-- Keys screen: enter a BYOK provider key, relaunch the app, confirm it
-  persisted (Keychain-backed, not re-entered).
-- Orchestrate screen: route → worker diff → frontier review → apply,
-  **and** mid-run Cancel renders "Cancelled" (not "Failed").
-- Evals screen: a real eval run renders an honest verdict, a savings % with
-  its `pricingConfidence` caveat (or "not computable"), and per-task rows.
-- CSP: DevTools console shows **no** CSP violation messages while the app
-  runs normally.
-- Quit the app; confirm no orphaned engine process
-  (`ps aux | grep openfusion-engine`).
+```text
+engine.worker.list { "projectDir": "/path/to/repo" }
+engine.worker.gc   { "projectDir": "/path/to/repo", "keep": ["/path/to/repo/.openfusion/worktrees/<id>"] }
+```
 
-**3. The signed-DMG verification** (`apps/desktop/BUILDING.md` §5, after
-running the build sequence there):
+Measure a harness:
 
-- `spctl -a -vvv -t install <App>.app` → accepted, notarized.
-- `codesign -dvvv --entitlements - <App>.app` → hardened runtime on,
-  entitlements match `Entitlements.plist`.
-- `stapler validate <App>.dmg` → validates.
-- Install on a **clean Mac / fresh user account** → launches directly, no
-  right-click-to-open dance.
-- A real orchestration + a real eval run inside that signed, notarized
-  build (not just a dev build).
-- No console CSP violations; no orphaned engine process on quit.
-- **JIT empirical check:** expect to likely need this — the sidecar
-  (`openfusion-engine`, a Node/V8 binary that JITs in-process) is the likely
-  reason, not the WKWebView. If the app crashes on launch **or** the engine
-  sidecar fails to start (cockpit screens error out, `openfusion-engine`
-  exits immediately), uncomment `allow-jit`/`allow-unsigned-executable-memory`
-  in `Entitlements.plist` and rebuild from scratch.
+```text
+engine.evals.run {
+  "projectDir": "/path/to/repo",
+  "tasks": [
+    { "commitSha": "<bug-fix commit>", "testCommand": ["pnpm", "test"] }
+  ]
+}
+```
 
-## Development
+Eval verdicts are deliberately conservative:
 
-Requires Node >= 22 and pnpm (via corepack).
+| Verdict | Meaning |
+|---|---|
+| `pass` | Quality held within the accepted noise band, costs were priced, savings were positive, and the sample size was credible. |
+| `fail` | The harness caused a quality hazard or a material cost hazard. It must not be reported as a savings win. |
+| `inconclusive` | The run was too small, unpriced, noisy, failed to measure cleanly, or did not show savings. |
 
-    corepack enable
-    pnpm install
-    pnpm build
-    pnpm test
+## Desktop App
+
+The desktop app lives in `apps/desktop`. It is a Tauri 2 shell:
+
+```text
+React + Vite webview
+  <-> Tauri Rust command bridge
+  <-> openfusion-engine sidecar over stdio JSON-RPC
+```
+
+The app has four screens:
+
+| Screen | Purpose |
+|---|---|
+| Project | Pick a local git repo and build its wiki with live progress. |
+| Keys | Configure frontier and open-model providers. Secrets are stored in macOS Keychain. |
+| Orchestrate | Run the route -> worker diff -> frontier review -> apply workflow. |
+| Evals | Run baseline-vs-harness evals and inspect the report card. |
+
+Desktop-specific architecture, sidecar staging, Rust tests, and operator smoke
+details are documented in [`apps/desktop/README.md`](apps/desktop/README.md).
+Signed DMG instructions are in [`apps/desktop/BUILDING.md`](apps/desktop/BUILDING.md).
+
+## Benchmarking
+
+The benchmark workflow lives under `benchmarks/` and the engine bench CLI.
+It is intended to test the central product claim: the harness should preserve
+quality while reducing estimated cost compared with a direct frontier baseline.
+
+```sh
+pnpm --filter @openfusion/engine build
+pnpm --filter @openfusion/engine exec openfusion-bench help
+```
+
+See [`benchmarks/README.md`](benchmarks/README.md) for dataset, layout, scoring,
+and caveats.
+
+## Project Layout
+
+| Path | Purpose |
+|---|---|
+| `apps/desktop/` | Tauri desktop app and Rust sidecar bridge. |
+| `packages/engine/` | Core indexing, harness generation, model routing, orchestration, evals, and JSON-RPC server. |
+| `packages/shared/` | Shared RPC and wiki types. |
+| `benchmarks/` | SWE-bench Verified Mini data and benchmark notes. |
+| `docs/research/` | Research notes and milestone verification docs. |
+| `docs/superpowers/specs/` | Product and architecture specs. |
+| `dev.sh` | Local development, smoke, and app-launch helper. |
+
+## Development Notes
+
+Run this before opening a PR:
+
+```sh
+./dev.sh check
+```
+
+Useful package-level loops:
+
+```sh
+pnpm --filter @openfusion/engine test
+pnpm --filter @openfusion/desktop test
+pnpm --filter @openfusion/desktop test:rust
+```
+
+When changing the engine sidecar or desktop shell, rebuild and restage the
+sidecar before running Tauri:
+
+```sh
+./dev.sh sidecar
+./dev.sh app
+```
+
+Live smokes are intentionally environment-gated because they spend real model
+tokens or need a logged-in frontier CLI. They should fail loudly if the required
+credentials are missing.
+
+## Privacy and Safety
+
+- The engine runs locally.
+- Model calls are sent only to the providers you configure or to the official frontier CLI you run locally.
+- The engine does not store frontier credentials. It uses the login state of the official CLI.
+- The desktop app stores BYOK provider secrets in macOS Keychain.
+- Generated Project Cards start as drafts and must be approved before becoming trusted worker context.
+- OpenFusion returns diffs; it does not commit, merge, or auto-ship code.
+
+## Further Reading
+
+- [Harness fusion app design](docs/superpowers/specs/2026-07-03-harness-fusion-app-design.md)
+- [Harness team cockpit design](docs/superpowers/specs/2026-07-06-harness-team-cockpit-design.md)
+- [Project Card design](docs/superpowers/specs/2026-07-08-wiki-project-card-design.md)
+- [Harness composition research](docs/research/2026-07-07-harness-composition.md)
+- [Open-source landscape research](docs/research/2026-07-03-oss-landscape.md)
 
 ## License
 
