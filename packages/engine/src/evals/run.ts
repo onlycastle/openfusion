@@ -304,6 +304,10 @@ export interface PerTaskResult {
   harnessOutcome: HarnessTaskOutcome;
   baselineUsd: number | null;
   harnessUsd: number | null;
+  routeId: string | null;
+  family: string | null;
+  dialectPack: string | null;
+  workerModel: string | null;
 }
 
 /** Phase 1: published harness configuration for eval reproducibility. */
@@ -581,8 +585,20 @@ async function runHarnessTask(
   harnessDir: string,
   task: EvalTask,
   opts: { runId?: string; abortSignal?: AbortSignal } = {},
-): Promise<{ passed: boolean; costUsd: number | null; outcome: HarnessTaskOutcome }> {
+): Promise<
+  {
+    passed: boolean;
+    costUsd: number | null;
+    outcome: HarnessTaskOutcome;
+  } & Pick<PerTaskResult, "routeId" | "family" | "dialectPack" | "workerModel">
+> {
   let result: OrchestrateResult;
+  const emptyProvenance = {
+    routeId: null,
+    family: null,
+    dialectPack: null,
+    workerModel: null,
+  };
   try {
     // M7b Task 2: `runId` forwarded VERBATIM -- this is the SAME batch-level
     // runId runEvals only ever get()s (never register()s/deregister()s;
@@ -608,8 +624,14 @@ async function runHarnessTask(
     // regardless of how this task scored.
     const message = err instanceof Error ? err.message : String(err);
     engine.log(`evals.run: engine.orchestrate failed for task ${task.id}: ${message}`);
-    return { passed: false, costUsd: null, outcome: "error" };
+    return { passed: false, costUsd: null, outcome: "error", ...emptyProvenance };
   }
+  const provenance = {
+    routeId: result.routeId,
+    family: result.family ?? null,
+    dialectPack: result.dialectPack ?? null,
+    workerModel: result.resolution === "frontier" ? "frontier" : result.resolution.model,
+  };
 
   if (result.diff.trim().length === 0) {
     // Nothing to apply — harnessDir stays at task.setup()'s pre-change
@@ -620,7 +642,7 @@ async function runHarnessTask(
     // failure: the harness had every opportunity (worker attempts + review
     // + escalation) and still produced nothing.
     const oracle = await runOracle(harnessDir, task.testCommand);
-    return { passed: oracle.passed, costUsd: result.cost.totalUsd, outcome: result.outcome };
+    return { passed: oracle.passed, costUsd: result.cost.totalUsd, outcome: result.outcome, ...provenance };
   }
 
   try {
@@ -636,11 +658,11 @@ async function runHarnessTask(
     // lifecycle) — scored as a measurement failure, not a crashed run.
     const message = err instanceof Error ? err.message : String(err);
     engine.log(`evals.run: applying the harness diff failed for task ${task.id}: ${message}`);
-    return { passed: false, costUsd: result.cost.totalUsd, outcome: "apply-failed" };
+    return { passed: false, costUsd: result.cost.totalUsd, outcome: "apply-failed", ...provenance };
   }
 
   const oracle = await runOracle(harnessDir, task.testCommand);
-  return { passed: oracle.passed, costUsd: result.cost.totalUsd, outcome: result.outcome };
+  return { passed: oracle.passed, costUsd: result.cost.totalUsd, outcome: result.outcome, ...provenance };
 }
 
 // The pipeline itself: guard -> per-task (baseline + harness, both scored by
@@ -733,6 +755,10 @@ export async function runEvals(engine: Engine, params: EvalsRunParams): Promise<
           harnessOutcome: harnessResult.outcome,
           baselineUsd: baseline.costUsd,
           harnessUsd: harnessResult.costUsd,
+          routeId: harnessResult.routeId,
+          family: harnessResult.family,
+          dialectPack: harnessResult.dialectPack,
+          workerModel: harnessResult.workerModel,
         });
       } finally {
         // Eval scratch is transient (unlike orchestrate's own user-facing

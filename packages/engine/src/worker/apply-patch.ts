@@ -64,10 +64,15 @@ export function parseApplyPatch(patch: string): { ops: FileOp[] } | { error: str
     if (updateMatch) {
       const filePath = updateMatch[1]!.trim();
       i += 1;
-      // Skip optional @@ headers
-      while (i < lines.length && (lines[i] ?? "").startsWith("@@")) i += 1;
+      const hunks: Array<{ old: string; new: string }> = [];
       const oldLines: string[] = [];
       const newLines: string[] = [];
+      const flushHunk = () => {
+        if (oldLines.length === 0 && newLines.length === 0) return;
+        hunks.push({ old: oldLines.join("\n"), new: newLines.join("\n") });
+        oldLines.length = 0;
+        newLines.length = 0;
+      };
       while (i < lines.length) {
         const hl = lines[i] ?? "";
         if (hl.startsWith("*** ")) break;
@@ -79,6 +84,7 @@ export function parseApplyPatch(patch: string): { ops: FileOp[] } | { error: str
           oldLines.push(ctx);
           newLines.push(ctx);
         } else if (hl.startsWith("@@")) {
+          flushHunk();
           i += 1;
           continue;
         } else {
@@ -88,10 +94,11 @@ export function parseApplyPatch(patch: string): { ops: FileOp[] } | { error: str
         }
         i += 1;
       }
+      flushHunk();
       ops.push({
         kind: "update",
         path: filePath,
-        hunks: [{ old: oldLines.join("\n"), new: newLines.join("\n") }],
+        hunks,
       });
       continue;
     }
@@ -156,6 +163,9 @@ export function applyPatchToWorktree(
     }
 
     if (op.kind === "add") {
+      if (fs.existsSync(gate.resolved)) {
+        return { ok: false, error: `add: already exists: ${op.path}`, errorKind: "invalid_args" };
+      }
       try {
         fs.mkdirSync(path.dirname(gate.resolved), { recursive: true });
         fs.writeFileSync(gate.resolved, op.content.endsWith("\n") ? op.content : `${op.content}\n`, "utf8");

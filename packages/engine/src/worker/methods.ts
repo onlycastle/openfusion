@@ -31,7 +31,7 @@ import { RpcMethodError } from "../rpc/errors.js";
 import { providerKindOf, requireGitRepo, resolveProjectKey } from "../rpc/guards.js";
 import { registerMethod } from "../rpc/register.js";
 import { wikiDbPath } from "../wiki/store.js";
-import { resolveDialectPackId } from "../models/catalog.js";
+import { requireDialectPack, resolveDialectPackId } from "../models/catalog.js";
 import { runWorkerLoop } from "./loop.js";
 import { createWorkerRuntime } from "./runtime.js";
 import type { ToolContext } from "./tools.js";
@@ -160,6 +160,7 @@ export function registerWorkerMethods(engine: Engine): void {
     let manager: WorktreeManager;
     let taskId: string;
     let worktree: Worktree;
+    let dialectPackId: string;
     try {
       requireGitRepo(params.projectDir);
 
@@ -168,6 +169,12 @@ export function registerWorkerMethods(engine: Engine): void {
       // worktree behind.
       languageModel = engine.models.registry.resolve(params.providerId, params.model);
       kind = providerKindOf(engine.models.registry, params.providerId);
+      dialectPackId = resolveDialectPackId({
+        explicit: params.dialectPack,
+        providerKind: kind,
+        modelId: params.model,
+      });
+      requireDialectPack(dialectPackId);
 
       manager = await engine.worker.getManager(params.projectDir);
       taskId = randomUUID();
@@ -208,11 +215,6 @@ export function registerWorkerMethods(engine: Engine): void {
     const toolErrorCounts: Record<string, number> = {};
     let editFailCount = 0;
 
-    const dialectPackId = resolveDialectPackId({
-      explicit: params.dialectPack,
-      providerKind: kind,
-      modelId: params.model,
-    });
     const runtime = createWorkerRuntime(dialectPackId, {
       root: worktree.path,
       bashTimeoutMs: params.bashTimeoutMs,

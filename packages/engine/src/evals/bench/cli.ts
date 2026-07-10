@@ -22,14 +22,15 @@ function usage(): string {
   return `openfusion-bench — SWE-bench Verified Mini paired harness eval
 
 Usage:
-  openfusion-bench prepare [--clones-only] [--approve-from <path>] [--bench-root <dir>] [--providers <path>]
-  openfusion-bench run [--limit N] [--instance <id>] [--run-id <id>] [--bench-root <dir>] [--providers <path>]
+  openfusion-bench prepare [--clones-only] [--approve-from <path>] [--bench-root <dir>] [--dataset <path>] [--providers <path>]
+  openfusion-bench run [--limit N] [--instance <id>] [--run-id <id>] [--bench-root <dir>] [--dataset <path>] [--providers <path>]
   openfusion-bench score --run-id <id> [--fixture-baseline <path>] [--fixture-harness <path>]
-  openfusion-bench report --run-id <id>
+  openfusion-bench report --run-id <id> [--dataset <path>]
   openfusion-bench help
 
 Environment:
   OPENFUSION_BENCH_PROVIDERS  path to gitignored ProviderConfig JSON (workers)
+  OPENFUSION_BENCH_DATASET    override vendored mini dataset path
   OPENFUSION_BENCH_ROOT       override ~/.openfusion/bench
   OPENFUSION_BENCH_SMOKE=1    reserved for operator smoke docs
 
@@ -79,6 +80,11 @@ function providersPathFrom(flags: Record<string, string | boolean>): string | un
   return process.env.OPENFUSION_BENCH_PROVIDERS;
 }
 
+function datasetPathFrom(flags: Record<string, string | boolean>): string | undefined {
+  if (typeof flags.dataset === "string") return flags.dataset;
+  return process.env.OPENFUSION_BENCH_DATASET;
+}
+
 async function main(): Promise<void> {
   const { cmd, flags } = parseArgs(process.argv.slice(2));
   const log = (m: string) => process.stderr.write(`${m}\n`);
@@ -97,6 +103,7 @@ async function main(): Promise<void> {
       if (engine !== null) configureBenchProviders(engine, providersPathFrom(flags), log);
       const result = await prepareBench(engine, {
         benchRoot: benchRootFrom(flags),
+        datasetPath: datasetPathFrom(flags),
         clonesOnly: flags.clonesOnly === true,
         approveFrom: typeof flags.approveFrom === "string" ? flags.approveFrom : undefined,
         log,
@@ -114,6 +121,7 @@ async function main(): Promise<void> {
       configureBenchProviders(engine, providersPathFrom(flags), log);
       const result = await runBench(engine, {
         benchRoot: benchRootFrom(flags),
+        datasetPath: datasetPathFrom(flags),
         limit: typeof flags.limit === "string" ? Number(flags.limit) : undefined,
         instanceId: typeof flags.instance === "string" ? flags.instance : undefined,
         runId: typeof flags.runId === "string" ? flags.runId : undefined,
@@ -215,7 +223,7 @@ async function main(): Promise<void> {
     let unpricedCalls = 0;
     let pricingConfidence: PricingConfidence = "verified";
     let escalations = 0;
-    let datasetSnapshotHash = loadBenchDataset(defaultDatasetPath()).snapshotHash;
+    let datasetSnapshotHash = loadBenchDataset(datasetPathFrom(flags) ?? defaultDatasetPath()).snapshotHash;
     const metaPath = path.join(dir, "run-meta.json");
     if (existsSync(metaPath)) {
       const meta = JSON.parse(readFileSync(metaPath, "utf8")) as {

@@ -25,6 +25,10 @@ function row(
     harnessUsd: opts.harnessUsd === undefined ? 0.2 : opts.harnessUsd,
     baselineOutcome: opts.baselineOutcome ?? "completed",
     harnessOutcome: opts.harnessOutcome ?? "worker-approved",
+    routeId: "tc:codegen",
+    family: "deepseek",
+    dialectPack: "string-edit-default",
+    workerModel: "deepseek-v4-flash",
   };
 }
 
