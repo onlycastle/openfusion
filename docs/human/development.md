@@ -69,8 +69,12 @@ does not provide the required macOS backend.
 and a file-size ratchet (`scripts/check-file-budget.mjs` — grandfathered
 files may shrink but never grow; new files are capped at 400 lines).
 Baselines only ever shrink: `pnpm arch:budget:rebase` locks in gains after a
-file split — it must never be used to raise a limit. Rules and rationale:
-`docs/superpowers/specs/2026-07-13-clean-architecture-design.md` (§3, §11).
+file split — it must never be used to raise a limit. One narrow exception:
+a grandfathered `test/` file's baseline may be re-based upward when the growth
+is added test coverage, always as its own clearly-labeled `chore(arch)` commit
+so the raise is reviewable. Source-file baselines never go up. Rules and
+rationale: `docs/superpowers/specs/2026-07-13-clean-architecture-design.md`
+(§3, §11).
 
 ## Change discipline
 
