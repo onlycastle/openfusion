@@ -6,11 +6,13 @@
   "license": "Apache-2.0",
   "scripts": {
     "dev": "vite",
+    "ui:dev": "OPENFUSION_UI_MOCK=1 vite --host 127.0.0.1",
     "build": "tsc && vite build",
     "typecheck": "tsc --noEmit",
     "preview": "vite preview",
     "test": "vitest run",
     "test:rust": "cargo test --manifest-path src-tauri/Cargo.toml --features test-mocks",
+    "stage-sandbox-runner": "node scripts/stage-sandbox-runner.mjs",
     "stage-sidecar": "node scripts/stage-sidecar.mjs",
     "tauri": "tauri"
   },

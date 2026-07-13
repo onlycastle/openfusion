@@ -223,6 +223,10 @@ export interface ProviderConfigInput {
   baseURL?: string;
 }
 
+export interface ProviderConnectionCheckInput extends ProviderConfigInput {
+  model: string;
+}
+
 export interface ModelProviderSummary {
   id: string;
   kind: ProviderKind;
@@ -246,6 +250,16 @@ export interface WikiBuildStats {
   symbols: number;
   refs: number;
   headSha: string;
+  sourceFingerprint: string;
+  coverage: {
+    supportedTracked: number;
+    currentEntries: number;
+    unchanged: number;
+    oversized: number;
+    unreadable: number;
+    parseFailed: number;
+    removed: number;
+  };
 }
 
 /** Mirrors the inline result shape of `engine.wiki.status`
@@ -271,13 +285,72 @@ export interface WikiStatus {
 export interface HarnessStatus {
   present: boolean;
   structural: "pass" | "fail" | null;
-  evals: string | null;
   headSha: string | null;
   card: "draft" | "approved" | null;
 }
 
+export interface HarnessHealthIssue {
+  code: string;
+  severity: "error" | "warning" | "info";
+}
+
+export interface HarnessHealthReport {
+  checkedAt: string;
+  overall: "healthy" | "degraded" | "insufficient-evidence" | "failed";
+  harness: {
+    present: boolean;
+    structural: "passed" | "failed" | "not-run";
+    freshness: "current" | "stale" | "unknown";
+    card: "draft" | "approved" | "missing";
+  };
+  wiki: {
+    operational: "passed" | "failed" | "inconclusive" | "not-run";
+    index: "passed" | "failed" | "inconclusive" | "cancelled" | "not-run";
+    retrieval: "passed" | "failed" | "inconclusive" | "cancelled" | "not-run";
+    delivery: "passed" | "failed" | "inconclusive" | "cancelled" | "not-run";
+  };
+  operational: {
+    status: "healthy" | "degraded" | "insufficient-evidence";
+    sampleSize: number;
+    successfulRuns: number;
+    failedRuns: number;
+    errorRuns: number;
+    cancelledRuns: number;
+    escalatedRuns: number;
+    reviewRequestChanges: number;
+    toolErrors: number;
+    applySucceeded: number;
+    applyFailed: number;
+    lastRunAt: string | null;
+  };
+  issues: HarnessHealthIssue[];
+}
+
 /** Mirrors the engine's `AgentModel` (harness/schema.ts). */
 export type AgentModel = "frontier" | { kind: string; model: string; providerId?: string };
+
+export type FrontierEngineKind = "claude-code" | "codex";
+export interface FrontierSelection {
+  engine: FrontierEngineKind;
+  model?: string;
+}
+export interface FrontierRoleSelections {
+  planning: FrontierSelection;
+  review: FrontierSelection;
+  escalation: FrontierSelection;
+  baseline: FrontierSelection;
+}
+export interface FrontierModelEntry {
+  engine: FrontierEngineKind;
+  id: string;
+  displayName: string;
+  description: string;
+  isDefault: boolean;
+}
+export interface FrontierModelsResult {
+  models: FrontierModelEntry[];
+  unavailable: Array<{ engine: FrontierEngineKind; message: string }>;
+}
 
 /** One row of the harness team, as `engine.harness.read` returns it. */
 export interface HarnessAgentView {
@@ -298,20 +371,49 @@ export interface HarnessTeam {
   card: { digest: string; body: string; state: "draft" | "approved" } | null;
 }
 
+export interface RoutingCandidate {
+  id: string;
+  harnessDigest: string;
+  evidenceDigest: string;
+  status: "proposed" | "shadowed" | "promoted" | "rejected" | "rolled-back";
+  shadowCompleted: boolean;
+  gate: {
+    cleanMatchedTasks: number;
+    noSafetyViolation: boolean;
+    fullyPriced: boolean;
+    eligible: boolean;
+    reasons: string[];
+    qualityDelta: { mean: number; lower95: number; upper95: number };
+    pairedSavings: { mean: number; lower95: number; upper95: number };
+  };
+  table: {
+    version: 3;
+    evidenceDigest: string;
+    fallback: "configured-route";
+    overrides: Array<{
+      when: Record<string, string>;
+      routeId: string;
+      family: string;
+      dialectPack: string;
+      contextPolicy: "full-history" | "compaction" | "unknown";
+    }>;
+  };
+}
+
 /** Mirrors `packages/engine/src/harness/generate.ts`'s
  * `GenerateHarnessResult`: the one-time build result after the frontier
  * session writes the harness bundle. */
 export interface GenerateHarnessResult {
   files: string[];
-  reportCard: { structural: "pass"; evals: "pending" };
+  reportCard: { structural: "pass"; operational: "insufficient-evidence" };
   estimatedCostUsd: number | null;
   pages: number;
   agents: number;
   note: string;
 }
 
-// M7c Task 2: the `engine.orchestrate`/`engine.evals.run` result shapes the
-// Orchestrate/Eval-report-card cockpit screens need — same hand-mirror
+// M7c Task 2: the `engine.orchestrate` result shape and occasional
+// `engine.evals.run` benchmark result shape — same hand-mirror
 // posture and drift caveat as `WikiBuildStats`/`WikiStatus` above (checked
 // field-for-field against `packages/engine/src/orchestrate/orchestrate.ts`'s
 // `OrchestrateResult`/`OrchestrateAttempt` and
@@ -343,6 +445,36 @@ export interface OrchestrateAttempt {
   empty?: boolean;
 }
 
+export interface CandidateRef {
+  schemaVersion: 1;
+  candidateId: string;
+  diffDigest: string;
+  touchedPaths: string[];
+  lifecycle: "prepared" | "verified" | "approved" | "stale" | "rejected" | "applied" | "expired";
+  createdAt: string;
+  expiresAt: string;
+}
+
+export interface ApprovalGrant {
+  schemaVersion: 1;
+  grantId: string;
+  token: string;
+  candidateId: string;
+  destinationProjectDigest: string;
+  baseSha: string;
+  diffDigest: string;
+  issuedAt: string;
+  expiresAt: string;
+}
+
+export interface CostEstimate {
+  knownUsd: number;
+  completeness: "complete" | "partial" | "none";
+  unpricedCalls: number;
+  pricingVersion: string;
+  confidence: "verified" | "estimated" | "mixed" | "unpriced";
+}
+
 /** Mirrors `OrchestrateResult` (orchestrate.ts) — the full result of one
  * `engine.orchestrate` run: which agent/model it routed to, every attempt
  * made, the final diff (empty on `"failed"`), the worktree it was produced
@@ -362,6 +494,16 @@ export interface OrchestrateResult {
   agent: string;
   taskClass: string;
   resolution: { providerId: string; model: string } | "frontier";
+  frontier?: { review: FrontierSelection; escalation: FrontierSelection };
+  taskSnapshot?: {
+    baseSha: string;
+    dirtyState: {
+      category: "clean" | "tracked" | "untracked" | "mixed";
+      digest: string;
+    };
+  };
+  candidateRef: CandidateRef | null;
+  verificationIncomplete?: boolean;
   attempts: OrchestrateAttempt[];
   diff: string;
   diffStat: string;
@@ -375,6 +517,7 @@ export interface OrchestrateResult {
     note: "estimate-class";
     pricingConfidence?: PricingConfidence;
   };
+  costEstimate: CostEstimate;
 }
 
 /** Mirrors `HarnessTaskOutcome` (evals/run.ts) — the harness side's per-task
@@ -401,6 +544,8 @@ export interface PerTaskResult {
   harnessOutcome: HarnessTaskOutcome;
   baselineUsd: number | null;
   harnessUsd: number | null;
+  baselinePolicyViolation?: boolean;
+  harnessPolicyViolation?: boolean;
 }
 
 /** Mirrors `EvalsReportCard` (evals/run.ts) — the M6 baseline-vs-harness
@@ -425,6 +570,23 @@ export interface EvalsReportCard {
   cleanHarnessPassed: number;
   cleanSavingsPct: number | null;
   measurementFailureCount: number;
+  policyViolationCount: number;
+  harnessConfig?: {
+    schemaVersion: 1 | 2;
+    harnessProfile: string;
+    familyCatalogVersion: string;
+    dialectPackVersion: string;
+    routePolicyVersion: string;
+    evalPolicyVersion: "eval-v1";
+    evaluatorOracleIdentity: string;
+    frontierEngine: string;
+    frontierRoles: {
+      planning?: FrontierSelection;
+      review: FrontierSelection;
+      escalation: FrontierSelection;
+      baseline: FrontierSelection;
+    };
+  };
 }
 
 // -- runOrchestrate/runEvals request params (runId is minted internally —
@@ -439,6 +601,121 @@ export interface OrchestrateRunParams {
   maxWorkerAttempts?: number;
   workerTimeoutMs?: number;
   reviewTimeoutMs?: number;
+  frontier?: { review?: FrontierSelection; escalation?: FrontierSelection };
+}
+
+export type RuntimeSessionStatus =
+  | "created"
+  | "running"
+  | "waiting-approval"
+  | "interrupted"
+  | "needs-recovery"
+  | "completed"
+  | "failed"
+  | "cancelled";
+
+export type RuntimeSessionKind = "orchestrate" | "worker" | "child" | "review" | "escalation";
+
+export interface RuntimeSession {
+  id: string;
+  runId: string;
+  parentSessionId?: string;
+  kind: RuntimeSessionKind;
+  status: RuntimeSessionStatus;
+  version: number;
+  resumeCapability: "exact" | "worktree-only" | "locked";
+  projectDir: string;
+  worktreePath?: string;
+  baseSha?: string;
+  modelFingerprint?: string;
+  configurationFingerprint?: string;
+  budgetSteps?: number;
+  budgetDeadlineAt?: string;
+  usedSteps: number;
+  inputTokens: number;
+  outputTokens: number;
+  costUsd: number | null;
+  createdAt: string;
+  updatedAt: string;
+  outcome?: string;
+}
+
+export type RuntimeLockedValue<T> =
+  | { state: "absent" }
+  | { state: "locked" }
+  | { state: "available"; value: T };
+
+export interface RuntimeEvent<T = unknown> {
+  sessionId: string;
+  seq: number;
+  type: string;
+  at: string;
+  metadata: Record<string, unknown>;
+  payload: RuntimeLockedValue<T>;
+}
+
+export interface RuntimeApproval {
+  id: string;
+  sessionId: string;
+  policySource: string;
+  status: "pending" | "approved" | "denied" | "cancelled";
+  scope: Record<string, unknown>;
+  request: RuntimeLockedValue<unknown>;
+  response: RuntimeLockedValue<unknown>;
+  createdAt: string;
+}
+
+export interface RuntimeSessionDetails {
+  session: RuntimeSession;
+  pendingApproval: RuntimeApproval | null;
+  events?: RuntimeEvent[];
+}
+
+export type RuntimeSessionAction =
+  | { type: "respond-approval"; approvalId: string; approved: boolean; response?: unknown }
+  | { type: "resume" }
+  | { type: "recover-current-state" }
+  | { type: "recover-checkpoint" }
+  | { type: "cancel" }
+  | { type: "send-child"; childSessionId: string; message: unknown }
+  | { type: "close-child"; childSessionId: string }
+  | { type: "import-child-diff"; childSessionId: string };
+
+export interface RuntimeConfiguration {
+  traceEnabled: boolean;
+  retentionDays: number;
+  retentionBytes: number;
+  sandboxGrants: string[];
+  enabledExtensions: string[];
+  childrenEnabled: boolean;
+}
+
+export type RuntimeExtensionKind = "skill" | "mcp" | "hook";
+
+export interface RuntimeExtensionRegistration {
+  kind: RuntimeExtensionKind;
+  id: string;
+  fingerprint: string;
+  config: Record<string, unknown>;
+  diagnostics: Array<{ code: string; message: string }>;
+  approvalStatus: "pending" | "approved" | "revoked";
+  enabled: boolean;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface RuntimeSkillSummary {
+  id: string;
+  name: string;
+  description: string;
+  dialect: "common" | "claude-code" | "codex";
+  sourcePath: string;
+  resources: string[];
+  allowedTools: string[];
+  invocation: { implicit: boolean; userInvocable: boolean };
+  fingerprint: string;
+  requiresApproval: boolean;
+  diagnostics: Array<{ code: string; field?: string; message: string }>;
 }
 
 /** Mirrors `engine.evals.run`'s RPC-level `TaskDescriptorSchema`
@@ -457,6 +734,11 @@ export interface EvalsRunRequestParams {
   projectDir: string;
   tasks: EvalsTaskDescriptor[];
   sampleNote?: string;
+  frontier?: {
+    review?: FrontierSelection;
+    escalation?: FrontierSelection;
+    baseline?: FrontierSelection;
+  };
 }
 
 // -- progress notification payloads ------------------------------------------
@@ -508,6 +790,10 @@ export class EngineClient {
     }
   }
 
+  ensureRuntimeKey(projectDir: string): Promise<string> {
+    return ensureRuntimeKey(projectDir);
+  }
+
   /** Subscribe to engine notifications. Lazily establishes the ONE
    * `engine_events` Channel/invoke on this instance's first subscriber;
    * every subsequent subscriber (on the same instance) shares it — no
@@ -543,11 +829,26 @@ export class EngineClient {
     return this.call<ModelsListResult>("engine.models.list", {}, opts);
   }
 
+  /** Make one minimal provider request before any key or metadata is saved.
+   * The engine uses a scratch registry, so a failed check cannot leave a
+   * broken provider available for routing. */
+  modelsCheckConnection(
+    config: ProviderConnectionCheckInput,
+    opts?: CallOptions,
+  ): Promise<{ connected: true }> {
+    return this.call<{ connected: true }>("engine.models.check", config, opts);
+  }
+
   /** `engine.models.configure` — registers (or overwrites) a provider in the
    * engine's in-memory registry so routing can resolve to it. The engine keeps
    * the apiKey memory-only per its own contract; this call carries it once. */
   modelsConfigure(config: ProviderConfigInput, opts?: CallOptions): Promise<{ configured: boolean }> {
     return this.call<{ configured: boolean }>("engine.models.configure", config, opts);
+  }
+
+  /** Remove a provider from the engine's live in-memory registry. */
+  modelsUnconfigure(id: string, opts?: CallOptions): Promise<{ unconfigured: boolean }> {
+    return this.call<{ unconfigured: boolean }>("engine.models.unconfigure", { id }, opts);
   }
 
   wikiBuild(projectDir: string, opts?: CallOptions): Promise<WikiBuildStats> {
@@ -568,6 +869,13 @@ export class EngineClient {
     return this.call<HarnessStatus>("engine.harness.status", { projectDir }, opts);
   }
 
+  /** Deterministic harness/wiki verification plus metadata-only operational
+   * evidence from recent real runs. This does not run model comparisons or
+   * claim that any generated answer is semantically correct. */
+  harnessHealth(projectDir: string, opts?: CallOptions): Promise<HarnessHealthReport> {
+    return this.call<HarnessHealthReport>("engine.harness.health", { projectDir }, opts);
+  }
+
   /** `engine.harness.generate` is long-running and currently not
    * cancellable. Progress is streamed through `harness.progress` and filtered
    * by projectDir so a stale in-flight notification cannot land in a newly
@@ -575,6 +883,7 @@ export class EngineClient {
   harnessGenerate(
     projectDir: string,
     onProgress?: (event: HarnessProgressEvent) => void,
+    frontier?: FrontierSelection,
     opts?: CallOptions,
   ): Promise<GenerateHarnessResult> {
     const unsubscribe =
@@ -590,9 +899,17 @@ export class EngineClient {
             onProgress(event as HarnessProgressEvent);
           });
 
-    return this.call<GenerateHarnessResult>("engine.harness.generate", { projectDir }, opts).finally(() => {
+    return this.call<GenerateHarnessResult>(
+      "engine.harness.generate",
+      frontier === undefined ? { projectDir } : { projectDir, frontier },
+      opts,
+    ).finally(() => {
       unsubscribe?.();
     });
+  }
+
+  frontierModels(opts?: CallOptions): Promise<FrontierModelsResult> {
+    return this.call<FrontierModelsResult>("engine.frontier.models", {}, opts);
   }
 
   /** `engine.harness.read` — the team view for a READY harness. Throws an
@@ -627,6 +944,52 @@ export class EngineClient {
     return this.call<void>("engine.harness.card.approve", { projectDir }, opts);
   }
 
+  routingProposals(projectDir: string, opts?: CallOptions): Promise<{ candidates: RoutingCandidate[] }> {
+    return this.call("engine.routing.proposals.list", { projectDir }, opts);
+  }
+
+  routingStatus(projectDir: string, opts?: CallOptions): Promise<{
+    active: RoutingCandidate | null;
+    currentHarnessDigest: string;
+  }> {
+    return this.call("engine.routing.status", { projectDir }, opts);
+  }
+
+  routingCreateProposal(projectDir: string, opts?: CallOptions): Promise<{ candidate: RoutingCandidate }> {
+    return this.call("engine.routing.proposals.create", { projectDir }, opts);
+  }
+
+  routingCompleteShadow(
+    projectDir: string,
+    candidate: Pick<RoutingCandidate, "id" | "evidenceDigest">,
+    opts?: CallOptions,
+  ): Promise<{ candidate: RoutingCandidate }> {
+    return this.call(
+      "engine.routing.proposals.shadow",
+      { projectDir, candidateId: candidate.id, evidenceDigest: candidate.evidenceDigest },
+      opts,
+    );
+  }
+
+  routingPromote(
+    projectDir: string,
+    candidateId: string,
+    expectedHarnessDigest: string,
+    opts?: CallOptions,
+  ): Promise<{ candidate: RoutingCandidate }> {
+    return this.call(
+      "engine.routing.proposals.promote",
+      { projectDir, candidateId, expectedHarnessDigest, humanApproved: true },
+      opts,
+    );
+  }
+
+  routingRollback(projectDir: string, candidateId: string, opts?: CallOptions): Promise<{
+    activeCandidateId?: string;
+  }> {
+    return this.call("engine.routing.rollback", { projectDir, candidateId }, opts);
+  }
+
   // -- cancellable long runs (M7c Task 2) ----------------------------------
 
   /** `engine.orchestrate` as a `CancellableRun<OrchestrateResult>` — see
@@ -645,6 +1008,134 @@ export class EngineClient {
     );
   }
 
+  /** Durable async orchestration: acknowledges admission immediately. */
+  orchestrateStart(
+    params: OrchestrateRunParams & { runId?: string },
+    opts?: CallOptions,
+  ): Promise<{ sessionId: string; runId: string; status: RuntimeSessionStatus; version: number }> {
+    return this.call("engine.orchestrate.start", params, opts);
+  }
+
+  runtimeConfigure(
+    projectDir: string,
+    input: Partial<RuntimeConfiguration> & { traceKey?: string },
+    opts?: CallOptions,
+  ): Promise<{ configured: true; configuration: RuntimeConfiguration }> {
+    return this.call("engine.runtime.configure", { projectDir, ...input }, opts);
+  }
+
+  runtimeStatus(projectDir: string, opts?: CallOptions): Promise<{
+    configuration: RuntimeConfiguration;
+    keyState: "host" | "ephemeral" | "locked";
+    database: { path: string; schemaVersion: number; integrity: "ok" | "failed" };
+    sandbox: { available: boolean; provisional: boolean; reason?: string };
+  }> {
+    return this.call("engine.runtime.status", { projectDir }, opts);
+  }
+
+  runtimeExtensionsList(
+    projectDir: string,
+    kind?: RuntimeExtensionKind,
+    opts?: CallOptions,
+  ): Promise<{ extensions: RuntimeExtensionRegistration[] }> {
+    return this.call("engine.runtime.extensions.list", { projectDir, ...(kind === undefined ? {} : { kind }) }, opts);
+  }
+
+  runtimeExtensionRegister(
+    projectDir: string,
+    input: Pick<RuntimeExtensionRegistration, "kind" | "id" | "fingerprint" | "config"> & {
+      diagnostics?: Array<{ code: string; message: string }>;
+    },
+    opts?: CallOptions,
+  ): Promise<{ extension: RuntimeExtensionRegistration }> {
+    return this.call("engine.runtime.extensions.register", { projectDir, ...input }, opts);
+  }
+
+  runtimeExtensionApprove(
+    projectDir: string,
+    extension: Pick<RuntimeExtensionRegistration, "kind" | "id" | "fingerprint">,
+    approved: boolean,
+    opts?: CallOptions,
+  ): Promise<{ extension: RuntimeExtensionRegistration }> {
+    return this.call("engine.runtime.extensions.approve", { projectDir, ...extension, approved }, opts);
+  }
+
+  runtimeExtensionEnable(
+    projectDir: string,
+    extension: Pick<RuntimeExtensionRegistration, "kind" | "id" | "fingerprint">,
+    enabled: boolean,
+    opts?: CallOptions,
+  ): Promise<{ extension: RuntimeExtensionRegistration }> {
+    return this.call("engine.runtime.extensions.enable", { projectDir, ...extension, enabled }, opts);
+  }
+
+  runtimeSkillsDiscover(projectDir: string, opts?: CallOptions): Promise<{ skills: RuntimeSkillSummary[] }> {
+    return this.call("engine.runtime.skills.discover", { projectDir }, opts);
+  }
+
+  runtimeMcpRegister(
+    projectDir: string,
+    config: Record<string, unknown>,
+    opts?: CallOptions,
+  ): Promise<{ extension: RuntimeExtensionRegistration }> {
+    return this.call("engine.runtime.mcp.register", { projectDir, config }, opts);
+  }
+
+  runtimeMcpConnect(projectDir: string, id: string, opts?: CallOptions): Promise<{
+    status: "configuration-approval-required" | "inventory-approval-required" | "connected";
+    configurationFingerprint: string;
+    inventoryFingerprint?: string;
+  }> {
+    return this.call("engine.runtime.mcp.connect", { projectDir, id }, opts);
+  }
+
+  runtimeHookFingerprint(
+    input: { id: string; mode: "observational" | "enforcing"; executable: string; args?: string[] },
+    opts?: CallOptions,
+  ): Promise<{ fingerprint: string }> {
+    return this.call("engine.runtime.hooks.fingerprint", input, opts);
+  }
+
+  runtimeCredentialConfigure(reference: string, value?: string, opts?: CallOptions): Promise<{ configured: boolean }> {
+    return this.call("engine.runtime.credentials.configure", { reference, value }, opts);
+  }
+
+  sessionGet(
+    projectDir: string,
+    sessionId: string,
+    options: { includeEvents?: boolean; afterSeq?: number; eventLimit?: number } = {},
+    opts?: CallOptions,
+  ): Promise<RuntimeSessionDetails> {
+    return this.call("engine.sessions.get", { projectDir, sessionId, ...options }, opts);
+  }
+
+  sessionsList(
+    projectDir: string,
+    filters: {
+      status?: RuntimeSessionStatus;
+      kind?: RuntimeSessionKind;
+      parentSessionId?: string | null;
+      limit?: number;
+    } = {},
+    opts?: CallOptions,
+  ): Promise<{ sessions: RuntimeSession[] }> {
+    return this.call("engine.sessions.list", { projectDir, ...filters }, opts);
+  }
+
+  sessionAction(
+    projectDir: string,
+    sessionId: string,
+    expectedVersion: number,
+    action: RuntimeSessionAction,
+    opts?: CallOptions,
+  ): Promise<{ session: RuntimeSession; approval?: RuntimeApproval }> {
+    return this.call(
+      "engine.sessions.action",
+      { projectDir, sessionId, expectedVersion, action },
+      opts,
+    );
+  }
+
   /** `engine.evals.run` as a `CancellableRun<EvalsReportCard>` — see
    * `#startCancellableRun`'s own doc comment for the full contract. */
   runEvals(
@@ -656,6 +1147,37 @@ export class EngineClient {
       "evals.progress",
       params,
       onProgress,
+    );
+  }
+
+  candidatePrepareApply(
+    candidateId: string,
+    projectDir: string,
+    opts?: CallOptions,
+  ): Promise<{ approvalGrant: ApprovalGrant }> {
+    return this.call<{ approvalGrant: ApprovalGrant }>(
+      "engine.candidates.prepareApply",
+      { candidateId, projectDir },
+      opts,
+    );
+  }
+
+  candidateApply(
+    candidateId: string,
+    approvalGrant: ApprovalGrant,
+    projectDir: string,
+    runId?: string,
+    opts?: CallOptions,
+  ): Promise<{ applied: true; candidateId: string }> {
+    return this.call<{ applied: true; candidateId: string }>(
+      "engine.orchestrate.apply",
+      {
+        candidateId,
+        approvalGrant,
+        projectDir,
+        ...(runId === undefined ? {} : { runId }),
+      },
+      opts,
     );
   }
 
@@ -808,6 +1330,11 @@ export function loadPersistedSecrets(): Promise<void> {
   return invoke("load_persisted_secrets");
 }
 
+/** Host-generated, Keychain-backed AES-256 trace key for this project. */
+export function ensureRuntimeKey(projectDir: string): Promise<string> {
+  return invoke<string>("ensure_runtime_key", { projectDir });
+}
+
 // ---------------------------------------------------------------------------
 // Provider metadata commands (non-secret) — Rust host, NOT engine RPC.
 // ---------------------------------------------------------------------------
@@ -880,8 +1407,6 @@ export async function reconfigureProvidersOnLaunch(): Promise<void> {
 // ---------------------------------------------------------------------------
 // Frontier CLI-auth commands — Rust host. No token ever crosses this surface.
 // ---------------------------------------------------------------------------
-
-export type FrontierEngineKind = "claude-code" | "codex";
 
 /** Mirrors `frontier.rs`'s `FrontierAuthStatus`. */
 export interface FrontierAuthStatus {

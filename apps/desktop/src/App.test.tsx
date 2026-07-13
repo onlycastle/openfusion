@@ -41,7 +41,7 @@ async function freshApp() {
 }
 
 describe("App shell", () => {
-  it("renders the project section rail after a project is selected", async () => {
+  it("renders one workspace sidebar and the project switcher after a project is selected", async () => {
     invokeMock.mockImplementation((cmd: string) => {
       if (cmd === "engine_call") return Promise.resolve({ providers: [] });
       if (cmd === "list_projects") return Promise.resolve([{ path: "/r/alpha", name: "alpha" }]);
@@ -51,16 +51,17 @@ describe("App shell", () => {
     });
     const App = await freshApp();
     render(<App />);
-    await waitFor(() => expect(screen.getByRole("navigation", { name: /projects/i })).toBeTruthy());
-    await waitFor(() => expect(screen.getByRole("navigation", { name: /project sections/i })).toBeTruthy());
+    await waitFor(() => expect(screen.getByRole("navigation", { name: /workspace sections/i })).toBeTruthy());
+    expect(screen.queryByRole("navigation", { name: /project sections/i })).toBeNull();
     expect(screen.getAllByText("alpha").length).toBeGreaterThan(0);
   });
 
-  it("does not render the empty project section rail before a project exists", async () => {
+  it("keeps project-specific destinations disabled before a project exists", async () => {
     const App = await freshApp();
     render(<App />);
-    await waitFor(() => expect(screen.getByRole("navigation", { name: /projects/i })).toBeTruthy());
-    expect(screen.queryByRole("navigation", { name: /project sections/i })).toBeNull();
+    await waitFor(() => expect(screen.getByRole("navigation", { name: /workspace sections/i })).toBeTruthy());
+    expect((screen.getByRole("button", { name: "Harness" }) as HTMLButtonElement).disabled).toBe(true);
+    expect((screen.getByRole("button", { name: "Health" }) as HTMLButtonElement).disabled).toBe(true);
     expect(screen.getAllByRole("button", { name: /add project/i }).length).toBeGreaterThan(0);
   });
 

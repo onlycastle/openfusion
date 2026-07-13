@@ -19,7 +19,7 @@ describe("ProjectRail", () => {
     expect(screen.getByText("alpha")).toBeTruthy();
     expect(screen.getByRole("button", { name: "Chat" }).getAttribute("aria-current")).toBe("page");
     expect(screen.getByRole("button", { name: "Harness setting" })).toBeTruthy();
-    expect(screen.getByRole("button", { name: "Evals" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Health" })).toBeTruthy();
   });
 
   it("switches section on click", () => {

@@ -1,6 +1,15 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { engineClient, listProviderConfigs, type AgentModel, type HarnessAgentView, type HarnessTeam } from "../engineClient";
+import {
+  engineClient,
+  listProviderConfigs,
+  type AgentModel,
+  type HarnessAgentView,
+  type HarnessTeam,
+  type RoutingCandidate,
+} from "../engineClient";
 import { useProject } from "../ProjectContext";
+import { Dialog } from "../ui/Dialog";
+import { Spinner } from "../ui/Spinner";
 
 function friendlyMessage(err: unknown): string {
   if (err instanceof Error && err.message.trim().length > 0) return err.message;
@@ -52,7 +61,7 @@ export function HarnessSettingPanel() {
       .then(([status, configs]) => {
         if (activeProjectDirRef.current !== dir) return;
         setOptions([
-          { value: "frontier", label: "frontier", model: "frontier" },
+          { value: "frontier", label: "Lead model", model: "frontier" },
           ...configs.map((c) => ({
             value: c.id,
             label: `${c.kind} · ${c.model}`,
@@ -164,41 +173,181 @@ export function HarnessSettingPanel() {
     );
   }, [activeProjectDir, load]);
 
-  if (state.status === "loading") return <div className="harness-panel-screen"><p role="status">Loading harness…</p></div>;
+  if (state.status === "loading") return <div className="harness-panel-screen"><p role="status" className="screen-loading"><Spinner label="Loading harness" size="medium" /> Loading harness…</p></div>;
   if (state.status === "error") return <div className="harness-panel-screen"><p role="alert" className="error-text">{state.message}</p></div>;
   if (state.status === "missing") {
     return (
       <div className="harness-panel-screen">
-        <p>No harness yet. Generate one from the Chat tab, then return here to tune models.</p>
+        <div className="screen-empty-state">
+          <span className="screen-empty-icon" aria-hidden="true">◇</span>
+          <h2>No harness yet</h2>
+          <p>Build the project harness in Studio, then return here to review the Project Card and route the team.</p>
+        </div>
       </div>
     );
   }
 
   return (
     <div className="harness-panel-screen">
-      <h2 className="harness-tree-title">Harness setting</h2>
+      <header className="screen-title-block">
+        <p className="screen-eyebrow">Project configuration</p>
+        <h1 className="harness-tree-title">Harness</h1>
+        <p>Review the project knowledge OpenFusion trusts and choose how each specialist routes work.</p>
+      </header>
       {state.team.card !== null && (
         <ProjectCardSection card={state.team.card} error={cardError} onSave={onCardSave} onApprove={onCardApprove} />
       )}
-      <div className="harness-tree-root">Claude Code <span className="muted-text">orchestrator · frontier</span></div>
+      <div className="harness-tree-root"><span>Lead models</span><span className="muted-text">Planning · review · escalation</span></div>
       <ul className="harness-tree">
         {state.team.agents.map((agent) => (
           <AgentRow key={agent.name} agent={agent} options={options} onChange={onModelChange} />
         ))}
       </ul>
       <label className="harness-escalation">
-        Escalate to frontier after{" "}
-        <select aria-label="Escalate to frontier after N failed attempts" value={state.team.escalation} onChange={(e) => onEscalationChange(e.target.value)}>
+        Escalate to a lead model after{" "}
+        <select aria-label="Escalate to a lead model after N failed attempts" value={state.team.escalation} onChange={(e) => onEscalationChange(e.target.value)}>
           <option value={1}>1</option>
           <option value={2}>2</option>
           <option value={3}>3</option>
         </select>{" "}
         failed attempts
       </label>
+      <RoutingPolicySection projectDir={activeProjectDir!} />
       {options.length === 1 && (
-        <p className="muted-text harness-tree-caption">Only frontier is available — add a model provider in Settings to route work to cheaper models.</p>
+        <p className="muted-text harness-tree-caption">Only lead models are available — add a worker model in Settings to route suitable implementation work.</p>
       )}
     </div>
+  );
+}
+
+function percentage(value: number): string {
+  return Number.isFinite(value) ? `${Math.round(value * 100)}%` : "Unavailable";
+}
+
+function RoutingPolicySection({ projectDir }: { projectDir: string }) {
+  const [candidates, setCandidates] = useState<RoutingCandidate[]>([]);
+  const [active, setActive] = useState<RoutingCandidate | null>(null);
+  const [harnessDigest, setHarnessDigest] = useState("");
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [confirmCandidate, setConfirmCandidate] = useState<RoutingCandidate | null>(null);
+
+  const refresh = useCallback(() => {
+    setLoading(true);
+    setError(null);
+    Promise.all([
+      engineClient.routingProposals(projectDir),
+      engineClient.routingStatus(projectDir),
+    ]).then(([proposals, status]) => {
+      setCandidates(proposals.candidates);
+      setActive(status.active);
+      setHarnessDigest(status.currentHarnessDigest);
+    }).catch((reason: unknown) => {
+      setError(friendlyMessage(reason));
+    }).finally(() => setLoading(false));
+  }, [projectDir]);
+
+  useEffect(() => refresh(), [refresh]);
+
+  const act = (operation: Promise<unknown>): void => {
+    setLoading(true);
+    setError(null);
+    operation.then(refresh, (reason: unknown) => {
+      setError(friendlyMessage(reason));
+      setLoading(false);
+    });
+  };
+
+  return (
+    <section className="harness-card routing-policy-section">
+      <div className="harness-card-header">
+        <div>
+          <h3 className="harness-card-title">Evidence-backed routing</h3>
+          <p className="muted-text">Deterministic routing-v3 proposals require protected evidence, a shadow check, and your approval.</p>
+        </div>
+        <button
+          type="button"
+          disabled={loading}
+          onClick={() => act(engineClient.routingCreateProposal(projectDir))}
+        >
+          Compile proposal
+        </button>
+      </div>
+      {active !== null && (
+        <div className="routing-active-policy">
+          <strong>Active policy</strong>
+          <span>{active.id}</span>
+          <button type="button" disabled={loading} onClick={() => act(engineClient.routingRollback(projectDir, active.id))}>
+            Roll back
+          </button>
+        </div>
+      )}
+      {loading && candidates.length === 0 && <p role="status"><Spinner label="Loading routing evidence" /> Loading routing evidence…</p>}
+      {error !== null && <p role="alert" className="error-text">{error}</p>}
+      {candidates.length === 0 && !loading && error === null && (
+        <p className="muted-text">No routing proposal has been compiled for this harness.</p>
+      )}
+      <ul className="harness-tree routing-candidate-list">
+        {candidates.map((candidate) => (
+          <li key={candidate.id} className="harness-tree-row routing-candidate-row">
+            <span>
+              <strong>{candidate.id}</strong>
+              <small>{candidate.status} · {candidate.gate.cleanMatchedTasks} matched tasks</small>
+            </span>
+            <span className="muted-text">
+              quality lower {percentage(candidate.gate.qualityDelta.lower95)} · savings lower {percentage(candidate.gate.pairedSavings.lower95)}
+            </span>
+            <span>
+              {candidate.status === "proposed" && (
+                <button
+                  type="button"
+                  disabled={loading}
+                  onClick={() => act(engineClient.routingCompleteShadow(projectDir, candidate))}
+                >
+                  Run shadow check
+                </button>
+              )}
+              {candidate.status === "shadowed" && candidate.gate.eligible && (
+                <button type="button" className="primary-action" disabled={loading} onClick={() => setConfirmCandidate(candidate)}>
+                  Review promotion…
+                </button>
+              )}
+            </span>
+            {!candidate.gate.eligible && (
+              <small className="error-text">Blocked: {candidate.gate.reasons.join(", ")}</small>
+            )}
+          </li>
+        ))}
+      </ul>
+      <Dialog
+        open={confirmCandidate !== null}
+        title="Promote this routing policy?"
+        description="This changes deterministic routing for new sessions that exactly match the current harness and project fingerprints. Sparse or stale evidence still falls back to configured routing."
+        onClose={() => setConfirmCandidate(null)}
+        dismissOnBackdrop={false}
+        size="medium"
+        footer={
+          <>
+            <button type="button" onClick={() => setConfirmCandidate(null)}>Cancel</button>
+            <button
+              type="button"
+              className="ui-button-primary"
+              onClick={() => {
+                const candidate = confirmCandidate;
+                setConfirmCandidate(null);
+                if (candidate !== null) {
+                  act(engineClient.routingPromote(projectDir, candidate.id, harnessDigest));
+                }
+              }}
+            >
+              Promote policy
+            </button>
+          </>
+        }
+      >
+        <p>Promotion is reversible and does not mutate the harness. It activates only the compiled override table tied to the current harness digest.</p>
+      </Dialog>
+    </section>
   );
 }
 
@@ -241,6 +390,7 @@ function ProjectCardSection({
   onApprove: () => void;
 }) {
   const [digestDraft, setDigestDraft] = useState(card.digest);
+  const [approveOpen, setApproveOpen] = useState(false);
 
   // Reseed whenever a reload hands us a NEW `card` (a fresh RPC response
   // object) — covers both the happy path (post-save/-approve reload) and the
@@ -278,11 +428,31 @@ function ProjectCardSection({
           Save draft
         </button>
         {isDraft && (
-          <button type="button" disabled={isDirty} onClick={onApprove}>
-            Approve
+          <button type="button" className="primary-action" aria-label="Approve" disabled={isDirty} onClick={() => setApproveOpen(true)}>
+            Review and Approve…
           </button>
         )}
       </div>
+
+      <Dialog
+        open={approveOpen}
+        title="Approve this Project Card?"
+        description="Approved project knowledge is included in future model work. Confirm that the summary is accurate and contains no sensitive information you do not want sent to configured models."
+        onClose={() => setApproveOpen(false)}
+        dismissOnBackdrop={false}
+        size="medium"
+        footer={
+          <>
+            <button type="button" onClick={() => setApproveOpen(false)}>Cancel</button>
+            <button type="button" className="ui-button-primary" onClick={() => { setApproveOpen(false); onApprove(); }}>Approve Card</button>
+          </>
+        }
+      >
+        <div className="project-card-review">
+          <span>Summary being approved</span>
+          <p>{digestDraft}</p>
+        </div>
+      </Dialog>
     </section>
   );
 }

@@ -37,6 +37,7 @@
 // must either (a) also stage a triple-less copy of `.assets` at bundle time,
 // or (b) change the engine's runtime asset lookup to something bundle-
 // layout-aware. Flagging here so it isn't rediscovered from scratch later.
+import { execFileSync } from "node:child_process";
 import { cpSync, chmodSync, existsSync, mkdirSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -73,6 +74,10 @@ function targetTriple() {
 }
 
 function main() {
+  execFileSync(process.execPath, [path.join(desktopRoot, "scripts", "stage-sandbox-runner.mjs")], {
+    cwd: repoRoot,
+    stdio: "inherit",
+  });
   const triple = targetTriple();
   const binaryName = `openfusion-engine-${triple}`;
   const assetsName = `${binaryName}.assets`;

@@ -15,8 +15,8 @@ for the technology decisions this scaffold is built on.
 │ webview (src/main.tsx)      │   Channel    │ Rust — Tauri core        │  JSON-RPC 2.0  │ openfusion-engine      │
 │ React 18 + Vite             │◄────────────►│  commands.rs             │◄──────────────►│ sidecar (compiled      │
 │ @tauri-apps/api/core        │              │  engine_bridge.rs        │                │ Node binary)           │
-│ 4 cockpit screens: Project /│              │  lib.rs (lifecycle)      │                │ packages/engine        │
-│ Keys / Orchestrate / Evals  │              │                          │                │                        │
+│ Studio / Harness / Evals +  │              │  lib.rs (lifecycle)      │                │ packages/engine        │
+│ Settings                    │              │                          │                │                        │
 └─────────────────────────────┘              └──────────────────────────┘                └───────────────────────┘
 ```
 
@@ -133,22 +133,26 @@ Rust toolchain for `cargo`/`tauri`).
 #    engine changes):
 pnpm --filter @openfusion/engine build:sidecar
 
-# 2. Stage it into src-tauri/binaries/ (Tauri's externalBin convention):
+# 2. Build/stage the native sandbox and engine into src-tauri/binaries/
+#    (Tauri's externalBin convention):
 pnpm --filter @openfusion/desktop stage-sidecar
 
 # 3. Run the dev shell (spawns the Vite dev server + a Tauri window):
 pnpm --filter @openfusion/desktop tauri dev
 ```
 
-`stage-sidecar` (`scripts/stage-sidecar.mjs`) copies
+`stage-sidecar` (`scripts/stage-sidecar.mjs`) first invokes
+`stage-sandbox-runner`, then copies
 `packages/engine/dist-sidecar/openfusion-engine-<triple>` (+ its `.assets`
 sibling directory of native/wasm runtime assets — better-sqlite3's addon,
-tree-sitter query files and wasm) into `src-tauri/binaries/`. This is a
+tree-sitter query files and wasm) and the Rust
+`openfusion-sandbox-<triple>` runner into `src-tauri/binaries/`. This is a
 dev-time-only manual step, run by hand rather than wired into `build.rs` —
 but it is NOT optional for `cargo build`/`cargo test` in this crate.
 `tauri-build`'s build script validates that every `tauri.conf.json`
-`bundle.externalBin` entry (`binaries/openfusion-engine`) resolves to a real
-file on disk *during the build itself*, before a single line of this
+`bundle.externalBin` entry (`binaries/openfusion-engine` and
+`binaries/openfusion-sandbox`) resolves to a real file on disk *during the
+build itself*, before a single line of this
 crate's own code compiles; with nothing staged, `cargo build` fails with
 exit code 101 ("resource path `binaries/openfusion-engine-<triple>` doesn't
 exist"). So steps 1 and 2 above are prerequisites for ANY `cargo
@@ -170,89 +174,52 @@ it does not run the Rust suite; `test:rust` is the canonical, separate
 command for that. (Note: this is not yet wired into CI — `.github/workflows/ci.yml`
 has no cargo-test step, a pre-existing gap.)
 
-## The Cockpit: Four Screens
+## The workspace UI
 
-The desktop app exposes a "cockpit" UI with four screens:
+The current desktop interface has three project workspaces and one global
+Settings dialog. The evergreen product flow is documented in
+[`../../docs/human/workflows.md`](../../docs/human/workflows.md); this section
+records desktop-specific ownership.
 
-### Project Screen
-Discover and index a local git repository. The app prompts for a project
-directory, then calls `engine.wiki.build` to construct the symbol index and
-wiki. A live progress panel streams `wiki.build.progress` notifications
-(projectDir, detail) as indexing runs. Once complete, the screen renders
-summary stats (files indexed, symbols found, refs resolved). This screen owns
-project discovery and wiki construction only — it carries no eval references;
-the eval report card (verdict, savings, per-task results) lives on its own
-Evals screen, described below.
+### Studio
 
-### Keys Screen
-Configure frontier engine access (Claude Code / Codex OAuth) and open-model
-providers (BYOK: Moonshot, Z.ai, DeepSeek, OpenAI-compatible). The shell
-securely stores all keys in macOS Keychain — the engine never touches
-credentials, only holds references to them at runtime. Keys configured here
-are write-only to the UI; there is no "view my keys" export (defense in depth
-against accidental exposure).
+Studio owns project readiness and task execution. The project switcher lives in
+the shared toolbar. Studio checks wiki and harness status, guides the user to
+connect the selected lead-model runtimes and a worker model, builds or refreshes the harness, and
+then opens the task composer.
 
-### Orchestrate Screen
-The marquee "route → cheap worker diff → frontier review → escalate → apply"
-loop, live. Picks a project directory, takes a free-text task description,
-and calls `engineClient.runOrchestrate` — a cancellable run that mints a UUID
-runId and streams progress notifications (`orchestrate.progress`, carrying
-runId + stage + detail). The screen displays:
-- **Route:** which agent and model the task was assigned to (likely an open
-  model by default, escalating to frontier if the worker fails twice).
-- **Live progress:** status updates as the worker or frontier session executes.
-- **Diff review:** the changes the worker or frontier engine produced
-  (a simple syntax-colored preview, not a full diff editor).
-- **Review verdict:** whether the diff was approved or flagged for changes
-  (and if escalated to frontier, a simple "escalated" note).
-- **Cost breakdown:** worker cost and frontier cost separately, both
-  estimate-class and tagged with a pricingConfidence caveat.
-- **Apply button:** `engine.orchestrate.apply` stages the diff into the
-  working tree via `git apply --3way` (never commits; the diff is left staged
-  for human review and commit).
+Task runs use `engineClient.runOrchestrate`, stream run-id-filtered progress,
+and render route, attempts, review verdicts, diff, and estimate-class cost. A
+cancel action calls `engine.cancel({runId})` and renders cancellation separately
+from failure. Studio reports when dirty checkout content was excluded from the
+committed task snapshot. Applying is a second confirmed action: the client
+prepares a one-use grant for the exact `CandidateRef`, then submits the
+candidate and grant. The engine repeats HEAD/diff/dirty-overlap checks before
+`git apply --3way`; it does not commit or merge changes.
 
-A **Cancel button** is available while a run is in progress. It calls
-`engine.cancel({runId})` (the engine's true stop mechanism), which causes
-the run's promise to reject with a `RunCancelledError` — distinct from a
-genuine failure. The UI renders a "Cancelled" state, not "Failed," once
-the cancellation settles. The app mints a UUID `runId` for every run and
-passes it to the engine so that `engine.cancel` can reliably reach the
-right in-flight request without relying on a per-call timeout (timeouts
-would abandon the promise while the run continued on the engine side).
+### Harness
 
-### Evals Screen
-Run baseline-vs-harness evals to measure whether the generated harness
-held quality against open-model workers vs an all-frontier baseline. Takes
-a list of commit shas and a test command, calls `engineClient.runEvals` as
-a cancellable run streaming `evals.progress` notifications (carrying runId
-for correlation), and renders:
-- **Verdict badge:** pass (green: quality held, savings > 0, ≥5 tasks),
-  fail (red ETH-HAZARD badge: harness degraded quality below baseline —
-  flagged and never shipped regardless of cost savings), or inconclusive
-  (amber: too few tasks, unpriced models, zero baseline pass rate, or ≥20%
-  measurement failures).
-- **Savings percentage:** e.g., "42.5% (estimate-class, pricing confidence:
-  provider-reported)". If models are unpriced or the run is inconclusive,
-  displays "not computable" instead of a fake number.
-- **Per-task table:** each task row shows baseline pass/fail, harness pass/fail,
-  and measurement status (oracle mismatch or infra failure recorded; clean
-  baseline and harness results factored into the verdict only, measurement
-  failures excluded from both).
-- **Clean-subset counts:** cleanTaskCount (tasks where NEITHER side hit a
-  measurement failure — the clean subset the verdict is actually computed
-  from, per `packages/engine/src/evals/run.ts`), cleanBaselinePassed
-  (baseline row of that subset), cleanHarnessPassed, cleanSavingsPct, and
-  measurementFailureCount (infra issues; affects verdict inconclusiveness).
+Harness reads the generated team for the selected project. It lets the user
+edit and approve the Project Card, choose a model for each specialist, and set
+the number of worker failures before lead-model escalation. An approved card is
+trusted worker context; a draft card is not.
 
-The app **never displays the raw "we saved 42.5% cost but the harness failed
-8 of 10 tasks"** — a quality regression is an ETH hazard, flagged in the UI
-and never shipped as a savings win. All cost estimates carry a `pricingConfidence`
-caveat (verified/provider-reported/secondary/unverified/unpriced) — if that's
-not "verified," a small badge notes it. Unpriced calls taint the entire run to
-"inconclusive" rather than a fake savings number.
+### Health
 
-A **Cancel button** behaves exactly as in Orchestrate: calls `engine.cancel({runId})`,
-renders "Cancelled" once it settles (distinct from "Failed").
+Health verifies the selected project harness without running competing model
+answers. It shows structure and Git freshness, wiki index/retrieval/MCP
+delivery, and metadata-only production evidence such as runtime errors,
+escalations, review retries, tool errors, and apply outcomes. These signals
+measure operational reliability, not answer correctness.
+
+### Settings
+
+Settings manages official Claude/Codex connections, account-visible lead-model
+discovery, independent planning/review/escalation/baseline selections, and BYOK
+worker models.
+Provider configuration is verified with a real minimal request before routing
+uses it. Keys are write-only in the UI and may be persisted in macOS Keychain
+or retained for the current session only.
 
 ## Content-Security-Policy (CSP)
 
@@ -296,25 +263,20 @@ done:
    `ps -p <pid>` should report no matching process. `tests/lifecycle.rs`
    proves this same property headlessly against mock sidecars; this smoke
    is the real-binary, real-window confirmation.
-4. **Orchestrate screen: route → cheap-worker diff → frontier review → escalate → apply, with a working Cancel button.** Open a real project, enter a task
-   ("add a test for the signup form"), and watch the orchestrator:
-   classify the task → route it to an open model → worker spawns an isolated
-   git worktree → produces a diff → frontier review gate evaluates it → diff
-   is approved/rejected (or escalated to frontier if rejected twice). Once
-   approved, click the Apply button — verify that `git apply --3way` stages
-   the diff (a `git status` shows "Changes to be committed"). Midway through
+4. **Studio: route → sandboxed author → verify → independent review → candidate-bound Apply, with a working Cancel button.** Open a real project, enter a task
+   ("add a test for the signup form"), and watch the run:
+   classify the task → route it to a model → author in a detached host-private
+   worktree → materialize and deterministically verify the exact diff → review
+   that read-only candidate tree in an independent session. Once approved,
+   click Apply and verify that a fresh one-use grant is prepared and `git apply
+   --3way` updates the working tree without committing or merging. Reusing the
+   grant or moving HEAD must fail. Midway through
    a run, click Cancel and verify it transitions to "Cancelled" (not "Failed").
-5. **Evals screen: run a real eval and see the honest report card.** Run evals
-   on a few golden tasks (commits from the repo's history). Verify that the
-   Evals screen renders:
-   - A verdict (pass/fail/inconclusive — if "fail," there's an ETH-HAZARD red
-     badge, never shown as a savings win).
-   - A savings percentage with a `pricingConfidence` label (e.g., "28% (provider-reported)"),
-     or a generic "not computable" if the figure can't be priced (unpriced models, an empty
-     clean subset, zero clean-baseline cost, or subscription-auth zero-metering — never a fake number).
-   - Per-task results (baseline pass/fail, harness pass/fail, measurement status).
-   - Clean-subset counts at the top (cleanTaskCount, cleanBaselinePassed, etc.).
-   - A working Cancel button that renders "Cancelled" once it settles.
+5. **Health: verify the project harness and inspect production evidence.**
+   Open Health for a prepared project and verify that structure, freshness,
+   wiki index/retrieval/delivery, and recent orchestration/apply counts render.
+   Confirm that issue rows contain only stable categories and that the screen
+   makes no claim about free-form task correctness.
 6. **CSP under a production build.** Run `pnpm --filter @openfusion/desktop build` to produce a
    release binary (`tauri build` output), launch it directly, open the app,
    and invoke the Command-line-exposed JSON-RPC calls (or render a simple test screen
