@@ -1,0 +1,3710 @@
+[
+  {
+    "type": "dependency",
+    "from": "packages/engine/src/harness/fingerprint.ts",
+    "to": "packages/engine/src/orchestrate/review-policy.ts",
+    "unresolvedTo": "../orchestrate/review-policy.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "modules-must-not-import-application"
+    }
+  },
+  {
+    "type": "dependency",
+    "from": "packages/engine/src/harness/registry.ts",
+    "to": "packages/engine/src/orchestrate/review-policy.ts",
+    "unresolvedTo": "../orchestrate/review-policy.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "modules-must-not-import-application"
+    }
+  },
+  {
+    "type": "dependency",
+    "from": "packages/engine/src/runtime/service.ts",
+    "to": "packages/engine/src/orchestrate/orchestrate.ts",
+    "unresolvedTo": "../orchestrate/orchestrate.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "modules-must-not-import-application"
+    }
+  },
+  {
+    "type": "dependency",
+    "from": "packages/engine/src/harness/driver.ts",
+    "to": "packages/engine/src/rpc/cancel-registry.ts",
+    "unresolvedTo": "../rpc/cancel-registry.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "modules-must-not-import-transport"
+    }
+  },
+  {
+    "type": "dependency",
+    "from": "packages/engine/src/harness/generate.ts",
+    "to": "packages/engine/src/rpc/errors.ts",
+    "unresolvedTo": "../rpc/errors.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "modules-must-not-import-transport"
+    }
+  },
+  {
+    "type": "dependency",
+    "from": "packages/engine/src/harness/generate.ts",
+    "to": "packages/engine/src/rpc/guards.ts",
+    "unresolvedTo": "../rpc/guards.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "modules-must-not-import-transport"
+    }
+  },
+  {
+    "type": "dependency",
+    "from": "packages/engine/src/models/gateway.ts",
+    "to": "packages/engine/src/rpc/errors.ts",
+    "unresolvedTo": "../rpc/errors.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "modules-must-not-import-transport"
+    }
+  },
+  {
+    "type": "dependency",
+    "from": "packages/engine/src/models/providers.ts",
+    "to": "packages/engine/src/rpc/errors.ts",
+    "unresolvedTo": "../rpc/errors.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "modules-must-not-import-transport"
+    }
+  },
+  {
+    "type": "dependency",
+    "from": "packages/engine/src/runtime/supervisor.ts",
+    "to": "packages/engine/src/rpc/cancel-registry.ts",
+    "unresolvedTo": "../rpc/cancel-registry.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "modules-must-not-import-transport"
+    }
+  },
+  {
+    "type": "dependency",
+    "from": "packages/engine/src/runtime/supervisor.ts",
+    "to": "packages/engine/src/rpc/errors.ts",
+    "unresolvedTo": "../rpc/errors.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "modules-must-not-import-transport"
+    }
+  },
+  {
+    "type": "cycle",
+    "from": "packages/engine/src/engine.ts",
+    "to": "packages/engine/src/candidates/methods.ts",
+    "unresolvedTo": "./candidates/methods.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-circular"
+    },
+    "cycle": [
+      {
+        "name": "packages/engine/src/candidates/methods.ts",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "packages/engine/src/engine.ts",
+        "dependencyTypes": [
+          "local",
+          "type-only",
+          "import"
+        ]
+      }
+    ]
+  },
+  {
+    "type": "cycle",
+    "from": "packages/engine/src/engine.ts",
+    "to": "packages/engine/src/candidates/service.ts",
+    "unresolvedTo": "./candidates/service.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-circular"
+    },
+    "cycle": [
+      {
+        "name": "packages/engine/src/candidates/service.ts",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "packages/engine/src/engine.ts",
+        "dependencyTypes": [
+          "local",
+          "type-only",
+          "import"
+        ]
+      }
+    ]
+  },
+  {
+    "type": "cycle",
+    "from": "packages/engine/src/engine.ts",
+    "to": "packages/engine/src/engines/methods.ts",
+    "unresolvedTo": "./engines/methods.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-circular"
+    },
+    "cycle": [
+      {
+        "name": "packages/engine/src/engines/methods.ts",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "packages/engine/src/engine.ts",
+        "dependencyTypes": [
+          "local",
+          "type-only",
+          "import"
+        ]
+      }
+    ]
+  },
+  {
+    "type": "cycle",
+    "from": "packages/engine/src/engine.ts",
+    "to": "packages/engine/src/evals/experiment.ts",
+    "unresolvedTo": "./evals/experiment.js",
+    "dependencyTypes": [
+      "local",
+      "export"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-circular"
+    },
+    "cycle": [
+      {
+        "name": "packages/engine/src/evals/experiment.ts",
+        "dependencyTypes": [
+          "local",
+          "export"
+        ]
+      },
+      {
+        "name": "packages/engine/src/engine.ts",
+        "dependencyTypes": [
+          "local",
+          "type-only",
+          "import"
+        ]
+      }
+    ]
+  },
+  {
+    "type": "cycle",
+    "from": "packages/engine/src/engine.ts",
+    "to": "packages/engine/src/evals/methods.ts",
+    "unresolvedTo": "./evals/methods.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-circular"
+    },
+    "cycle": [
+      {
+        "name": "packages/engine/src/evals/methods.ts",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "packages/engine/src/engine.ts",
+        "dependencyTypes": [
+          "local",
+          "type-only",
+          "import"
+        ]
+      }
+    ]
+  },
+  {
+    "type": "cycle",
+    "from": "packages/engine/src/engine.ts",
+    "to": "packages/engine/src/evals/run.ts",
+    "unresolvedTo": "./evals/run.js",
+    "dependencyTypes": [
+      "local",
+      "export"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-circular"
+    },
+    "cycle": [
+      {
+        "name": "packages/engine/src/evals/run.ts",
+        "dependencyTypes": [
+          "local",
+          "export"
+        ]
+      },
+      {
+        "name": "packages/engine/src/engine.ts",
+        "dependencyTypes": [
+          "local",
+          "type-only",
+          "import"
+        ]
+      }
+    ]
+  },
+  {
+    "type": "cycle",
+    "from": "packages/engine/src/engine.ts",
+    "to": "packages/engine/src/harness/driver.ts",
+    "unresolvedTo": "./harness/driver.js",
+    "dependencyTypes": [
+      "local",
+      "export"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-circular"
+    },
+    "cycle": [
+      {
+        "name": "packages/engine/src/harness/driver.ts",
+        "dependencyTypes": [
+          "local",
+          "export"
+        ]
+      },
+      {
+        "name": "packages/engine/src/rpc/cancel-registry.ts",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "packages/engine/src/engine.ts",
+        "dependencyTypes": [
+          "local",
+          "type-only",
+          "import"
+        ]
+      }
+    ]
+  },
+  {
+    "type": "cycle",
+    "from": "packages/engine/src/engine.ts",
+    "to": "packages/engine/src/harness/generate.ts",
+    "unresolvedTo": "./harness/generate.js",
+    "dependencyTypes": [
+      "local",
+      "export"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-circular"
+    },
+    "cycle": [
+      {
+        "name": "packages/engine/src/harness/generate.ts",
+        "dependencyTypes": [
+          "local",
+          "export"
+        ]
+      },
+      {
+        "name": "packages/engine/src/engine.ts",
+        "dependencyTypes": [
+          "local",
+          "type-only",
+          "import"
+        ]
+      }
+    ]
+  },
+  {
+    "type": "cycle",
+    "from": "packages/engine/src/engine.ts",
+    "to": "packages/engine/src/harness/health.ts",
+    "unresolvedTo": "./harness/health.js",
+    "dependencyTypes": [
+      "local",
+      "export"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-circular"
+    },
+    "cycle": [
+      {
+        "name": "packages/engine/src/harness/health.ts",
+        "dependencyTypes": [
+          "local",
+          "export"
+        ]
+      },
+      {
+        "name": "packages/engine/src/engine.ts",
+        "dependencyTypes": [
+          "local",
+          "type-only",
+          "import"
+        ]
+      }
+    ]
+  },
+  {
+    "type": "cycle",
+    "from": "packages/engine/src/engine.ts",
+    "to": "packages/engine/src/harness/methods.ts",
+    "unresolvedTo": "./harness/methods.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-circular"
+    },
+    "cycle": [
+      {
+        "name": "packages/engine/src/harness/methods.ts",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "packages/engine/src/engine.ts",
+        "dependencyTypes": [
+          "local",
+          "type-only",
+          "import"
+        ]
+      }
+    ]
+  },
+  {
+    "type": "cycle",
+    "from": "packages/engine/src/engine.ts",
+    "to": "packages/engine/src/models/methods.ts",
+    "unresolvedTo": "./models/methods.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-circular"
+    },
+    "cycle": [
+      {
+        "name": "packages/engine/src/models/methods.ts",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "packages/engine/src/engine.ts",
+        "dependencyTypes": [
+          "local",
+          "type-only",
+          "import"
+        ]
+      }
+    ]
+  },
+  {
+    "type": "cycle",
+    "from": "packages/engine/src/engine.ts",
+    "to": "packages/engine/src/orchestrate/methods.ts",
+    "unresolvedTo": "./orchestrate/methods.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-circular"
+    },
+    "cycle": [
+      {
+        "name": "packages/engine/src/orchestrate/methods.ts",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "packages/engine/src/engine.ts",
+        "dependencyTypes": [
+          "local",
+          "type-only",
+          "import"
+        ]
+      }
+    ]
+  },
+  {
+    "type": "cycle",
+    "from": "packages/engine/src/engine.ts",
+    "to": "packages/engine/src/orchestrate/orchestrate.ts",
+    "unresolvedTo": "./orchestrate/orchestrate.js",
+    "dependencyTypes": [
+      "local",
+      "export"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-circular"
+    },
+    "cycle": [
+      {
+        "name": "packages/engine/src/orchestrate/orchestrate.ts",
+        "dependencyTypes": [
+          "local",
+          "export"
+        ]
+      },
+      {
+        "name": "packages/engine/src/engine.ts",
+        "dependencyTypes": [
+          "local",
+          "type-only",
+          "import"
+        ]
+      }
+    ]
+  },
+  {
+    "type": "cycle",
+    "from": "packages/engine/src/engine.ts",
+    "to": "packages/engine/src/orchestrate/review.ts",
+    "unresolvedTo": "./orchestrate/review.js",
+    "dependencyTypes": [
+      "local",
+      "export"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-circular"
+    },
+    "cycle": [
+      {
+        "name": "packages/engine/src/orchestrate/review.ts",
+        "dependencyTypes": [
+          "local",
+          "export"
+        ]
+      },
+      {
+        "name": "packages/engine/src/harness/driver.ts",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "packages/engine/src/rpc/cancel-registry.ts",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "packages/engine/src/engine.ts",
+        "dependencyTypes": [
+          "local",
+          "type-only",
+          "import"
+        ]
+      }
+    ]
+  },
+  {
+    "type": "cycle",
+    "from": "packages/engine/src/engine.ts",
+    "to": "packages/engine/src/rpc/cancel-registry.ts",
+    "unresolvedTo": "./rpc/cancel-registry.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-circular"
+    },
+    "cycle": [
+      {
+        "name": "packages/engine/src/rpc/cancel-registry.ts",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "packages/engine/src/engine.ts",
+        "dependencyTypes": [
+          "local",
+          "type-only",
+          "import"
+        ]
+      }
+    ]
+  },
+  {
+    "type": "cycle",
+    "from": "packages/engine/src/engine.ts",
+    "to": "packages/engine/src/runs/methods.ts",
+    "unresolvedTo": "./runs/methods.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-circular"
+    },
+    "cycle": [
+      {
+        "name": "packages/engine/src/runs/methods.ts",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "packages/engine/src/engine.ts",
+        "dependencyTypes": [
+          "local",
+          "type-only",
+          "import"
+        ]
+      }
+    ]
+  },
+  {
+    "type": "cycle",
+    "from": "packages/engine/src/engine.ts",
+    "to": "packages/engine/src/runtime/evidence-methods.ts",
+    "unresolvedTo": "./runtime/evidence-methods.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-circular"
+    },
+    "cycle": [
+      {
+        "name": "packages/engine/src/runtime/evidence-methods.ts",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "packages/engine/src/engine.ts",
+        "dependencyTypes": [
+          "local",
+          "type-only",
+          "import"
+        ]
+      }
+    ]
+  },
+  {
+    "type": "cycle",
+    "from": "packages/engine/src/engine.ts",
+    "to": "packages/engine/src/runtime/methods.ts",
+    "unresolvedTo": "./runtime/methods.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-circular"
+    },
+    "cycle": [
+      {
+        "name": "packages/engine/src/runtime/methods.ts",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "packages/engine/src/engine.ts",
+        "dependencyTypes": [
+          "local",
+          "type-only",
+          "import"
+        ]
+      }
+    ]
+  },
+  {
+    "type": "cycle",
+    "from": "packages/engine/src/engine.ts",
+    "to": "packages/engine/src/runtime/service.ts",
+    "unresolvedTo": "./runtime/service.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-circular"
+    },
+    "cycle": [
+      {
+        "name": "packages/engine/src/runtime/service.ts",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "packages/engine/src/engine.ts",
+        "dependencyTypes": [
+          "local",
+          "type-only",
+          "import"
+        ]
+      }
+    ]
+  },
+  {
+    "type": "cycle",
+    "from": "packages/engine/src/engine.ts",
+    "to": "packages/engine/src/runtime/supervisor.ts",
+    "unresolvedTo": "./runtime/supervisor.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-circular"
+    },
+    "cycle": [
+      {
+        "name": "packages/engine/src/runtime/supervisor.ts",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "packages/engine/src/engine.ts",
+        "dependencyTypes": [
+          "local",
+          "type-only",
+          "import"
+        ]
+      }
+    ]
+  },
+  {
+    "type": "cycle",
+    "from": "packages/engine/src/engine.ts",
+    "to": "packages/engine/src/wiki/mcp.ts",
+    "unresolvedTo": "./wiki/mcp.js",
+    "dependencyTypes": [
+      "local",
+      "export"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-circular"
+    },
+    "cycle": [
+      {
+        "name": "packages/engine/src/wiki/mcp.ts",
+        "dependencyTypes": [
+          "local",
+          "export"
+        ]
+      },
+      {
+        "name": "packages/engine/src/engine.ts",
+        "dependencyTypes": [
+          "local",
+          "type-only",
+          "import"
+        ]
+      }
+    ]
+  },
+  {
+    "type": "cycle",
+    "from": "packages/engine/src/engine.ts",
+    "to": "packages/engine/src/wiki/methods.ts",
+    "unresolvedTo": "./wiki/methods.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-circular"
+    },
+    "cycle": [
+      {
+        "name": "packages/engine/src/wiki/methods.ts",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "packages/engine/src/engine.ts",
+        "dependencyTypes": [
+          "local",
+          "type-only",
+          "import"
+        ]
+      }
+    ]
+  },
+  {
+    "type": "cycle",
+    "from": "packages/engine/src/engine.ts",
+    "to": "packages/engine/src/worker/methods.ts",
+    "unresolvedTo": "./worker/methods.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-circular"
+    },
+    "cycle": [
+      {
+        "name": "packages/engine/src/worker/methods.ts",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "packages/engine/src/engine.ts",
+        "dependencyTypes": [
+          "local",
+          "type-only",
+          "import"
+        ]
+      }
+    ]
+  },
+  {
+    "type": "cycle",
+    "from": "packages/engine/src/evals/experiment.ts",
+    "to": "packages/engine/src/evals/run.ts",
+    "unresolvedTo": "./run.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-circular"
+    },
+    "cycle": [
+      {
+        "name": "packages/engine/src/evals/run.ts",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "packages/engine/src/engine.ts",
+        "dependencyTypes": [
+          "local",
+          "type-only",
+          "import"
+        ]
+      },
+      {
+        "name": "packages/engine/src/evals/experiment.ts",
+        "dependencyTypes": [
+          "local",
+          "export"
+        ]
+      }
+    ]
+  },
+  {
+    "type": "cycle",
+    "from": "packages/engine/src/evals/methods.ts",
+    "to": "packages/engine/src/evals/experiment.ts",
+    "unresolvedTo": "./experiment.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-circular"
+    },
+    "cycle": [
+      {
+        "name": "packages/engine/src/evals/experiment.ts",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "packages/engine/src/engine.ts",
+        "dependencyTypes": [
+          "local",
+          "type-only",
+          "import"
+        ]
+      },
+      {
+        "name": "packages/engine/src/evals/methods.ts",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      }
+    ]
+  },
+  {
+    "type": "cycle",
+    "from": "packages/engine/src/evals/methods.ts",
+    "to": "packages/engine/src/evals/run.ts",
+    "unresolvedTo": "./run.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-circular"
+    },
+    "cycle": [
+      {
+        "name": "packages/engine/src/evals/run.ts",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "packages/engine/src/engine.ts",
+        "dependencyTypes": [
+          "local",
+          "type-only",
+          "import"
+        ]
+      },
+      {
+        "name": "packages/engine/src/evals/methods.ts",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      }
+    ]
+  },
+  {
+    "type": "cycle",
+    "from": "packages/engine/src/evals/run.ts",
+    "to": "packages/engine/src/evals/verdict.ts",
+    "unresolvedTo": "./verdict.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-circular"
+    },
+    "cycle": [
+      {
+        "name": "packages/engine/src/evals/verdict.ts",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "packages/engine/src/evals/run.ts",
+        "dependencyTypes": [
+          "local",
+          "type-only",
+          "import"
+        ]
+      }
+    ]
+  },
+  {
+    "type": "cycle",
+    "from": "packages/engine/src/evals/run.ts",
+    "to": "packages/engine/src/orchestrate/orchestrate.ts",
+    "unresolvedTo": "../orchestrate/orchestrate.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-circular"
+    },
+    "cycle": [
+      {
+        "name": "packages/engine/src/orchestrate/orchestrate.ts",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "packages/engine/src/engine.ts",
+        "dependencyTypes": [
+          "local",
+          "type-only",
+          "import"
+        ]
+      },
+      {
+        "name": "packages/engine/src/evals/run.ts",
+        "dependencyTypes": [
+          "local",
+          "export"
+        ]
+      }
+    ]
+  },
+  {
+    "type": "cycle",
+    "from": "packages/engine/src/evals/run.ts",
+    "to": "packages/engine/src/orchestrate/review.ts",
+    "unresolvedTo": "../orchestrate/review.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-circular"
+    },
+    "cycle": [
+      {
+        "name": "packages/engine/src/orchestrate/review.ts",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "packages/engine/src/harness/driver.ts",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "packages/engine/src/rpc/cancel-registry.ts",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "packages/engine/src/engine.ts",
+        "dependencyTypes": [
+          "local",
+          "type-only",
+          "import"
+        ]
+      },
+      {
+        "name": "packages/engine/src/evals/run.ts",
+        "dependencyTypes": [
+          "local",
+          "export"
+        ]
+      }
+    ]
+  },
+  {
+    "type": "cycle",
+    "from": "packages/engine/src/evals/run.ts",
+    "to": "packages/engine/src/rpc/cancel-registry.ts",
+    "unresolvedTo": "../rpc/cancel-registry.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-circular"
+    },
+    "cycle": [
+      {
+        "name": "packages/engine/src/rpc/cancel-registry.ts",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "packages/engine/src/engine.ts",
+        "dependencyTypes": [
+          "local",
+          "type-only",
+          "import"
+        ]
+      },
+      {
+        "name": "packages/engine/src/evals/run.ts",
+        "dependencyTypes": [
+          "local",
+          "export"
+        ]
+      }
+    ]
+  },
+  {
+    "type": "cycle",
+    "from": "packages/engine/src/evals/run.ts",
+    "to": "packages/engine/src/runtime/snapshot.ts",
+    "unresolvedTo": "../runtime/snapshot.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-circular"
+    },
+    "cycle": [
+      {
+        "name": "packages/engine/src/runtime/snapshot.ts",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "packages/engine/src/engine.ts",
+        "dependencyTypes": [
+          "local",
+          "type-only",
+          "import"
+        ]
+      },
+      {
+        "name": "packages/engine/src/evals/run.ts",
+        "dependencyTypes": [
+          "local",
+          "export"
+        ]
+      }
+    ]
+  },
+  {
+    "type": "cycle",
+    "from": "packages/engine/src/harness/generate.ts",
+    "to": "packages/engine/src/harness/driver.ts",
+    "unresolvedTo": "./driver.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-circular"
+    },
+    "cycle": [
+      {
+        "name": "packages/engine/src/harness/driver.ts",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "packages/engine/src/rpc/cancel-registry.ts",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "packages/engine/src/engine.ts",
+        "dependencyTypes": [
+          "local",
+          "type-only",
+          "import"
+        ]
+      },
+      {
+        "name": "packages/engine/src/harness/generate.ts",
+        "dependencyTypes": [
+          "local",
+          "export"
+        ]
+      }
+    ]
+  },
+  {
+    "type": "cycle",
+    "from": "packages/engine/src/harness/health.ts",
+    "to": "packages/engine/src/wiki/verify.ts",
+    "unresolvedTo": "../wiki/verify.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-circular"
+    },
+    "cycle": [
+      {
+        "name": "packages/engine/src/wiki/verify.ts",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "packages/engine/src/engine.ts",
+        "dependencyTypes": [
+          "local",
+          "type-only",
+          "import"
+        ]
+      },
+      {
+        "name": "packages/engine/src/harness/health.ts",
+        "dependencyTypes": [
+          "local",
+          "export"
+        ]
+      }
+    ]
+  },
+  {
+    "type": "cycle",
+    "from": "packages/engine/src/harness/methods.ts",
+    "to": "packages/engine/src/harness/driver.ts",
+    "unresolvedTo": "./driver.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-circular"
+    },
+    "cycle": [
+      {
+        "name": "packages/engine/src/harness/driver.ts",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "packages/engine/src/rpc/cancel-registry.ts",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "packages/engine/src/engine.ts",
+        "dependencyTypes": [
+          "local",
+          "type-only",
+          "import"
+        ]
+      },
+      {
+        "name": "packages/engine/src/harness/methods.ts",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      }
+    ]
+  },
+  {
+    "type": "cycle",
+    "from": "packages/engine/src/harness/methods.ts",
+    "to": "packages/engine/src/harness/generate.ts",
+    "unresolvedTo": "./generate.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-circular"
+    },
+    "cycle": [
+      {
+        "name": "packages/engine/src/harness/generate.ts",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "packages/engine/src/engine.ts",
+        "dependencyTypes": [
+          "local",
+          "type-only",
+          "import"
+        ]
+      },
+      {
+        "name": "packages/engine/src/harness/methods.ts",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      }
+    ]
+  },
+  {
+    "type": "cycle",
+    "from": "packages/engine/src/harness/methods.ts",
+    "to": "packages/engine/src/harness/health.ts",
+    "unresolvedTo": "./health.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-circular"
+    },
+    "cycle": [
+      {
+        "name": "packages/engine/src/harness/health.ts",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "packages/engine/src/engine.ts",
+        "dependencyTypes": [
+          "local",
+          "type-only",
+          "import"
+        ]
+      },
+      {
+        "name": "packages/engine/src/harness/methods.ts",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      }
+    ]
+  },
+  {
+    "type": "cycle",
+    "from": "packages/engine/src/orchestrate/orchestrate.ts",
+    "to": "packages/engine/src/orchestrate/review.ts",
+    "unresolvedTo": "./review.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-circular"
+    },
+    "cycle": [
+      {
+        "name": "packages/engine/src/orchestrate/review.ts",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "packages/engine/src/harness/driver.ts",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "packages/engine/src/rpc/cancel-registry.ts",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "packages/engine/src/engine.ts",
+        "dependencyTypes": [
+          "local",
+          "type-only",
+          "import"
+        ]
+      },
+      {
+        "name": "packages/engine/src/orchestrate/orchestrate.ts",
+        "dependencyTypes": [
+          "local",
+          "export"
+        ]
+      }
+    ]
+  },
+  {
+    "type": "cycle",
+    "from": "packages/engine/src/orchestrate/orchestrate.ts",
+    "to": "packages/engine/src/rpc/cancel-registry.ts",
+    "unresolvedTo": "../rpc/cancel-registry.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-circular"
+    },
+    "cycle": [
+      {
+        "name": "packages/engine/src/rpc/cancel-registry.ts",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "packages/engine/src/engine.ts",
+        "dependencyTypes": [
+          "local",
+          "type-only",
+          "import"
+        ]
+      },
+      {
+        "name": "packages/engine/src/orchestrate/orchestrate.ts",
+        "dependencyTypes": [
+          "local",
+          "export"
+        ]
+      }
+    ]
+  },
+  {
+    "type": "cycle",
+    "from": "packages/engine/src/orchestrate/orchestrate.ts",
+    "to": "packages/engine/src/runtime/snapshot.ts",
+    "unresolvedTo": "../runtime/snapshot.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-circular"
+    },
+    "cycle": [
+      {
+        "name": "packages/engine/src/runtime/snapshot.ts",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "packages/engine/src/engine.ts",
+        "dependencyTypes": [
+          "local",
+          "type-only",
+          "import"
+        ]
+      },
+      {
+        "name": "packages/engine/src/orchestrate/orchestrate.ts",
+        "dependencyTypes": [
+          "local",
+          "export"
+        ]
+      }
+    ]
+  },
+  {
+    "type": "cycle",
+    "from": "packages/engine/src/runtime/service.ts",
+    "to": "packages/engine/src/orchestrate/orchestrate.ts",
+    "unresolvedTo": "../orchestrate/orchestrate.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-circular"
+    },
+    "cycle": [
+      {
+        "name": "packages/engine/src/orchestrate/orchestrate.ts",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "packages/engine/src/engine.ts",
+        "dependencyTypes": [
+          "local",
+          "type-only",
+          "import"
+        ]
+      },
+      {
+        "name": "packages/engine/src/runtime/service.ts",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      }
+    ]
+  },
+  {
+    "type": "cycle",
+    "from": "packages/engine/src/runtime/service.ts",
+    "to": "packages/engine/src/runtime/children.ts",
+    "unresolvedTo": "./children.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-circular"
+    },
+    "cycle": [
+      {
+        "name": "packages/engine/src/runtime/children.ts",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "packages/engine/src/engine.ts",
+        "dependencyTypes": [
+          "local",
+          "type-only",
+          "import"
+        ]
+      },
+      {
+        "name": "packages/engine/src/runtime/service.ts",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      }
+    ]
+  },
+  {
+    "type": "cycle",
+    "from": "packages/engine/src/runtime/supervisor.ts",
+    "to": "packages/engine/src/rpc/cancel-registry.ts",
+    "unresolvedTo": "../rpc/cancel-registry.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-circular"
+    },
+    "cycle": [
+      {
+        "name": "packages/engine/src/rpc/cancel-registry.ts",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "packages/engine/src/engine.ts",
+        "dependencyTypes": [
+          "local",
+          "type-only",
+          "import"
+        ]
+      },
+      {
+        "name": "packages/engine/src/runtime/supervisor.ts",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      }
+    ]
+  },
+  {
+    "type": "cycle",
+    "from": "packages/engine/src/runtime/supervisor.ts",
+    "to": "packages/engine/src/runtime/snapshot.ts",
+    "unresolvedTo": "./snapshot.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-circular"
+    },
+    "cycle": [
+      {
+        "name": "packages/engine/src/runtime/snapshot.ts",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "packages/engine/src/engine.ts",
+        "dependencyTypes": [
+          "local",
+          "type-only",
+          "import"
+        ]
+      },
+      {
+        "name": "packages/engine/src/runtime/supervisor.ts",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      }
+    ]
+  },
+  {
+    "type": "cycle",
+    "from": "packages/engine/src/wiki/methods.ts",
+    "to": "packages/engine/src/wiki/mcp.ts",
+    "unresolvedTo": "./mcp.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-circular"
+    },
+    "cycle": [
+      {
+        "name": "packages/engine/src/wiki/mcp.ts",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "packages/engine/src/engine.ts",
+        "dependencyTypes": [
+          "local",
+          "type-only",
+          "import"
+        ]
+      },
+      {
+        "name": "packages/engine/src/wiki/methods.ts",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      }
+    ]
+  },
+  {
+    "type": "cycle",
+    "from": "packages/engine/src/wiki/methods.ts",
+    "to": "packages/engine/src/wiki/verify.ts",
+    "unresolvedTo": "./verify.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-circular"
+    },
+    "cycle": [
+      {
+        "name": "packages/engine/src/wiki/verify.ts",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "packages/engine/src/engine.ts",
+        "dependencyTypes": [
+          "local",
+          "type-only",
+          "import"
+        ]
+      },
+      {
+        "name": "packages/engine/src/wiki/methods.ts",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      }
+    ]
+  },
+  {
+    "type": "cycle",
+    "from": "packages/engine/src/worker/methods.ts",
+    "to": "packages/engine/src/runtime/children.ts",
+    "unresolvedTo": "../runtime/children.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-circular"
+    },
+    "cycle": [
+      {
+        "name": "packages/engine/src/runtime/children.ts",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "packages/engine/src/engine.ts",
+        "dependencyTypes": [
+          "local",
+          "type-only",
+          "import"
+        ]
+      },
+      {
+        "name": "packages/engine/src/worker/methods.ts",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      }
+    ]
+  },
+  {
+    "type": "cycle",
+    "from": "packages/engine/src/worker/methods.ts",
+    "to": "packages/engine/src/runtime/snapshot.ts",
+    "unresolvedTo": "../runtime/snapshot.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-circular"
+    },
+    "cycle": [
+      {
+        "name": "packages/engine/src/runtime/snapshot.ts",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "packages/engine/src/engine.ts",
+        "dependencyTypes": [
+          "local",
+          "type-only",
+          "import"
+        ]
+      },
+      {
+        "name": "packages/engine/src/worker/methods.ts",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      }
+    ]
+  },
+  {
+    "type": "cycle",
+    "from": "packages/engine/src/worker/tools.ts",
+    "to": "packages/engine/src/worker/apply-patch.ts",
+    "unresolvedTo": "./apply-patch.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-circular"
+    },
+    "cycle": [
+      {
+        "name": "packages/engine/src/worker/apply-patch.ts",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "packages/engine/src/worker/tools.ts",
+        "dependencyTypes": [
+          "local",
+          "type-only",
+          "import"
+        ]
+      }
+    ]
+  },
+  {
+    "type": "dependency",
+    "from": "packages/engine/src/candidates/service.ts",
+    "to": "packages/engine/src/harness/registry.ts",
+    "unresolvedTo": "../harness/registry.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-cross-module-deep-imports"
+    }
+  },
+  {
+    "type": "dependency",
+    "from": "packages/engine/src/candidates/service.ts",
+    "to": "packages/engine/src/runtime/sandbox.ts",
+    "unresolvedTo": "../runtime/sandbox.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-cross-module-deep-imports"
+    }
+  },
+  {
+    "type": "dependency",
+    "from": "packages/engine/src/candidates/service.ts",
+    "to": "packages/engine/src/runtime/types.ts",
+    "unresolvedTo": "../runtime/types.js",
+    "dependencyTypes": [
+      "local",
+      "type-only",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-cross-module-deep-imports"
+    }
+  },
+  {
+    "type": "dependency",
+    "from": "packages/engine/src/candidates/service.ts",
+    "to": "packages/engine/src/verification/policy.ts",
+    "unresolvedTo": "../verification/policy.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-cross-module-deep-imports"
+    }
+  },
+  {
+    "type": "dependency",
+    "from": "packages/engine/src/candidates/service.ts",
+    "to": "packages/engine/src/worker/worktree.ts",
+    "unresolvedTo": "../worker/worktree.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-cross-module-deep-imports"
+    }
+  },
+  {
+    "type": "dependency",
+    "from": "packages/engine/src/engines/claude.ts",
+    "to": "packages/engine/src/runtime/capabilities.ts",
+    "unresolvedTo": "../runtime/capabilities.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-cross-module-deep-imports"
+    }
+  },
+  {
+    "type": "dependency",
+    "from": "packages/engine/src/engines/codex.ts",
+    "to": "packages/engine/src/runtime/capabilities.ts",
+    "unresolvedTo": "../runtime/capabilities.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-cross-module-deep-imports"
+    }
+  },
+  {
+    "type": "dependency",
+    "from": "packages/engine/src/engines/methods.ts",
+    "to": "packages/engine/src/models/meter.ts",
+    "unresolvedTo": "../models/meter.js",
+    "dependencyTypes": [
+      "local",
+      "type-only",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-cross-module-deep-imports"
+    }
+  },
+  {
+    "type": "dependency",
+    "from": "packages/engine/src/engines/methods.ts",
+    "to": "packages/engine/src/wiki/store.ts",
+    "unresolvedTo": "../wiki/store.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-cross-module-deep-imports"
+    }
+  },
+  {
+    "type": "dependency",
+    "from": "packages/engine/src/evals/bench/cli.ts",
+    "to": "packages/engine/src/engines/selection.ts",
+    "unresolvedTo": "../../engines/selection.js",
+    "dependencyTypes": [
+      "local",
+      "type-only",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-cross-module-deep-imports"
+    }
+  },
+  {
+    "type": "dependency",
+    "from": "packages/engine/src/evals/bench/cli.ts",
+    "to": "packages/engine/src/models/meter.ts",
+    "unresolvedTo": "../../models/meter.js",
+    "dependencyTypes": [
+      "local",
+      "type-only",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-cross-module-deep-imports"
+    }
+  },
+  {
+    "type": "dependency",
+    "from": "packages/engine/src/evals/bench/prepare.ts",
+    "to": "packages/engine/src/engines/selection.ts",
+    "unresolvedTo": "../../engines/selection.js",
+    "dependencyTypes": [
+      "local",
+      "type-only",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-cross-module-deep-imports"
+    }
+  },
+  {
+    "type": "dependency",
+    "from": "packages/engine/src/evals/bench/prepare.ts",
+    "to": "packages/engine/src/harness/generate.ts",
+    "unresolvedTo": "../../harness/generate.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-cross-module-deep-imports"
+    }
+  },
+  {
+    "type": "dependency",
+    "from": "packages/engine/src/evals/bench/prepare.ts",
+    "to": "packages/engine/src/harness/schema.ts",
+    "unresolvedTo": "../../harness/schema.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-cross-module-deep-imports"
+    }
+  },
+  {
+    "type": "dependency",
+    "from": "packages/engine/src/evals/bench/prepare.ts",
+    "to": "packages/engine/src/harness/store.ts",
+    "unresolvedTo": "../../harness/store.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-cross-module-deep-imports"
+    }
+  },
+  {
+    "type": "dependency",
+    "from": "packages/engine/src/evals/bench/providerConfig.ts",
+    "to": "packages/engine/src/models/providers.ts",
+    "unresolvedTo": "../../models/providers.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-cross-module-deep-imports"
+    }
+  },
+  {
+    "type": "dependency",
+    "from": "packages/engine/src/evals/bench/report.ts",
+    "to": "packages/engine/src/models/meter.ts",
+    "unresolvedTo": "../../models/meter.js",
+    "dependencyTypes": [
+      "local",
+      "type-only",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-cross-module-deep-imports"
+    }
+  },
+  {
+    "type": "dependency",
+    "from": "packages/engine/src/evals/bench/runner.ts",
+    "to": "packages/engine/src/engines/selection.ts",
+    "unresolvedTo": "../../engines/selection.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-cross-module-deep-imports"
+    }
+  },
+  {
+    "type": "dependency",
+    "from": "packages/engine/src/evals/bench/runner.ts",
+    "to": "packages/engine/src/engines/types.ts",
+    "unresolvedTo": "../../engines/types.js",
+    "dependencyTypes": [
+      "local",
+      "type-only",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-cross-module-deep-imports"
+    }
+  },
+  {
+    "type": "dependency",
+    "from": "packages/engine/src/evals/bench/runner.ts",
+    "to": "packages/engine/src/harness/store.ts",
+    "unresolvedTo": "../../harness/store.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-cross-module-deep-imports"
+    }
+  },
+  {
+    "type": "dependency",
+    "from": "packages/engine/src/evals/bench/runner.ts",
+    "to": "packages/engine/src/models/meter.ts",
+    "unresolvedTo": "../../models/meter.js",
+    "dependencyTypes": [
+      "local",
+      "type-only",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-cross-module-deep-imports"
+    }
+  },
+  {
+    "type": "dependency",
+    "from": "packages/engine/src/evals/experiment.ts",
+    "to": "packages/engine/src/engines/selection.ts",
+    "unresolvedTo": "../engines/selection.js",
+    "dependencyTypes": [
+      "local",
+      "type-only",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-cross-module-deep-imports"
+    }
+  },
+  {
+    "type": "dependency",
+    "from": "packages/engine/src/evals/experiment.ts",
+    "to": "packages/engine/src/harness/fingerprint.ts",
+    "unresolvedTo": "../harness/fingerprint.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-cross-module-deep-imports"
+    }
+  },
+  {
+    "type": "dependency",
+    "from": "packages/engine/src/evals/experiment.ts",
+    "to": "packages/engine/src/harness/store.ts",
+    "unresolvedTo": "../harness/store.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-cross-module-deep-imports"
+    }
+  },
+  {
+    "type": "dependency",
+    "from": "packages/engine/src/evals/experiment.ts",
+    "to": "packages/engine/src/runtime/context.ts",
+    "unresolvedTo": "../runtime/context.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-cross-module-deep-imports"
+    }
+  },
+  {
+    "type": "dependency",
+    "from": "packages/engine/src/evals/experiment.ts",
+    "to": "packages/engine/src/runtime/evidence.ts",
+    "unresolvedTo": "../runtime/evidence.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-cross-module-deep-imports"
+    }
+  },
+  {
+    "type": "dependency",
+    "from": "packages/engine/src/evals/experiment.ts",
+    "to": "packages/engine/src/runtime/supervisor.ts",
+    "unresolvedTo": "../runtime/supervisor.js",
+    "dependencyTypes": [
+      "local",
+      "type-only",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-cross-module-deep-imports"
+    }
+  },
+  {
+    "type": "dependency",
+    "from": "packages/engine/src/evals/methods.ts",
+    "to": "packages/engine/src/engines/selection.ts",
+    "unresolvedTo": "../engines/selection.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-cross-module-deep-imports"
+    }
+  },
+  {
+    "type": "dependency",
+    "from": "packages/engine/src/evals/methods.ts",
+    "to": "packages/engine/src/runs/ledger.ts",
+    "unresolvedTo": "../runs/ledger.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-cross-module-deep-imports"
+    }
+  },
+  {
+    "type": "dependency",
+    "from": "packages/engine/src/evals/methods.ts",
+    "to": "packages/engine/src/runtime/evidence.ts",
+    "unresolvedTo": "../runtime/evidence.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-cross-module-deep-imports"
+    }
+  },
+  {
+    "type": "dependency",
+    "from": "packages/engine/src/evals/run.ts",
+    "to": "packages/engine/src/engines/selection.ts",
+    "unresolvedTo": "../engines/selection.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-cross-module-deep-imports"
+    }
+  },
+  {
+    "type": "dependency",
+    "from": "packages/engine/src/evals/run.ts",
+    "to": "packages/engine/src/engines/types.ts",
+    "unresolvedTo": "../engines/types.js",
+    "dependencyTypes": [
+      "local",
+      "type-only",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-cross-module-deep-imports"
+    }
+  },
+  {
+    "type": "dependency",
+    "from": "packages/engine/src/evals/run.ts",
+    "to": "packages/engine/src/harness/fingerprint.ts",
+    "unresolvedTo": "../harness/fingerprint.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-cross-module-deep-imports"
+    }
+  },
+  {
+    "type": "dependency",
+    "from": "packages/engine/src/evals/run.ts",
+    "to": "packages/engine/src/harness/schema.ts",
+    "unresolvedTo": "../harness/schema.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-cross-module-deep-imports"
+    }
+  },
+  {
+    "type": "dependency",
+    "from": "packages/engine/src/evals/run.ts",
+    "to": "packages/engine/src/harness/store.ts",
+    "unresolvedTo": "../harness/store.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-cross-module-deep-imports"
+    }
+  },
+  {
+    "type": "dependency",
+    "from": "packages/engine/src/evals/run.ts",
+    "to": "packages/engine/src/models/catalog.ts",
+    "unresolvedTo": "../models/catalog.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-cross-module-deep-imports"
+    }
+  },
+  {
+    "type": "dependency",
+    "from": "packages/engine/src/evals/run.ts",
+    "to": "packages/engine/src/models/meter.ts",
+    "unresolvedTo": "../models/meter.js",
+    "dependencyTypes": [
+      "local",
+      "type-only",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-cross-module-deep-imports"
+    }
+  },
+  {
+    "type": "dependency",
+    "from": "packages/engine/src/evals/run.ts",
+    "to": "packages/engine/src/runtime/context.ts",
+    "unresolvedTo": "../runtime/context.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-cross-module-deep-imports"
+    }
+  },
+  {
+    "type": "dependency",
+    "from": "packages/engine/src/evals/run.ts",
+    "to": "packages/engine/src/runtime/evidence.ts",
+    "unresolvedTo": "../runtime/evidence.js",
+    "dependencyTypes": [
+      "local",
+      "type-only",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-cross-module-deep-imports"
+    }
+  },
+  {
+    "type": "dependency",
+    "from": "packages/engine/src/evals/run.ts",
+    "to": "packages/engine/src/runtime/sandbox.ts",
+    "unresolvedTo": "../runtime/sandbox.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-cross-module-deep-imports"
+    }
+  },
+  {
+    "type": "dependency",
+    "from": "packages/engine/src/evals/run.ts",
+    "to": "packages/engine/src/runtime/snapshot.ts",
+    "unresolvedTo": "../runtime/snapshot.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-cross-module-deep-imports"
+    }
+  },
+  {
+    "type": "dependency",
+    "from": "packages/engine/src/evals/run.ts",
+    "to": "packages/engine/src/runtime/store.ts",
+    "unresolvedTo": "../runtime/store.js",
+    "dependencyTypes": [
+      "local",
+      "type-only",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-cross-module-deep-imports"
+    }
+  },
+  {
+    "type": "dependency",
+    "from": "packages/engine/src/evals/run.ts",
+    "to": "packages/engine/src/runtime/supervisor.ts",
+    "unresolvedTo": "../runtime/supervisor.js",
+    "dependencyTypes": [
+      "local",
+      "type-only",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-cross-module-deep-imports"
+    }
+  },
+  {
+    "type": "dependency",
+    "from": "packages/engine/src/evals/verdict.ts",
+    "to": "packages/engine/src/models/meter.ts",
+    "unresolvedTo": "../models/meter.js",
+    "dependencyTypes": [
+      "local",
+      "type-only",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-cross-module-deep-imports"
+    }
+  },
+  {
+    "type": "dependency",
+    "from": "packages/engine/src/harness/driver.ts",
+    "to": "packages/engine/src/engines/types.ts",
+    "unresolvedTo": "../engines/types.js",
+    "dependencyTypes": [
+      "local",
+      "type-only",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-cross-module-deep-imports"
+    }
+  },
+  {
+    "type": "dependency",
+    "from": "packages/engine/src/harness/fingerprint.ts",
+    "to": "packages/engine/src/models/catalog.ts",
+    "unresolvedTo": "../models/catalog.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-cross-module-deep-imports"
+    }
+  },
+  {
+    "type": "dependency",
+    "from": "packages/engine/src/harness/generate.ts",
+    "to": "packages/engine/src/engines/selection.ts",
+    "unresolvedTo": "../engines/selection.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-cross-module-deep-imports"
+    }
+  },
+  {
+    "type": "dependency",
+    "from": "packages/engine/src/harness/generate.ts",
+    "to": "packages/engine/src/models/catalog.ts",
+    "unresolvedTo": "../models/catalog.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-cross-module-deep-imports"
+    }
+  },
+  {
+    "type": "dependency",
+    "from": "packages/engine/src/harness/generate.ts",
+    "to": "packages/engine/src/models/pricing.ts",
+    "unresolvedTo": "../models/pricing.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-cross-module-deep-imports"
+    }
+  },
+  {
+    "type": "dependency",
+    "from": "packages/engine/src/harness/generate.ts",
+    "to": "packages/engine/src/runtime/supervisor.ts",
+    "unresolvedTo": "../runtime/supervisor.js",
+    "dependencyTypes": [
+      "local",
+      "type-only",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-cross-module-deep-imports"
+    }
+  },
+  {
+    "type": "dependency",
+    "from": "packages/engine/src/harness/generate.ts",
+    "to": "packages/engine/src/wiki/store.ts",
+    "unresolvedTo": "../wiki/store.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-cross-module-deep-imports"
+    }
+  },
+  {
+    "type": "dependency",
+    "from": "packages/engine/src/harness/health.ts",
+    "to": "packages/engine/src/runs/ledger.ts",
+    "unresolvedTo": "../runs/ledger.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-cross-module-deep-imports"
+    }
+  },
+  {
+    "type": "dependency",
+    "from": "packages/engine/src/harness/health.ts",
+    "to": "packages/engine/src/verification/project.ts",
+    "unresolvedTo": "../verification/project.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-cross-module-deep-imports"
+    }
+  },
+  {
+    "type": "dependency",
+    "from": "packages/engine/src/harness/health.ts",
+    "to": "packages/engine/src/wiki/verify.ts",
+    "unresolvedTo": "../wiki/verify.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-cross-module-deep-imports"
+    }
+  },
+  {
+    "type": "dependency",
+    "from": "packages/engine/src/harness/methods.ts",
+    "to": "packages/engine/src/engines/selection.ts",
+    "unresolvedTo": "../engines/selection.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-cross-module-deep-imports"
+    }
+  },
+  {
+    "type": "dependency",
+    "from": "packages/engine/src/harness/methods.ts",
+    "to": "packages/engine/src/models/catalog.ts",
+    "unresolvedTo": "../models/catalog.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-cross-module-deep-imports"
+    }
+  },
+  {
+    "type": "dependency",
+    "from": "packages/engine/src/harness/methods.ts",
+    "to": "packages/engine/src/runs/ledger.ts",
+    "unresolvedTo": "../runs/ledger.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-cross-module-deep-imports"
+    }
+  },
+  {
+    "type": "dependency",
+    "from": "packages/engine/src/harness/schema.ts",
+    "to": "packages/engine/src/engines/selection.ts",
+    "unresolvedTo": "../engines/selection.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-cross-module-deep-imports"
+    }
+  },
+  {
+    "type": "dependency",
+    "from": "packages/engine/src/harness/schema.ts",
+    "to": "packages/engine/src/models/catalog.ts",
+    "unresolvedTo": "../models/catalog.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-cross-module-deep-imports"
+    }
+  },
+  {
+    "type": "dependency",
+    "from": "packages/engine/src/harness/upgrade.ts",
+    "to": "packages/engine/src/models/catalog.ts",
+    "unresolvedTo": "../models/catalog.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-cross-module-deep-imports"
+    }
+  },
+  {
+    "type": "dependency",
+    "from": "packages/engine/src/models/gateway.ts",
+    "to": "packages/engine/src/engines/types.ts",
+    "unresolvedTo": "../engines/types.js",
+    "dependencyTypes": [
+      "local",
+      "type-only",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-cross-module-deep-imports"
+    }
+  },
+  {
+    "type": "dependency",
+    "from": "packages/engine/src/orchestrate/methods.ts",
+    "to": "packages/engine/src/engines/selection.ts",
+    "unresolvedTo": "../engines/selection.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-cross-module-deep-imports"
+    }
+  },
+  {
+    "type": "dependency",
+    "from": "packages/engine/src/orchestrate/methods.ts",
+    "to": "packages/engine/src/runs/ledger.ts",
+    "unresolvedTo": "../runs/ledger.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-cross-module-deep-imports"
+    }
+  },
+  {
+    "type": "dependency",
+    "from": "packages/engine/src/orchestrate/methods.ts",
+    "to": "packages/engine/src/worker/worktree.ts",
+    "unresolvedTo": "../worker/worktree.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-cross-module-deep-imports"
+    }
+  },
+  {
+    "type": "dependency",
+    "from": "packages/engine/src/orchestrate/orchestrate.ts",
+    "to": "packages/engine/src/engines/selection.ts",
+    "unresolvedTo": "../engines/selection.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-cross-module-deep-imports"
+    }
+  },
+  {
+    "type": "dependency",
+    "from": "packages/engine/src/orchestrate/orchestrate.ts",
+    "to": "packages/engine/src/engines/types.ts",
+    "unresolvedTo": "../engines/types.js",
+    "dependencyTypes": [
+      "local",
+      "type-only",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-cross-module-deep-imports"
+    }
+  },
+  {
+    "type": "dependency",
+    "from": "packages/engine/src/orchestrate/orchestrate.ts",
+    "to": "packages/engine/src/harness/fingerprint.ts",
+    "unresolvedTo": "../harness/fingerprint.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-cross-module-deep-imports"
+    }
+  },
+  {
+    "type": "dependency",
+    "from": "packages/engine/src/orchestrate/orchestrate.ts",
+    "to": "packages/engine/src/harness/schema.ts",
+    "unresolvedTo": "../harness/schema.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-cross-module-deep-imports"
+    }
+  },
+  {
+    "type": "dependency",
+    "from": "packages/engine/src/orchestrate/orchestrate.ts",
+    "to": "packages/engine/src/harness/store.ts",
+    "unresolvedTo": "../harness/store.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-cross-module-deep-imports"
+    }
+  },
+  {
+    "type": "dependency",
+    "from": "packages/engine/src/orchestrate/orchestrate.ts",
+    "to": "packages/engine/src/runtime/evidence.ts",
+    "unresolvedTo": "../runtime/evidence.js",
+    "dependencyTypes": [
+      "local",
+      "type-only",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-cross-module-deep-imports"
+    }
+  },
+  {
+    "type": "dependency",
+    "from": "packages/engine/src/orchestrate/orchestrate.ts",
+    "to": "packages/engine/src/runtime/snapshot.ts",
+    "unresolvedTo": "../runtime/snapshot.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-cross-module-deep-imports"
+    }
+  },
+  {
+    "type": "dependency",
+    "from": "packages/engine/src/orchestrate/orchestrate.ts",
+    "to": "packages/engine/src/runtime/supervisor.ts",
+    "unresolvedTo": "../runtime/supervisor.js",
+    "dependencyTypes": [
+      "local",
+      "type-only",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-cross-module-deep-imports"
+    }
+  },
+  {
+    "type": "dependency",
+    "from": "packages/engine/src/orchestrate/orchestrate.ts",
+    "to": "packages/engine/src/wiki/store.ts",
+    "unresolvedTo": "../wiki/store.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-cross-module-deep-imports"
+    }
+  },
+  {
+    "type": "dependency",
+    "from": "packages/engine/src/orchestrate/orchestrate.ts",
+    "to": "packages/engine/src/worker/methods.ts",
+    "unresolvedTo": "../worker/methods.js",
+    "dependencyTypes": [
+      "local",
+      "type-only",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-cross-module-deep-imports"
+    }
+  },
+  {
+    "type": "dependency",
+    "from": "packages/engine/src/orchestrate/orchestrate.ts",
+    "to": "packages/engine/src/worker/worktree.ts",
+    "unresolvedTo": "../worker/worktree.js",
+    "dependencyTypes": [
+      "local",
+      "type-only",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-cross-module-deep-imports"
+    }
+  },
+  {
+    "type": "dependency",
+    "from": "packages/engine/src/orchestrate/review.ts",
+    "to": "packages/engine/src/engines/types.ts",
+    "unresolvedTo": "../engines/types.js",
+    "dependencyTypes": [
+      "local",
+      "type-only",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-cross-module-deep-imports"
+    }
+  },
+  {
+    "type": "dependency",
+    "from": "packages/engine/src/orchestrate/review.ts",
+    "to": "packages/engine/src/harness/driver.ts",
+    "unresolvedTo": "../harness/driver.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-cross-module-deep-imports"
+    }
+  },
+  {
+    "type": "dependency",
+    "from": "packages/engine/src/orchestrate/routing.ts",
+    "to": "packages/engine/src/harness/schema.ts",
+    "unresolvedTo": "../harness/schema.js",
+    "dependencyTypes": [
+      "local",
+      "type-only",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-cross-module-deep-imports"
+    }
+  },
+  {
+    "type": "dependency",
+    "from": "packages/engine/src/orchestrate/routing.ts",
+    "to": "packages/engine/src/harness/upgrade.ts",
+    "unresolvedTo": "../harness/upgrade.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-cross-module-deep-imports"
+    }
+  },
+  {
+    "type": "dependency",
+    "from": "packages/engine/src/orchestrate/routing.ts",
+    "to": "packages/engine/src/models/catalog.ts",
+    "unresolvedTo": "../models/catalog.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-cross-module-deep-imports"
+    }
+  },
+  {
+    "type": "dependency",
+    "from": "packages/engine/src/orchestrate/routing.ts",
+    "to": "packages/engine/src/models/providers.ts",
+    "unresolvedTo": "../models/providers.js",
+    "dependencyTypes": [
+      "local",
+      "type-only",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-cross-module-deep-imports"
+    }
+  },
+  {
+    "type": "dependency",
+    "from": "packages/engine/src/rpc/guards.ts",
+    "to": "packages/engine/src/models/providers.ts",
+    "unresolvedTo": "../models/providers.js",
+    "dependencyTypes": [
+      "local",
+      "type-only",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-cross-module-deep-imports"
+    }
+  },
+  {
+    "type": "dependency",
+    "from": "packages/engine/src/rpc/guards.ts",
+    "to": "packages/engine/src/wiki/indexer.ts",
+    "unresolvedTo": "../wiki/indexer.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-cross-module-deep-imports"
+    }
+  },
+  {
+    "type": "dependency",
+    "from": "packages/engine/src/runtime/children.ts",
+    "to": "packages/engine/src/worker/worktree.ts",
+    "unresolvedTo": "../worker/worktree.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-cross-module-deep-imports"
+    }
+  },
+  {
+    "type": "dependency",
+    "from": "packages/engine/src/runtime/evidence-methods.ts",
+    "to": "packages/engine/src/harness/fingerprint.ts",
+    "unresolvedTo": "../harness/fingerprint.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-cross-module-deep-imports"
+    }
+  },
+  {
+    "type": "dependency",
+    "from": "packages/engine/src/runtime/evidence-methods.ts",
+    "to": "packages/engine/src/harness/store.ts",
+    "unresolvedTo": "../harness/store.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-cross-module-deep-imports"
+    }
+  },
+  {
+    "type": "dependency",
+    "from": "packages/engine/src/runtime/methods.ts",
+    "to": "packages/engine/src/engines/selection.ts",
+    "unresolvedTo": "../engines/selection.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-cross-module-deep-imports"
+    }
+  },
+  {
+    "type": "dependency",
+    "from": "packages/engine/src/runtime/snapshot.ts",
+    "to": "packages/engine/src/harness/registry.ts",
+    "unresolvedTo": "../harness/registry.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-cross-module-deep-imports"
+    }
+  },
+  {
+    "type": "dependency",
+    "from": "packages/engine/src/runtime/snapshot.ts",
+    "to": "packages/engine/src/harness/store.ts",
+    "unresolvedTo": "../harness/store.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-cross-module-deep-imports"
+    }
+  },
+  {
+    "type": "dependency",
+    "from": "packages/engine/src/runtime/snapshot.ts",
+    "to": "packages/engine/src/wiki/store.ts",
+    "unresolvedTo": "../wiki/store.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-cross-module-deep-imports"
+    }
+  },
+  {
+    "type": "dependency",
+    "from": "packages/engine/src/tools/gateway.ts",
+    "to": "packages/engine/src/engines/path-scope.ts",
+    "unresolvedTo": "../engines/path-scope.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-cross-module-deep-imports"
+    }
+  },
+  {
+    "type": "dependency",
+    "from": "packages/engine/src/tools/gateway.ts",
+    "to": "packages/engine/src/runtime/policy.ts",
+    "unresolvedTo": "../runtime/policy.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-cross-module-deep-imports"
+    }
+  },
+  {
+    "type": "dependency",
+    "from": "packages/engine/src/verification/policy.ts",
+    "to": "packages/engine/src/harness/registry.ts",
+    "unresolvedTo": "../harness/registry.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-cross-module-deep-imports"
+    }
+  },
+  {
+    "type": "dependency",
+    "from": "packages/engine/src/verification/project.ts",
+    "to": "packages/engine/src/harness/registry.ts",
+    "unresolvedTo": "../harness/registry.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-cross-module-deep-imports"
+    }
+  },
+  {
+    "type": "dependency",
+    "from": "packages/engine/src/wiki/indexer.ts",
+    "to": "packages/engine/src/verification/project.ts",
+    "unresolvedTo": "../verification/project.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-cross-module-deep-imports"
+    }
+  },
+  {
+    "type": "dependency",
+    "from": "packages/engine/src/wiki/verify.ts",
+    "to": "packages/engine/src/harness/registry.ts",
+    "unresolvedTo": "../harness/registry.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-cross-module-deep-imports"
+    }
+  },
+  {
+    "type": "dependency",
+    "from": "packages/engine/src/wiki/verify.ts",
+    "to": "packages/engine/src/verification/policy.ts",
+    "unresolvedTo": "../verification/policy.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-cross-module-deep-imports"
+    }
+  },
+  {
+    "type": "dependency",
+    "from": "packages/engine/src/wiki/verify.ts",
+    "to": "packages/engine/src/verification/project.ts",
+    "unresolvedTo": "../verification/project.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-cross-module-deep-imports"
+    }
+  },
+  {
+    "type": "dependency",
+    "from": "packages/engine/src/worker/apply-patch.ts",
+    "to": "packages/engine/src/engines/path-scope.ts",
+    "unresolvedTo": "../engines/path-scope.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-cross-module-deep-imports"
+    }
+  },
+  {
+    "type": "dependency",
+    "from": "packages/engine/src/worker/loop.ts",
+    "to": "packages/engine/src/models/pricing.ts",
+    "unresolvedTo": "../models/pricing.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-cross-module-deep-imports"
+    }
+  },
+  {
+    "type": "dependency",
+    "from": "packages/engine/src/worker/loop.ts",
+    "to": "packages/engine/src/runtime/context.ts",
+    "unresolvedTo": "../runtime/context.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-cross-module-deep-imports"
+    }
+  },
+  {
+    "type": "dependency",
+    "from": "packages/engine/src/worker/methods.ts",
+    "to": "packages/engine/src/harness/schema.ts",
+    "unresolvedTo": "../harness/schema.js",
+    "dependencyTypes": [
+      "local",
+      "type-only",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-cross-module-deep-imports"
+    }
+  },
+  {
+    "type": "dependency",
+    "from": "packages/engine/src/worker/methods.ts",
+    "to": "packages/engine/src/harness/store.ts",
+    "unresolvedTo": "../harness/store.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-cross-module-deep-imports"
+    }
+  },
+  {
+    "type": "dependency",
+    "from": "packages/engine/src/worker/methods.ts",
+    "to": "packages/engine/src/models/catalog.ts",
+    "unresolvedTo": "../models/catalog.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-cross-module-deep-imports"
+    }
+  },
+  {
+    "type": "dependency",
+    "from": "packages/engine/src/worker/methods.ts",
+    "to": "packages/engine/src/models/pricing.ts",
+    "unresolvedTo": "../models/pricing.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-cross-module-deep-imports"
+    }
+  },
+  {
+    "type": "dependency",
+    "from": "packages/engine/src/worker/methods.ts",
+    "to": "packages/engine/src/runs/events.ts",
+    "unresolvedTo": "../runs/events.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-cross-module-deep-imports"
+    }
+  },
+  {
+    "type": "dependency",
+    "from": "packages/engine/src/worker/methods.ts",
+    "to": "packages/engine/src/runtime/children.ts",
+    "unresolvedTo": "../runtime/children.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-cross-module-deep-imports"
+    }
+  },
+  {
+    "type": "dependency",
+    "from": "packages/engine/src/worker/methods.ts",
+    "to": "packages/engine/src/runtime/context-compiler.ts",
+    "unresolvedTo": "../runtime/context-compiler.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-cross-module-deep-imports"
+    }
+  },
+  {
+    "type": "dependency",
+    "from": "packages/engine/src/worker/methods.ts",
+    "to": "packages/engine/src/runtime/context.ts",
+    "unresolvedTo": "../runtime/context.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-cross-module-deep-imports"
+    }
+  },
+  {
+    "type": "dependency",
+    "from": "packages/engine/src/worker/methods.ts",
+    "to": "packages/engine/src/runtime/evidence.ts",
+    "unresolvedTo": "../runtime/evidence.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-cross-module-deep-imports"
+    }
+  },
+  {
+    "type": "dependency",
+    "from": "packages/engine/src/worker/methods.ts",
+    "to": "packages/engine/src/runtime/hooks.ts",
+    "unresolvedTo": "../runtime/hooks.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-cross-module-deep-imports"
+    }
+  },
+  {
+    "type": "dependency",
+    "from": "packages/engine/src/worker/methods.ts",
+    "to": "packages/engine/src/runtime/mcp.ts",
+    "unresolvedTo": "../runtime/mcp.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-cross-module-deep-imports"
+    }
+  },
+  {
+    "type": "dependency",
+    "from": "packages/engine/src/worker/methods.ts",
+    "to": "packages/engine/src/runtime/policy.ts",
+    "unresolvedTo": "../runtime/policy.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-cross-module-deep-imports"
+    }
+  },
+  {
+    "type": "dependency",
+    "from": "packages/engine/src/worker/methods.ts",
+    "to": "packages/engine/src/runtime/read-cache.ts",
+    "unresolvedTo": "../runtime/read-cache.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-cross-module-deep-imports"
+    }
+  },
+  {
+    "type": "dependency",
+    "from": "packages/engine/src/worker/methods.ts",
+    "to": "packages/engine/src/runtime/skills.ts",
+    "unresolvedTo": "../runtime/skills.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-cross-module-deep-imports"
+    }
+  },
+  {
+    "type": "dependency",
+    "from": "packages/engine/src/worker/methods.ts",
+    "to": "packages/engine/src/runtime/snapshot.ts",
+    "unresolvedTo": "../runtime/snapshot.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-cross-module-deep-imports"
+    }
+  },
+  {
+    "type": "dependency",
+    "from": "packages/engine/src/worker/methods.ts",
+    "to": "packages/engine/src/runtime/store.ts",
+    "unresolvedTo": "../runtime/store.js",
+    "dependencyTypes": [
+      "local",
+      "type-only",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-cross-module-deep-imports"
+    }
+  },
+  {
+    "type": "dependency",
+    "from": "packages/engine/src/worker/methods.ts",
+    "to": "packages/engine/src/runtime/supervisor.ts",
+    "unresolvedTo": "../runtime/supervisor.js",
+    "dependencyTypes": [
+      "local",
+      "type-only",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-cross-module-deep-imports"
+    }
+  },
+  {
+    "type": "dependency",
+    "from": "packages/engine/src/worker/methods.ts",
+    "to": "packages/engine/src/runtime/types.ts",
+    "unresolvedTo": "../runtime/types.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-cross-module-deep-imports"
+    }
+  },
+  {
+    "type": "dependency",
+    "from": "packages/engine/src/worker/methods.ts",
+    "to": "packages/engine/src/wiki/query.ts",
+    "unresolvedTo": "../wiki/query.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-cross-module-deep-imports"
+    }
+  },
+  {
+    "type": "dependency",
+    "from": "packages/engine/src/worker/methods.ts",
+    "to": "packages/engine/src/wiki/store.ts",
+    "unresolvedTo": "../wiki/store.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-cross-module-deep-imports"
+    }
+  },
+  {
+    "type": "dependency",
+    "from": "packages/engine/src/worker/runtime.ts",
+    "to": "packages/engine/src/models/catalog.ts",
+    "unresolvedTo": "../models/catalog.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-cross-module-deep-imports"
+    }
+  },
+  {
+    "type": "dependency",
+    "from": "packages/engine/src/worker/tools.ts",
+    "to": "packages/engine/src/engines/path-scope.ts",
+    "unresolvedTo": "../engines/path-scope.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-cross-module-deep-imports"
+    }
+  },
+  {
+    "type": "dependency",
+    "from": "packages/engine/src/worker/tools.ts",
+    "to": "packages/engine/src/harness/schema.ts",
+    "unresolvedTo": "../harness/schema.js",
+    "dependencyTypes": [
+      "local",
+      "type-only",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-cross-module-deep-imports"
+    }
+  },
+  {
+    "type": "dependency",
+    "from": "packages/engine/src/worker/tools.ts",
+    "to": "packages/engine/src/runtime/policy.ts",
+    "unresolvedTo": "../runtime/policy.js",
+    "dependencyTypes": [
+      "local",
+      "type-only",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-cross-module-deep-imports"
+    }
+  },
+  {
+    "type": "dependency",
+    "from": "packages/engine/src/worker/tools.ts",
+    "to": "packages/engine/src/runtime/read-cache.ts",
+    "unresolvedTo": "../runtime/read-cache.js",
+    "dependencyTypes": [
+      "local",
+      "type-only",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-cross-module-deep-imports"
+    }
+  },
+  {
+    "type": "dependency",
+    "from": "packages/engine/src/worker/tools.ts",
+    "to": "packages/engine/src/runtime/sandbox.ts",
+    "unresolvedTo": "../runtime/sandbox.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-cross-module-deep-imports"
+    }
+  },
+  {
+    "type": "dependency",
+    "from": "packages/engine/src/worker/tools.ts",
+    "to": "packages/engine/src/runtime/store.ts",
+    "unresolvedTo": "../runtime/store.js",
+    "dependencyTypes": [
+      "local",
+      "type-only",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-cross-module-deep-imports"
+    }
+  },
+  {
+    "type": "dependency",
+    "from": "packages/engine/src/worker/tools.ts",
+    "to": "packages/engine/src/wiki/query.ts",
+    "unresolvedTo": "../wiki/query.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-cross-module-deep-imports"
+    }
+  },
+  {
+    "type": "dependency",
+    "from": "packages/engine/src/worker/tools.ts",
+    "to": "packages/engine/src/wiki/store.ts",
+    "unresolvedTo": "../wiki/store.js",
+    "dependencyTypes": [
+      "local",
+      "type-only",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-cross-module-deep-imports"
+    }
+  }
+]
