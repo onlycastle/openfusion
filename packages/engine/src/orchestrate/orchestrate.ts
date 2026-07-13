@@ -10,10 +10,9 @@
 // write policy, exercised here for the first time "in anger") does the task
 // itself.
 //
-// COMPOSITION CHOICE (worker vs frontier): worker runs go through
-// engine.worker.run's OWN RPC handler (via engine.dispatcher.dispatch — see
-// callEngineMethod below) rather than a duplicated pipeline, because that
-// handler already owns a lot of correctness-critical plumbing this task must
+// COMPOSITION CHOICE (worker vs frontier): worker runs go through the typed
+// WorkerRunner application service rather than the JSON-RPC transport or a
+// duplicated pipeline, because that service already owns the correctness-critical plumbing this task must
 // not re-implement or drift from: worktree creation, tool wiring, the
 // timeout/abort signal combination, pricing/metering under source "worker",
 // and worker.progress notifications. Frontier sessions, by contrast, are
@@ -28,23 +27,36 @@
 import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import path from "node:path";
-import { RpcErrorCodes } from "@openfusion/shared";
+import {
+  RpcErrorCodes,
+  type CandidateRef,
+  type CostEstimate,
+  type TaskContract,
+  type TaskSnapshotRef,
+} from "@openfusion/shared";
 import type { Engine } from "../engine.js";
 import type { FrontierSession } from "../engines/types.js";
+import {
+  resolveFrontierSelection,
+  type FrontierSelection,
+  type OrchestrateFrontierSelections,
+} from "../engines/selection.js";
 import type { AgentDef, HarnessBundle } from "../harness/schema.js";
 import { CARD_SLUG, validateHarness } from "../harness/schema.js";
-import { HarnessValidationError, loadHarness } from "../harness/store.js";
+import { fingerprintHarness } from "../harness/fingerprint.js";
+import { HarnessValidationError, loadHarnessSnapshot } from "../harness/store.js";
 import { RunCancelledError } from "../rpc/cancel-registry.js";
 import { RpcMethodError } from "../rpc/errors.js";
 import { requireGitRepo } from "../rpc/guards.js";
 import { wikiDbPath } from "../wiki/store.js";
+import { captureTaskSnapshot } from "../runtime/snapshot.js";
+import type { RunSupervisor } from "../runtime/supervisor.js";
+import type { HarnessExperimentVariant } from "../runtime/evidence.js";
+import type { Worktree } from "../worker/worktree.js";
+import type { WorkerRunResult } from "../worker/methods.js";
 import { reviewDiff, type ReviewVerdict } from "./review.js";
 import { resolveNamedAgent, routeTask, type WorkerResolution } from "./routing.js";
 
-// The only frontier engine kind orchestration drives today — mirrors
-// engines/methods.ts's own `params.engine ?? "claude-code"` default and
-// harness/generate.ts's FRONTIER_KIND.
-const FRONTIER_KIND = "claude-code";
 const DEFAULT_MAX_WORKER_ATTEMPTS = 2;
 
 // M6 Task 1 review round 1 (Important — Fix 1): reviewTimeoutMs (and, by
@@ -83,6 +95,7 @@ export interface OrchestrateParams {
   maxWorkerAttempts?: number;
   workerTimeoutMs?: number;
   reviewTimeoutMs?: number;
+  frontier?: OrchestrateFrontierSelections;
   // M7b Task 2: client-supplied (or evals.run-forwarded) run identifier used
   // ONLY to look up (never register/deregister) this run's cancellation
   // signal — see cancel-registry.ts's header comment for the ownership
@@ -91,6 +104,49 @@ export interface OrchestrateParams {
   // what lets evals.run's per-task nested orchestrate() call reuse the SAME
   // batch-level runId without this function clobbering that registration.
   runId?: string;
+  /** Internal parent session identity for worker child-session linkage. */
+  runtimeSessionId?: string;
+  taskContract?: TaskContract;
+  /** Internal: captured once by the top-level RunSupervisor. */
+  taskSnapshot?: TaskSnapshotRef;
+  supervisor?: RunSupervisor;
+  /** Internal eval/runtime override for a snapshot-pinned authenticated wiki. */
+  wikiMcp?: { url: string; bearerToken: string } | null;
+  /** Internal: async sessions may stop at policy approvals. */
+  interactive?: boolean;
+  /** Internal protected-evaluation variant. Controlled trials bypass promoted routing. */
+  experimentVariant?: HarnessExperimentVariant;
+  /** Internal exact worker continuation loaded from the encrypted trace. */
+  resumeWorker?: {
+    sessionId: string;
+    approvalResponse?: { approvalId: string; approved: boolean; reason?: string };
+    task: string;
+    providerId: string;
+    model: string;
+    wikiDigest?: string;
+    dialectPack?: string;
+  };
+}
+
+export interface OrchestrateApprovalPauseState {
+  workerSessionId: string;
+  approvalId: string;
+  worker: {
+    task: string;
+    providerId: string;
+    model: string;
+    dialectPack?: string;
+  };
+}
+
+export class OrchestrateApprovalPause extends Error {
+  readonly state: OrchestrateApprovalPauseState;
+
+  constructor(state: OrchestrateApprovalPauseState) {
+    super("orchestration is waiting for approval");
+    this.name = "OrchestrateApprovalPause";
+    this.state = state;
+  }
 }
 
 export interface OrchestrateAttempt {
@@ -113,6 +169,10 @@ export interface OrchestrateResult {
   // all three come off the same routeTask() call.
   taskClass: string;
   resolution: WorkerResolution | "frontier";
+  frontier: { review: FrontierSelection; escalation: FrontierSelection };
+  taskSnapshot: TaskSnapshotRef;
+  candidateRef: CandidateRef | null;
+  verificationIncomplete?: boolean;
   // Phase 1 telemetry pins — reconstructible eval configuration.
   routeId: string;
   family?: string;
@@ -151,6 +211,7 @@ export interface OrchestrateResult {
     totalUsd: number | null;
     note: "estimate-class";
   };
+  costEstimate: CostEstimate;
 }
 
 // Null-safe running total — same shape as harness/driver.ts's own addCost
@@ -173,47 +234,13 @@ function isWikiBuilt(engine: Engine, projectDir: string): boolean {
   return engine.wiki.getStore(projectDir).getMeta("head_sha") !== null;
 }
 
-async function attachedWikiMcpUrl(engine: Engine, projectDir: string): Promise<string | null> {
+async function attachedWikiMcp(
+  engine: Engine,
+  projectDir: string,
+): Promise<{ url: string; bearerToken: string } | null> {
   if (!isWikiBuilt(engine, projectDir)) return null;
   const server = await engine.wiki.startMcpServer(engine, projectDir);
-  return server.url;
-}
-
-// Invokes an already-registered engine.worker.* RPC method through the SAME
-// in-process dispatcher engine.orchestrate itself is registered on — see
-// this module's header comment for why worker runs are composed this way
-// (reusing worker/methods.ts's own handler) rather than frontier sessions
-// (opened directly off the adapter, below). Unwraps the JSON-RPC envelope
-// into a plain return value or a proper RpcMethodError throw, so callers
-// below never see the {jsonrpc,id,result|error} shape.
-async function callEngineMethod<T>(engine: Engine, method: string, params: unknown): Promise<T> {
-  const response = await engine.dispatcher.dispatch({
-    jsonrpc: "2.0",
-    id: randomUUID(),
-    method,
-    params,
-  });
-  if (response === null) {
-    throw new RpcMethodError(RpcErrorCodes.SERVER_ERROR, `${method} produced no response`);
-  }
-  if (response.error !== undefined) {
-    throw new RpcMethodError(response.error.code, response.error.message, response.error.data);
-  }
-  return response.result as T;
-}
-
-interface WorkerRunResponse {
-  diff: string;
-  diffStat: string;
-  summary: string;
-  costUsd: number | null;
-  worktree: { path: string; branch: string };
-  dialectPack?: string;
-  dialectPackVersion?: string;
-  editDialect?: string;
-  toolCallCounts?: Record<string, number>;
-  toolErrorCounts?: Record<string, number>;
-  editFailCount?: number;
+  return { url: server.url, bearerToken: server.bearerToken };
 }
 
 // Final review Fix 3 (Important): what the PRIOR worker attempt (if any)
@@ -381,17 +408,15 @@ async function runFrontierTurn(
 }
 
 // Best-effort cleanup for a worktree that did NOT survive (a rejected or
-// empty-diff worker attempt) — reuses engine.worker.cleanup's own
-// find-by-path-then-remove logic (worker/methods.ts) through the same
-// dispatcher composition as the worker run itself. Swallows its own failure
+// empty-diff worker attempt) — reuses WorkerService's typed
+// find-by-path-then-remove logic. Swallows its own failure
 // (logged, not thrown): losing track of one stale worktree must never abort
 // the whole orchestrate run or mask its real outcome.
 async function cleanupWorktree(engine: Engine, projectDir: string, worktreePath: string): Promise<void> {
   try {
-    await callEngineMethod(engine, "engine.worker.cleanup", { projectDir, worktreePath });
+    await engine.worker.cleanup(projectDir, worktreePath);
   } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    engine.log(`orchestrate: failed to clean up worktree ${worktreePath}: ${message}`);
+    engine.log("orchestrate: failed to clean up a worktree");
   }
 }
 
@@ -429,7 +454,8 @@ function liftWorktreeFromError(err: unknown): { path: string; branch: string } |
 }
 
 interface EscalationResult {
-  worktree: { path: string; branch: string };
+  worktree: Worktree;
+  authorSessionId: string;
   diff: string;
   diffStat: string;
   text: string;
@@ -449,23 +475,34 @@ async function runEscalation(
   engine: Engine,
   params: OrchestrateParams,
   agent: AgentDef,
+  frontier: FrontierSelection,
   timeoutMs: number,
   abortSignal?: AbortSignal,
 ): Promise<EscalationResult> {
+  const adapter = engine.frontier.getAdapter(frontier.engine);
+  if (adapter === undefined) {
+    throw new RpcMethodError(RpcErrorCodes.SERVER_ERROR, `unknown frontier engine: ${frontier.engine}`);
+  }
+  const capabilities = await adapter.capabilities?.();
+  if (capabilities?.sandboxCompatibility !== "certified") {
+    throw new RpcMethodError(
+      RpcErrorCodes.SERVER_ERROR,
+      "frontier authoring is disabled because the selected runtime has no certified sandbox",
+      { reasonCode: "backend-unsupported" },
+    );
+  }
   const manager = await engine.worker.getManager(params.projectDir);
-  const worktree = await manager.create(randomUUID());
+  const worktree = await manager.create(randomUUID(), params.taskSnapshot?.baseSha);
 
   try {
-    const adapter = engine.frontier.getAdapter(FRONTIER_KIND);
-    if (adapter === undefined) {
-      throw new RpcMethodError(RpcErrorCodes.SERVER_ERROR, `unknown frontier engine: ${FRONTIER_KIND}`);
-    }
     // wikiMcpUrl stays keyed off the BASE project (params.projectDir) — the
     // escalation still wants the base repo's wiki context — independent of
     // the session's cwd (below), which is now the worktree, not the base
     // repo.
-    const wikiMcpUrl = await attachedWikiMcpUrl(engine, params.projectDir);
-    const session = await adapter.createSession({
+    const wikiMcp = params.wikiMcp !== undefined
+      ? params.wikiMcp
+      : await attachedWikiMcp(engine, params.projectDir);
+    const session = await engine.providerGateway.createFrontierSession(adapter, {
       // FIX (M5b Task 4 review round 1, Finding 1 — CRITICAL): this
       // `projectDir` becomes the session subprocess's cwd (claude.ts:
       // `cwd: projectDir` in the query() options) — it MUST be the
@@ -478,8 +515,10 @@ async function runEscalation(
       // non-empty diff against a fake adapter that ignored cwd and wrote
       // straight into writeScope[0].
       projectDir: worktree.path,
-      wikiMcpUrl,
+      wikiMcpUrl: wikiMcp?.url ?? null,
+      ...(wikiMcp === null ? {} : { wikiMcpBearerToken: wikiMcp.bearerToken }),
       log: engine.log,
+      model: frontier.model,
       toolPolicy: { writeScope: [worktree.path] },
       resultLabel: "frontier-escalate",
     });
@@ -507,18 +546,15 @@ async function runEscalation(
       const diff = await manager.diff(worktree);
       const diffStat = await manager.diffStat(worktree);
       return {
-        worktree: { path: worktree.path, branch: worktree.branch },
+        worktree,
+        authorSessionId: session.id,
         diff,
         diffStat,
         text: turn.text,
         costUsd: turn.costUsd,
       };
     } finally {
-      await session.close().catch(() => {
-        // Best-effort — mirrors FrontierService's own per-session close()
-        // isolation; a throwing adapter close() must never mask this
-        // escalation's real outcome.
-      });
+      await engine.frontier.closeSession(session);
       untrackSession();
     }
   } catch (err) {
@@ -538,6 +574,8 @@ async function runEscalation(
 // maxWorkerAttempts) -> escalate. See this module's header comment for the
 // composition rationale, and the M5b Task 4 brief for the full contract.
 export async function orchestrate(engine: Engine, params: OrchestrateParams): Promise<OrchestrateResult> {
+  const reviewFrontier = resolveFrontierSelection(params.frontier?.review);
+  const escalationFrontier = resolveFrontierSelection(params.frontier?.escalation);
   // M7b Task 2: READ-ONLY lookup only — orchestrate() never register()s or
   // deregister()s a runId's controller (see OrchestrateParams.runId's own
   // doc comment and cancel-registry.ts's header comment for the ownership
@@ -564,6 +602,66 @@ export async function orchestrate(engine: Engine, params: OrchestrateParams): Pr
   // for backward compatibility — see finish() below).
   let reviewUsd: number | null = null;
   let escalateUsd: number | null = null;
+  let knownUsd = 0;
+  let pricedCalls = 0;
+  let unpricedCalls = 0;
+  let candidateRef: CandidateRef | null = null;
+  let verificationIncomplete = false;
+  // FIX (Phase 0 stabilize, Task 2 — root cause of both evals-run
+  // failures): a supervisor's own `taskSnapshot` (RunSupervisor.initialize,
+  // runtime/supervisor.ts) is captured ONCE, against `supervisor.projectDir`
+  // — the top-level run's own directory. That's a safe, ready-made
+  // snapshot to reuse here ONLY when THIS orchestrate() call operates
+  // against that SAME directory, which is always true for the direct
+  // engine.orchestrate RPC path (orchestrate/methods.ts hands runKernel.run
+  // and orchestrate() the identical params.projectDir). It is NOT true for
+  // evals/run.ts's per-task harness arm: runHarnessTask shares ONE
+  // top-level supervisor (captured against the real project being
+  // evaluated) across every per-task orchestrate() call, each scoped to its
+  // OWN ephemeral scratch `harnessDir` copy — a different git repo with its
+  // own HEAD/baseSha and its own freshly-written harness generation.
+  // Trusting the mismatched snapshot there used to fail two ways: the
+  // "harness changed after task snapshot capture" guard below always fired
+  // (a fresh scratch copy's harness generationId can never equal the real
+  // project's), and — had that guard not caught it — every later use of
+  // `taskSnapshot.baseSha` (runEscalation's worktree creation, worker.run's
+  // params) would have pinned a baseSha from the WRONG repository entirely.
+  // Comparing directories here and falling through to a fresh capture
+  // (below) when they disagree keeps the identity check meaningful for both
+  // callers instead of only the direct-RPC one, with no change in behavior
+  // for that direct-RPC case (the comparison always passes there).
+  let taskSnapshot = params.taskSnapshot ??
+    (params.supervisor !== undefined && params.supervisor.projectDir === path.resolve(params.projectDir)
+      ? params.supervisor.taskSnapshot
+      : undefined);
+
+  const recordCost = (costUsd: number | null, confidence: CostEstimate["confidence"]): void => {
+    if (costUsd === null) unpricedCalls += 1;
+    else {
+      knownUsd += costUsd;
+      pricedCalls += 1;
+    }
+    params.supervisor?.recordCost(costUsd, confidence);
+  };
+
+  const currentCostEstimate = (): CostEstimate =>
+    params.supervisor?.costEstimate() ?? {
+      knownUsd,
+      completeness: unpricedCalls === 0
+        ? pricedCalls === 0
+          ? "none"
+          : "complete"
+        : pricedCalls === 0
+          ? "none"
+          : "partial",
+      unpricedCalls,
+      pricingVersion: "pricing-v1",
+      confidence: unpricedCalls > 0
+        ? pricedCalls > 0
+          ? "mixed"
+          : "unpriced"
+        : "estimated",
+    };
 
   const nextAttemptNumber = (): number => attempts.length + 1;
 
@@ -589,11 +687,17 @@ export async function orchestrate(engine: Engine, params: OrchestrateParams): Pr
     const family = resolution === "frontier" ? undefined : resolution.family;
     const dialectPack =
       resolution === "frontier" ? lastDialectPack : (lastDialectPack ?? resolution.dialectPack);
+    if (taskSnapshot === undefined) throw new Error("orchestrate finished without a task snapshot");
+    const costEstimate = currentCostEstimate();
     return {
       outcome,
       agent: agentName,
       taskClass,
       resolution,
+      frontier: { review: reviewFrontier, escalation: escalationFrontier },
+      taskSnapshot,
+      candidateRef,
+      ...(verificationIncomplete ? { verificationIncomplete: true } : {}),
       routeId,
       family,
       dialectPack,
@@ -610,18 +714,29 @@ export async function orchestrate(engine: Engine, params: OrchestrateParams): Pr
         reviewUsd,
         frontierUsd: addCost(reviewUsd, escalateUsd),
         escalateUsd,
-        totalUsd: addCost(workerUsd, addCost(reviewUsd, escalateUsd)),
+        totalUsd: costEstimate.completeness === "complete" ? costEstimate.knownUsd : null,
         note: "estimate-class",
       },
+      costEstimate,
     };
   }
 
   try {
     progress(engine, "load", "loading harness bundle", params.runId);
     requireGitRepo(params.projectDir);
-    let harness;
+    taskSnapshot ??= await captureTaskSnapshot(engine, params.projectDir);
+    params.taskSnapshot = taskSnapshot;
+    if (taskSnapshot.dirtyState.category !== "clean") {
+      progress(
+        engine,
+        "snapshot",
+        `working tree is ${taskSnapshot.dirtyState.category}; workers use committed HEAD and exclude those edits`,
+        params.runId,
+      );
+    }
+    let harnessSnapshot;
     try {
-      harness = loadHarness(params.projectDir);
+      harnessSnapshot = loadHarnessSnapshot(params.projectDir);
     } catch (loadErr) {
       // Mirrors harness/methods.ts's own HarnessValidationError handling
       // (engine.harness.status/export): a harness that's PRESENT but
@@ -633,16 +748,63 @@ export async function orchestrate(engine: Engine, params: OrchestrateParams): Pr
       }
       throw loadErr;
     }
-    if (harness === null) {
+    if (harnessSnapshot === null) {
       throw new RpcMethodError(RpcErrorCodes.SERVER_ERROR, "no harness; run engine.harness.generate first");
     }
+    if (
+      harnessSnapshot.generationId !== taskSnapshot.harnessGeneration ||
+      harnessSnapshot.fingerprint.digest !== taskSnapshot.harnessFingerprint
+    ) {
+      throw new RpcMethodError(
+        RpcErrorCodes.SERVER_ERROR,
+        "harness changed after task snapshot capture",
+        { reasonCode: "base-changed" },
+      );
+    }
+    const harness = harnessSnapshot.bundle;
     const issues = validateHarness(harness);
     if (issues.length > 0) {
       throw new RpcMethodError(RpcErrorCodes.SERVER_ERROR, "harness failed structural validation", { issues });
     }
 
     progress(engine, "route", "classifying and routing the task", params.runId);
-    const routed = routeTask(params.task, harness, engine.models.registry);
+    let routed = routeTask(params.task, harness, engine.models.registry);
+    const harnessFingerprint = fingerprintHarness(harness).digest;
+    const routingOverride = params.experimentVariant === undefined
+      ? engine.runtime.evidence.resolve(
+          engine.runtime.getStore(params.projectDir),
+          harnessFingerprint,
+          {
+            taskClass: routed.taskClass,
+            difficulty: routed.difficulty,
+            harnessFingerprint,
+            projectFingerprint: taskSnapshot.projectDigest,
+          },
+        )
+      : null;
+    if (routingOverride !== null) {
+      const taskEntries = Object.entries(harness.routing.taskClasses);
+      const matched = taskEntries.find(([taskClass, entry]) =>
+        ("routeId" in entry ? entry.routeId : undefined) === routingOverride.routeId ||
+        `tc:${taskClass}` === routingOverride.routeId);
+      const defaultRouteId = harness.routing.version === 2
+        ? (harness.routing.defaults.routeId ?? "tc:default")
+        : "tc:default";
+      const overrideAgent = matched?.[1].agent ??
+        (routingOverride.routeId === defaultRouteId ? harness.routing.defaults.agent : undefined);
+      if (overrideAgent !== undefined) {
+        const resolved = resolveNamedAgent(overrideAgent, harness, engine.models.registry);
+        routed = {
+          ...routed,
+          agent: resolved.agent,
+          resolution: resolved.resolution === "frontier"
+            ? "frontier"
+            : { ...resolved.resolution, dialectPack: routingOverride.dialectPack },
+          routeId: routingOverride.routeId,
+          agentChain: [resolved.agent.name],
+        };
+      }
+    }
     progress(engine, "route", `routed to agent "${routed.agent.name}" (class ${routed.taskClass})`, params.runId);
 
     // M6 Task 6: computed ONCE per run (the harness's own pages/manifest
@@ -657,6 +819,20 @@ export async function orchestrate(engine: Engine, params: OrchestrateParams): Pr
     const workerContext = buildWorkerContext(harness);
     contextBranch = workerContext.branch;
     progress(engine, "load", `worker context: ${workerContext.branch}`, params.runId);
+    const taskContract: TaskContract = params.taskContract ?? {
+      schemaVersion: 1,
+      requirements: [params.task],
+      constraints: [],
+      verificationCommands: [],
+    };
+    // The independent reviewer must see the same structured contract whose
+    // digest is bound into the candidate coverage report. JSON encoding keeps
+    // every user string unambiguous without duplicating the full candidate
+    // diff in the prompt.
+    const reviewerTask = JSON.stringify({ request: params.task, contract: taskContract });
+    const taskWikiMcp = params.wikiMcp !== undefined
+      ? params.wikiMcp
+      : await attachedWikiMcp(engine, params.projectDir);
 
     const maxWorkerAttempts =
       params.maxWorkerAttempts ?? harness.routing.escalation.failuresBeforeFrontier ?? DEFAULT_MAX_WORKER_ATTEMPTS;
@@ -694,15 +870,20 @@ export async function orchestrate(engine: Engine, params: OrchestrateParams): Pr
           params.runId,
         );
 
-        let workerResult: WorkerRunResponse;
+        let workerResult: WorkerRunResult;
+        const resumedWorker = i === 0 ? params.resumeWorker : undefined;
+        const workerTask = resumedWorker?.task ?? buildWorkerTask(currentAgent, params.task, priorAttempt);
         try {
-          workerResult = await callEngineMethod<WorkerRunResponse>(engine, "engine.worker.run", {
+          workerResult = await engine.worker.run(engine, {
             projectDir: params.projectDir,
-            task: buildWorkerTask(currentAgent, params.task, priorAttempt),
-            wikiDigest: workerContext.text,
-            providerId,
-            model,
-            dialectPack,
+            task: workerTask,
+            wikiDigest: resumedWorker?.wikiDigest ?? workerContext.text,
+            providerId: resumedWorker?.providerId ?? providerId,
+            model: resumedWorker?.model ?? model,
+            dialectPack: resumedWorker?.dialectPack ?? (
+              params.experimentVariant === "generic-worker" ? "string-edit-default" : dialectPack
+            ),
+            experimentVariant: params.experimentVariant,
             // Fix 1: unlike reviewTimeoutMs/escalateTimeoutMs above, this is
             // deliberately left as `params.workerTimeoutMs` verbatim
             // (possibly undefined) rather than defaulted here —
@@ -719,7 +900,16 @@ export async function orchestrate(engine: Engine, params: OrchestrateParams): Pr
             // get()-only read, so engine.cancel({runId}) reaches whichever
             // worker attempt happens to be in flight.
             runId: params.runId,
-          });
+            parentSessionId: params.runtimeSessionId,
+            interactive: params.interactive === true,
+            resumeSessionId: resumedWorker?.sessionId,
+            approvalResponse: resumedWorker?.approvalResponse,
+            baseSha: taskSnapshot.baseSha,
+            harnessGeneration: taskSnapshot.harnessGeneration,
+            harnessFingerprint: taskSnapshot.harnessFingerprint,
+            taskWikiHeadSha: taskSnapshot.wikiHeadSha,
+            taskWikiDigest: taskSnapshot.wikiDigest,
+          }, params.supervisor);
         } catch (err) {
           // FIX (M5b Task 4 review round 1, Finding 2 — Important): a
           // worker.run failure on attempt >=2 leaves ITS OWN worktree on
@@ -733,7 +923,30 @@ export async function orchestrate(engine: Engine, params: OrchestrateParams): Pr
           if (worktree !== undefined) lastWorktree = worktree;
           throw err;
         }
+        if (workerResult.paused === true) {
+          if (workerResult.sessionId === undefined || workerResult.approvalId === undefined) {
+            throw new Error("worker paused without durable approval identifiers");
+          }
+          throw new OrchestrateApprovalPause({
+            workerSessionId: workerResult.sessionId,
+            approvalId: workerResult.approvalId,
+            worker: {
+              task: workerTask,
+              providerId: resumedWorker?.providerId ?? providerId,
+              model: resumedWorker?.model ?? model,
+              ...((resumedWorker?.dialectPack ?? dialectPack) === undefined
+                ? {}
+                : { dialectPack: resumedWorker?.dialectPack ?? dialectPack }),
+            },
+          });
+        }
+        if (workerResult.diff === undefined || workerResult.diffStat === undefined) {
+          throw new Error("worker completed without an exact diff result");
+        }
         workerUsd = addCost(workerUsd, workerResult.costUsd);
+        if (params.supervisor === undefined) {
+          recordCost(workerResult.costUsd, workerResult.costUsd === null ? "unpriced" : "estimated");
+        }
         // Tentatively tracked as soon as it's known to exist — see the
         // `lastWorktree` doc comment above.
         lastWorktree = workerResult.worktree;
@@ -757,16 +970,78 @@ export async function orchestrate(engine: Engine, params: OrchestrateParams): Pr
           continue;
         }
 
-        progress(engine, `review:${n}`, "reviewing the worker's diff with a read-only frontier session", params.runId);
-        const adapter = engine.frontier.getAdapter(FRONTIER_KIND);
-        if (adapter === undefined) {
-          throw new RpcMethodError(RpcErrorCodes.SERVER_ERROR, `unknown frontier engine: ${FRONTIER_KIND}`);
+        progress(engine, `verify:${n}`, "materializing and deterministically verifying the exact candidate", params.runId);
+        const candidateWorktree: Worktree = {
+          id: path.basename(workerResult.worktree.path),
+          path: workerResult.worktree.path,
+          branch: workerResult.worktree.branch,
+          base: params.projectDir,
+          baseSha: taskSnapshot.baseSha,
+        };
+        let prepared;
+        try {
+          prepared = await engine.candidates.prepare(engine, {
+            projectDir: params.projectDir,
+            worktree: candidateWorktree,
+            snapshot: taskSnapshot,
+            contract: taskContract,
+            signal: cancelSignal,
+          });
+        } catch {
+          verificationIncomplete = true;
+          const verdict: ReviewVerdict = {
+            decision: "request-changes",
+            reasons: ["Deterministic verification was incomplete."],
+            severity: "major",
+          };
+          attempts.push({ n, kind: "worker", summary: workerResult.summary, verdict });
+          await cleanupWorktree(engine, params.projectDir, workerResult.worktree.path);
+          lastWorktree = null;
+          return finish(
+            "failed",
+            currentAgent.name,
+            routed.taskClass,
+            currentResolution,
+            workerResult.diff,
+            workerResult.diffStat,
+            null,
+            routed.routeId,
+          );
         }
-        const wikiMcpUrl = await attachedWikiMcpUrl(engine, params.projectDir);
-        const reviewSession = await adapter.createSession({
-          projectDir: params.projectDir,
-          wikiMcpUrl,
+
+        progress(engine, `review:${n}`, "reviewing the verified candidate in its exact read-only tree", params.runId);
+        const adapter = engine.frontier.getAdapter(reviewFrontier.engine);
+        if (adapter === undefined) {
+          throw new RpcMethodError(RpcErrorCodes.SERVER_ERROR, `unknown frontier engine: ${reviewFrontier.engine}`);
+        }
+        const reviewerCapabilities = await adapter.capabilities?.();
+        if (reviewerCapabilities?.sandboxCompatibility !== "certified") {
+          verificationIncomplete = true;
+          const verdict: ReviewVerdict = {
+            decision: "request-changes",
+            reasons: ["No compliant independent read-only reviewer is available."],
+            severity: "major",
+          };
+          attempts.push({ n, kind: "worker", summary: workerResult.summary, verdict });
+          await cleanupWorktree(engine, params.projectDir, workerResult.worktree.path);
+          lastWorktree = null;
+          return finish(
+            "failed",
+            currentAgent.name,
+            routed.taskClass,
+            currentResolution,
+            prepared.canonical.diff,
+            prepared.diffStat,
+            null,
+            routed.routeId,
+          );
+        }
+        const reviewSession = await engine.providerGateway.createFrontierSession(adapter, {
+          projectDir: workerResult.worktree.path,
+          wikiMcpUrl: taskWikiMcp?.url ?? null,
+          ...(taskWikiMcp === null ? {} : { wikiMcpBearerToken: taskWikiMcp.bearerToken }),
           log: engine.log,
+          model: reviewFrontier.model,
           resultLabel: "frontier-review",
         });
         // M6 Task 1 (eval-batch safety gate): this session is created
@@ -782,28 +1057,52 @@ export async function orchestrate(engine: Engine, params: OrchestrateParams): Pr
         try {
           const reviewResult = await reviewDiff(
             reviewSession,
-            { task: params.task, diff: workerResult.diff, summary: workerResult.summary },
-            { timeoutMs: reviewTimeoutMs, abortSignal: cancelSignal },
+            {
+              task: reviewerTask,
+              diff: "",
+              summary: workerResult.summary,
+              verifierEvidence: JSON.stringify(
+                prepared.reports.map((report) => ({
+                  stageId: report.stageId,
+                  verdict: report.verdict,
+                  outputRef: report.outputRef,
+                })),
+              ),
+            },
+            {
+              timeoutMs: reviewTimeoutMs,
+              abortSignal: cancelSignal,
+              beforePrompt: () => params.supervisor?.reserveModelCall(),
+              onAttemptCost: (cost) => recordCost(cost, cost === null ? "unpriced" : "verified"),
+            },
           );
           verdict = reviewResult.verdict;
           reviewUsd = addCost(reviewUsd, reviewResult.costUsd);
         } finally {
-          await reviewSession.close().catch(() => {
-            // Best-effort — see runEscalation's identical close() comment.
-          });
+          await engine.frontier.closeSession(reviewSession);
           untrackReviewSession();
         }
 
         attempts.push({ n, kind: "worker", summary: workerResult.summary, verdict });
 
         if (verdict.decision === "approve") {
+          candidateRef = engine.candidates.mint({
+            projectDir: params.projectDir,
+            worktree: candidateWorktree,
+            snapshot: taskSnapshot,
+            prepared,
+            authorAttemptId: `attempt-${n}`,
+            authorSessionId: workerResult.runId ?? candidateWorktree.id,
+            reviewerSessionId: reviewSession.id,
+            verdict,
+          });
           return finish(
             "worker-approved",
             currentAgent.name,
             routed.taskClass,
             currentResolution,
-            workerResult.diff,
-            workerResult.diffStat,
+            prepared.canonical.diff,
+            prepared.diffStat,
             workerResult.worktree,
             routed.routeId,
           );
@@ -824,10 +1123,18 @@ export async function orchestrate(engine: Engine, params: OrchestrateParams): Pr
 
     // Escalate: either routing resolved straight to "frontier", or every
     // worker attempt above was rejected or produced an empty diff.
-    progress(engine, "escalate", "escalating to the frontier with write access", params.runId);
+    progress(engine, "escalate", "escalating to a lead model with write access", params.runId);
     let escalation: EscalationResult;
     try {
-      escalation = await runEscalation(engine, params, routed.agent, escalateTimeoutMs, cancelSignal);
+      params.supervisor?.reserveModelCall();
+      escalation = await runEscalation(
+        engine,
+        params,
+        routed.agent,
+        escalationFrontier,
+        escalateTimeoutMs,
+        cancelSignal,
+      );
     } catch (err) {
       // Mirrors the worker-attempt catch's identical lift, above.
       const worktree = liftWorktreeFromError(err);
@@ -835,6 +1142,7 @@ export async function orchestrate(engine: Engine, params: OrchestrateParams): Pr
       throw err;
     }
     escalateUsd = addCost(escalateUsd, escalation.costUsd);
+    recordCost(escalation.costUsd, escalation.costUsd === null ? "unpriced" : "verified");
     lastWorktree = escalation.worktree;
 
     const n = nextAttemptNumber();
@@ -854,18 +1162,143 @@ export async function orchestrate(engine: Engine, params: OrchestrateParams): Pr
       );
     }
 
-    attempts.push({ n, kind: "frontier", summary: escalation.text });
+    let prepared;
+    try {
+      prepared = await engine.candidates.prepare(engine, {
+        projectDir: params.projectDir,
+        worktree: escalation.worktree,
+        snapshot: taskSnapshot,
+        contract: taskContract,
+        signal: cancelSignal,
+      });
+    } catch {
+      verificationIncomplete = true;
+      attempts.push({
+        n,
+        kind: "frontier",
+        summary: escalation.text,
+        verdict: {
+          decision: "request-changes",
+          reasons: ["Deterministic verification was incomplete."],
+          severity: "major",
+        },
+      });
+      await cleanupWorktree(engine, params.projectDir, escalation.worktree.path);
+      lastWorktree = null;
+      return finish(
+        "failed",
+        routed.agent.name,
+        routed.taskClass,
+        routed.resolution,
+        escalation.diff,
+        escalation.diffStat,
+        null,
+        routed.routeId,
+      );
+    }
+
+    const reviewAdapter = engine.frontier.getAdapter(reviewFrontier.engine);
+    const reviewCapabilities = await reviewAdapter?.capabilities?.();
+    if (reviewAdapter === undefined || reviewCapabilities?.sandboxCompatibility !== "certified") {
+      verificationIncomplete = true;
+      attempts.push({
+        n,
+        kind: "frontier",
+        summary: escalation.text,
+        verdict: {
+          decision: "request-changes",
+          reasons: ["No compliant independent read-only reviewer is available."],
+          severity: "major",
+        },
+      });
+      await cleanupWorktree(engine, params.projectDir, escalation.worktree.path);
+      lastWorktree = null;
+      return finish(
+        "failed",
+        routed.agent.name,
+        routed.taskClass,
+        routed.resolution,
+        prepared.canonical.diff,
+        prepared.diffStat,
+        null,
+        routed.routeId,
+      );
+    }
+    const reviewSession = await engine.providerGateway.createFrontierSession(reviewAdapter, {
+      projectDir: escalation.worktree.path,
+      wikiMcpUrl: taskWikiMcp?.url ?? null,
+      ...(taskWikiMcp === null ? {} : { wikiMcpBearerToken: taskWikiMcp.bearerToken }),
+      log: engine.log,
+      model: reviewFrontier.model,
+      resultLabel: "frontier-review",
+    });
+    const untrackReview = engine.frontier.track(reviewSession);
+    let escalationVerdict: ReviewVerdict;
+    try {
+      const reviewResult = await reviewDiff(
+        reviewSession,
+        {
+          task: reviewerTask,
+          diff: "",
+          summary: escalation.text,
+          verifierEvidence: JSON.stringify(
+            prepared.reports.map((report) => ({
+              stageId: report.stageId,
+              verdict: report.verdict,
+              outputRef: report.outputRef,
+            })),
+          ),
+        },
+        {
+          timeoutMs: reviewTimeoutMs,
+          abortSignal: cancelSignal,
+          beforePrompt: () => params.supervisor?.reserveModelCall(),
+          onAttemptCost: (cost) => recordCost(cost, cost === null ? "unpriced" : "verified"),
+        },
+      );
+      escalationVerdict = reviewResult.verdict;
+      reviewUsd = addCost(reviewUsd, reviewResult.costUsd);
+    } finally {
+      await engine.frontier.closeSession(reviewSession);
+      untrackReview();
+    }
+    attempts.push({ n, kind: "frontier", summary: escalation.text, verdict: escalationVerdict });
+    if (escalationVerdict.decision !== "approve") {
+      await cleanupWorktree(engine, params.projectDir, escalation.worktree.path);
+      lastWorktree = null;
+      return finish(
+        "failed",
+        routed.agent.name,
+        routed.taskClass,
+        routed.resolution,
+        prepared.canonical.diff,
+        prepared.diffStat,
+        null,
+        routed.routeId,
+      );
+    }
+    candidateRef = engine.candidates.mint({
+      projectDir: params.projectDir,
+      worktree: escalation.worktree,
+      snapshot: taskSnapshot,
+      prepared,
+      authorAttemptId: `attempt-${n}`,
+      authorSessionId: escalation.authorSessionId,
+      reviewerSessionId: reviewSession.id,
+      verdict: escalationVerdict,
+    });
     return finish(
       "escalated",
       routed.agent.name,
       routed.taskClass,
       routed.resolution,
-      escalation.diff,
-      escalation.diffStat,
+      prepared.canonical.diff,
+      prepared.diffStat,
       escalation.worktree,
       routed.routeId,
     );
   } catch (err) {
+    if (err instanceof OrchestrateApprovalPause) throw err;
     // M7b Task 2: determined by checking the resolved cancelSignal's OWN
     // `.aborted` flag directly (mirrors worker/methods.ts's existing
     // timeoutSignal.aborted / controller.signal.aborted convention) rather
