@@ -92,12 +92,22 @@ interface FakeAdapterOptions {
   // for an event the adapter manages to emit after abort() has already
   // fired.
   postAbortEvent?: FrontierEvent;
+  models?: Array<{ id: string; displayName: string; description: string; isDefault: boolean }>;
+  modelListError?: Error;
 }
 
 function makeFakeAdapter(opts: FakeAdapterOptions = {}): FrontierAdapter {
   const kind = opts.kind ?? "claude-code";
   return {
     kind,
+    ...(opts.models !== undefined || opts.modelListError !== undefined
+      ? {
+          async listModels() {
+            if (opts.modelListError !== undefined) throw opts.modelListError;
+            return opts.models ?? [];
+          },
+        }
+      : {}),
     async createSession({ projectDir, wikiMcpUrl, toolPolicy, resultLabel }): Promise<FrontierSession> {
       opts.wikiMcpUrls?.push(wikiMcpUrl);
       opts.capturedToolPolicy?.push(toolPolicy);
@@ -148,6 +158,26 @@ function makeFakeAdapter(opts: FakeAdapterOptions = {}): FrontierAdapter {
 }
 
 describe("frontier RPC methods", () => {
+  it("merges account-visible model catalogs and reports unavailable runtimes", async () => {
+    engine = createEngine();
+    engine.frontier.registerAdapter(makeFakeAdapter({
+      kind: "claude-code",
+      models: [{ id: "opus", displayName: "Opus", description: "Claude Opus", isDefault: true }],
+    }));
+    engine.frontier.registerAdapter(makeFakeAdapter({
+      kind: "codex",
+      modelListError: new Error("not connected"),
+    }));
+
+    const response = await call("engine.frontier.models", {});
+
+    expect(response.error).toBeUndefined();
+    expect(response.result.models).toEqual([
+      { engine: "claude-code", id: "opus", displayName: "Opus", description: "Claude Opus", isDefault: true },
+    ]);
+    expect(response.result.unavailable).toEqual([{ engine: "codex", message: "not connected" }]);
+  });
+
   it("start -> prompt streams ordered notifications then responds with the result (meter-independent)", async () => {
     dir = makeRepo();
     const notifications: Array<{ method: string; params: unknown }> = [];
@@ -768,7 +798,7 @@ describe("frontier RPC methods", () => {
     expect(res.error?.code).toBe(RpcErrorCodes.INVALID_PARAMS);
   });
 
-  it("start resolves relative writeScope entries against projectDir before passing them to the adapter", async () => {
+  it("rejects write-capable interactive frontier sessions", async () => {
     dir = makeRepo();
     engine = createEngine();
     const capturedToolPolicy: Array<{ writeScope?: string[] } | undefined> = [];
@@ -779,13 +809,9 @@ describe("frontier RPC methods", () => {
       attachWiki: false,
       writeScope: ["scratch", "nested/dir"],
     });
-    expect(start.error).toBeUndefined();
-
-    expect(capturedToolPolicy).toHaveLength(1);
-    expect(capturedToolPolicy[0]?.writeScope).toEqual([
-      path.resolve(dir, "scratch"),
-      path.resolve(dir, "nested/dir"),
-    ]);
+    expect(start.error?.code).toBe(RpcErrorCodes.INVALID_PARAMS);
+    expect(start.error?.message).toContain("write-capable frontier sessions are disabled");
+    expect(capturedToolPolicy).toHaveLength(0);
   });
 
   it("start with no writeScope leaves toolPolicy undefined for the adapter (deny-all default unchanged)", async () => {
@@ -821,7 +847,7 @@ describe("frontier RPC methods", () => {
     expect(res.error?.message).toContain("writeScope entry resolves outside the project");
   });
 
-  it("accepts '.' and '.openfusion' as writeScope entries (both resolve inside projectDir)", async () => {
+  it("does not expose project or control-plane roots as interactive write scope", async () => {
     dir = makeRepo();
     engine = createEngine();
     const capturedToolPolicy: Array<{ writeScope?: string[] } | undefined> = [];
@@ -832,12 +858,8 @@ describe("frontier RPC methods", () => {
       attachWiki: false,
       writeScope: [".", ".openfusion"],
     });
-    expect(start.error).toBeUndefined();
-    expect(capturedToolPolicy).toHaveLength(1);
-    expect(capturedToolPolicy[0]?.writeScope).toEqual([
-      path.resolve(dir),
-      path.resolve(dir, ".openfusion"),
-    ]);
+    expect(start.error?.code).toBe(RpcErrorCodes.INVALID_PARAMS);
+    expect(capturedToolPolicy).toHaveLength(0);
   });
 
   it("rejects a writeScope entry that escapes the project via a same-prefix traversal (.openfusion/../..)", async () => {

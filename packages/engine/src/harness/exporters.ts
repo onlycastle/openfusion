@@ -17,24 +17,6 @@ export interface HarnessExportResult {
   files: string[];
 }
 
-// Shown at the top of AGENTS.md (and, implicitly, is why claude-subagents
-// prompts don't repeat it per-file — AGENTS.md is the one place a human is
-// expected to read end to end) whenever the harness hasn't yet cleared its
-// eval gate (spec §12.1 ETH hazard gate; M6). `manifest.verification.evals`
-// starts "pending" at generation time and is never assumed "pass" — this
-// caveat is the harness's own admission that its agent prompts and routing
-// are unverified until the eval loop says otherwise.
-const UNVERIFIED_CAVEAT =
-  '> **UNVERIFIED**: this harness has not yet passed its eval gate (`manifest.verification.evals` is not `"pass"`). Treat the agent roster, prompts, and routing below as unverified until `engine.harness.generate`’s eval loop confirms they do not regress quality versus an all-frontier baseline.';
-
-// Same caveat, but as a YAML COMMENT for claude-subagents' per-agent
-// frontmatter (see renderSubagentMd below) — a user who exports ONLY
-// subagents (never AGENTS.md) would otherwise get trusted-looking files
-// with no ETH-gate caveat anywhere in them. A comment, not a real
-// frontmatter field, so it never pollutes the agent's actual config.
-const UNVERIFIED_SUBAGENT_COMMENT =
-  "# UNVERIFIED: this harness has not passed evals (openfusion M6); review before trusting";
-
 function findPage(bundle: HarnessBundle, slug: string): WikiPage | undefined {
   return bundle.pages.find((p) => p.slug === slug);
 }
@@ -70,10 +52,8 @@ function renderPageSection(page: WikiPage | undefined, missingLabel: string): st
 // manifest.verification.card === "approved" — see the card-led export gate
 // below), THEN project summary (architecture page), build/test commands
 // (build-and-test page), conventions (conventions page), then the agent
-// roster table. The UNVERIFIED caveat is emitted directly under the title
-// whenever `manifest.verification.evals !== "pass"` so it's the first thing
-// a reader sees, not buried after the roster — independent of, and
-// unaffected by, whether the card section is present.
+// roster table. Project-local benchmark state is deliberately absent: system
+// benchmarks do not certify a generated harness instance.
 function renderAgentsMd(bundle: HarnessBundle): string {
   const lines: string[] = [];
   lines.push("# AGENTS.md");
@@ -83,11 +63,6 @@ function renderAgentsMd(bundle: HarnessBundle): string {
   );
   lines.push("");
 
-  if (bundle.manifest.verification.evals !== "pass") {
-    lines.push(UNVERIFIED_CAVEAT);
-    lines.push("");
-  }
-
   // Card-led export (spec §6): both the wiki page (CARD_SLUG) AND
   // manifest.verification.card === "approved" must hold — the same
   // both-exist discipline orchestrate.ts's buildWorkerContext uses for
@@ -95,8 +70,7 @@ function renderAgentsMd(bundle: HarnessBundle): string {
   // "## Project summary". A draft card, or an "approved" manifest flag with
   // no matching page (e.g. hand-edited away), gets NO section here: the
   // export stays byte-identical to a harness with no card at all — never a
-  // degraded/partial rendering of its own. This gate is independent of the
-  // UNVERIFIED caveat above (which gates harness trust, not card trust).
+  // degraded/partial rendering of its own.
   const card = findPage(bundle, CARD_SLUG);
   if (card !== undefined && bundle.manifest.verification.card === "approved") {
     const CARD_DIRECTIVE =
@@ -148,11 +122,8 @@ async function exportAgentsMd(projectDir: string, bundle: HarnessBundle): Promis
   return { files: [path.relative(projectDir, filePath)] };
 }
 
-// Read-only by default: an exported subagent runs on an open worker model
-// under a specialist prompt this pipeline generated but has not yet
-// eval-gated (see UNVERIFIED_CAVEAT above) — it should be able to explore
-// the project, not mutate it, until a human explicitly widens its tools in
-// Claude Code's own subagent config.
+// Read-only by default: exported generated instructions should be reviewed
+// before a human explicitly widens their tools in Claude Code's config.
 const READ_ONLY_TOOLS_LINE = "Read, Grep, Glob";
 
 // `<projectDir>/.claude/agents/<name>.md` per agent — Claude Code's native
@@ -168,9 +139,7 @@ function renderSubagentMd(agent: AgentDef, bundle: HarnessBundle): string {
     description: agent.description,
     tools: READ_ONLY_TOOLS_LINE,
   });
-  const unverifiedComment =
-    bundle.manifest.verification.evals !== "pass" ? `${UNVERIFIED_SUBAGENT_COMMENT}\n` : "";
-  const header = `---\n${frontmatter}${unverifiedComment}# suggested worker: ${renderModelHint(agent)}\n---\n`;
+  const header = `---\n${frontmatter}# suggested worker: ${renderModelHint(agent)}\n---\n`;
 
   const body: string[] = [agent.prompt.trim(), "", "## Project wiki digest", ""];
   for (const page of bundle.pages) {
@@ -227,11 +196,8 @@ function renderOpencodeJson(bundle: HarnessBundle): string {
       harnessProfile: bundle.manifest.harnessProfile ?? "openfusion-native",
       familyCatalogVersion: bundle.manifest.familyCatalogVersion,
       dialectPackVersion: bundle.manifest.dialectPackVersion,
-      evals: bundle.manifest.verification.evals,
-      note:
-        bundle.manifest.verification.evals !== "pass"
-          ? "UNVERIFIED: harness has not passed evals"
-          : undefined,
+      structural: bundle.manifest.verification.structural,
+      card: bundle.manifest.verification.card ?? "missing",
     },
     default_agent: bundle.routing.defaults.agent,
     agents,

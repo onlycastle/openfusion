@@ -1,9 +1,24 @@
-import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { readFileSync, statSync } from "node:fs";
 import path from "node:path";
+import {
+  fingerprintTrackedSources,
+  getProjectHeadSha,
+  listHeadTreeEntries,
+  readGitBlobsBatched,
+  type TrackedSourceState,
+} from "../verification/project.js";
 import type { WikiParser } from "./parser.js";
 import type { FileUpdate, WikiStore } from "./store.js";
+
+export interface WikiCoverage {
+  supportedTracked: number;
+  currentEntries: number;
+  unchanged: number;
+  oversized: number;
+  unreadable: number;
+  parseFailed: number;
+  removed: number;
+}
 
 export interface IndexStats {
   filesSeen: number;
@@ -14,9 +29,11 @@ export interface IndexStats {
   symbols: number;
   refs: number;
   headSha: string;
+  sourceFingerprint: string;
+  coverage: WikiCoverage;
 }
 
-const MAX_FILE_BYTES = 1024 * 1024;
+export const MAX_WIKI_FILE_BYTES = 1024 * 1024;
 
 // M7c Task 1 (the M7b-flagged gap): buildIndex previously ran silently from
 // the caller's point of view — engine.wiki.build had no progress signal at
@@ -36,18 +53,7 @@ export type BuildIndexProgress = (detail: string) => void;
 const PROGRESS_INTERVAL = 25;
 
 export function getHeadSha(projectDir: string): string {
-  return execFileSync("git", ["-C", projectDir, "rev-parse", "HEAD"], {
-    encoding: "utf8",
-    stdio: ["ignore", "pipe", "pipe"],
-  }).trim();
-}
-
-function listTrackedFiles(projectDir: string): string[] {
-  const out = execFileSync("git", ["-C", projectDir, "ls-files", "-z"], {
-    encoding: "utf8",
-    maxBuffer: 64 * 1024 * 1024,
-  });
-  return out.split("\0").filter((p) => p.length > 0);
+  return getProjectHeadSha(projectDir);
 }
 
 export async function buildIndex(
@@ -56,10 +62,10 @@ export async function buildIndex(
   parser: WikiParser,
   onProgress?: BuildIndexProgress,
 ): Promise<IndexStats> {
-  const headSha = getHeadSha(projectDir);
+  const headSha = getProjectHeadSha(projectDir);
   const extensions = parser.supportedExtensions();
-  const tracked = listTrackedFiles(projectDir).filter((p) =>
-    extensions.has(path.extname(p)),
+  const tracked = listHeadTreeEntries(projectDir).filter((entry) =>
+    extensions.has(path.extname(entry.path)),
   );
   const total = tracked.length;
   onProgress?.(`scanning ${total} file${total === 1 ? "" : "s"}`);
@@ -67,58 +73,116 @@ export async function buildIndex(
   let filesIndexed = 0;
   let filesSkipped = 0;
   let filesFailed = 0;
+  let unchanged = 0;
+  let oversized = 0;
+  let unreadable = 0;
   let processed = 0;
   const seen = new Set<string>();
   const updates: FileUpdate[] = [];
+  const sourceStates: TrackedSourceState[] = [];
+  const invalidated = new Set<string>();
+  const blobEntries = tracked.filter(
+    (entry) =>
+      entry.type === "blob" &&
+      entry.mode !== "120000" &&
+      (entry.size === null || entry.size <= MAX_WIKI_FILE_BYTES),
+  );
+  let blobs = new Map<string, Buffer>();
+  try {
+    blobs = readGitBlobsBatched(projectDir, blobEntries);
+  } catch {
+    // Missing blobs are categorized per file below. The build publishes
+    // coverage evidence rather than leaking raw Git diagnostics.
+  }
 
-  for (const relPath of tracked) {
+  for (const entry of tracked) {
+    const relPath = entry.path;
     seen.add(relPath);
     processed += 1;
     if (processed % PROGRESS_INTERVAL === 0) {
       onProgress?.(`indexed ${processed}/${total} files (last: ${relPath})`);
       await new Promise<void>((resolve) => setImmediate(resolve));
     }
-    const absPath = path.join(projectDir, relPath);
-    let size: number;
-    try {
-      size = statSync(absPath).size;
-    } catch {
-      filesSkipped += 1; // tracked but momentarily unreadable: keep existing entries
+    if (entry.type !== "blob" || entry.mode === "120000") {
+      unreadable += 1;
+      filesSkipped += 1;
+      sourceStates.push({ path: relPath, state: "unreadable" });
+      invalidated.add(relPath);
       continue;
     }
-    if (size > MAX_FILE_BYTES) {
-      filesSkipped += 1; // too large to parse: keep any existing entries
+    if (entry.size !== null && entry.size > MAX_WIKI_FILE_BYTES) {
+      oversized += 1;
+      filesSkipped += 1;
+      sourceStates.push({ path: relPath, state: "oversized", size: entry.size });
+      invalidated.add(relPath);
       continue;
     }
-    let source: string;
-    try {
-      source = readFileSync(absPath, "utf8");
-    } catch {
-      filesSkipped += 1; // vanished between stat and read: keep existing entries
+    const content = blobs.get(entry.objectId);
+    if (content === undefined) {
+      unreadable += 1;
+      filesSkipped += 1;
+      sourceStates.push({ path: relPath, state: "unreadable" });
+      invalidated.add(relPath);
       continue;
     }
-    const hash = createHash("sha256").update(source).digest("hex");
+    const size = content.length;
+    if (size > MAX_WIKI_FILE_BYTES) {
+      oversized += 1;
+      filesSkipped += 1;
+      sourceStates.push({ path: relPath, state: "oversized", size });
+      invalidated.add(relPath);
+      continue;
+    }
+    const source = content.toString("utf8");
+    const hash = createHash("sha256").update(content).digest("hex");
+    sourceStates.push({ path: relPath, state: "readable", hash: `sha256:${hash}`, size });
     if (store.getFileHash(relPath) === hash) {
+      unchanged += 1;
       filesSkipped += 1;
       continue;
     }
     const result = parser.parseFile(relPath, source);
     if (result === null) {
       filesFailed += 1;
+      invalidated.add(relPath);
       continue;
     }
     updates.push({
       path: relPath,
       hash,
       lang: parser.languageFor(relPath) ?? "unknown",
+      searchText: source,
       symbols: result.symbols,
       refs: result.refs,
     });
     filesIndexed += 1;
   }
 
-  const removals = store.listFiles().filter((known) => !seen.has(known));
-  store.applyBuild(updates, removals, { headSha });
+  const sourceFingerprint = fingerprintTrackedSources(sourceStates);
+  if (getProjectHeadSha(projectDir) !== headSha) {
+    throw new Error("wiki source HEAD changed during indexing; retry the build");
+  }
+
+  const removals = store
+    .listFiles()
+    .filter((known) => !seen.has(known) || invalidated.has(known));
+  const currentPaths = new Set(store.listFiles());
+  for (const removed of removals) currentPaths.delete(removed);
+  for (const update of updates) currentPaths.add(update.path);
+  const coverage: WikiCoverage = {
+    supportedTracked: tracked.length,
+    currentEntries: currentPaths.size,
+    unchanged,
+    oversized,
+    unreadable,
+    parseFailed: filesFailed,
+    removed: removals.length,
+  };
+  store.applyBuild(updates, removals, {
+    headSha,
+    sourceFingerprint,
+    coverageJson: JSON.stringify(coverage),
+  });
 
   onProgress?.(
     `indexed ${filesIndexed}/${total} files (${filesSkipped} skipped, ${filesFailed} failed)`,
@@ -134,5 +198,7 @@ export async function buildIndex(
     symbols: counts.symbols,
     refs: counts.refs,
     headSha,
+    sourceFingerprint,
+    coverage,
   };
 }

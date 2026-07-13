@@ -71,6 +71,8 @@ describe("synthEvalTask", () => {
     const dir = tmpDir("of-synth-");
     const task = synthEvalTask();
     await task.setup(dir);
+    expect(existsSync(path.join(dir, "test.js"))).toBe(false);
+    await task.prepareOracle?.(dir);
 
     const before = await runOracle(dir, task.testCommand);
     expect(before.passed).toBe(false);
@@ -99,6 +101,8 @@ describe("synthEvalTask", () => {
     expect(task.prompt).toBe("custom prompt");
     await task.setup(dir);
     expect(existsSync(path.join(dir, "impl.js"))).toBe(true);
+    expect(existsSync(path.join(dir, "spec.js"))).toBe(false);
+    await task.prepareOracle?.(dir);
     expect(existsSync(path.join(dir, "spec.js"))).toBe(true);
   });
 });

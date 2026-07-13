@@ -1,11 +1,13 @@
-import type { z } from "zod";
+import { z } from "zod";
 import type { FrontierSession } from "../engines/types.js";
 import { RunCancelledError } from "../rpc/cancel-registry.js";
 
 // promptForJson (M4 Task 3) is the sole way harnessgen elicits structured
-// content from a frontier session: it prompts, accumulates the turn's `text`
-// events, extracts a JSON candidate, validates it against a caller-supplied
-// zod schema, and — on a schema mismatch — re-prompts the SAME session with
+// content from a frontier session: it converts the caller's zod schema to
+// JSON Schema for adapters with native structured-output support, prefers a
+// returned `structuredOutput`, and otherwise extracts a JSON candidate from
+// accumulated `text` events. Either path is validated against the original
+// zod schema and — on a schema mismatch — re-prompts the SAME session with
 // the validation issues folded back in, giving the model one (by default) or
 // more chances to self-correct before giving up. Built entirely against the
 // FrontierSession contract (engines/types.ts) so it is fully testable with a
@@ -14,10 +16,11 @@ import { RunCancelledError } from "../rpc/cancel-registry.js";
 // Surfaced by callers (M4 Task 4's generation pipeline) as
 // `harness.progress` notifications: "attempt" fires once per prompt sent
 // (including the first), "validation-retry" fires when a validation failure
-// is about to trigger a re-prompt, and "notice" mirrors a FrontierEvent
-// `notice` (rate_limit/overloaded/api_error) encountered mid-turn.
+// is about to trigger a re-prompt, "validation-failure" records the exhausted
+// final attempt, and "notice" mirrors a FrontierEvent `notice`
+// (rate_limit/overloaded/api_error) encountered mid-turn.
 export type DriverNotice = {
-  kind: "attempt" | "validation-retry" | "notice";
+  kind: "attempt" | "validation-retry" | "validation-failure" | "notice";
   detail: string;
 };
 
@@ -51,6 +54,10 @@ export interface PromptForJsonOpts {
   // two attempts total), matching the brief.
   retries?: number;
   notify?: (notice: DriverNotice) => void;
+  /** Called immediately before each real prompt attempt, including retries. */
+  beforePrompt?: () => void;
+  /** Receives one complete-or-null price observation for each prompt attempt. */
+  onAttemptCost?: (costUsd: number | null) => void;
   // Stamped onto HarnessGenError.stage if exhaustion is reached — see the
   // class comment above. promptForJson never inspects or derives this
   // itself.
@@ -63,11 +70,9 @@ export interface PromptForJsonOpts {
   // deliberately simple (no cross-attempt budget tracking) — acceptable
   // because the attempt COUNT is already bounded by `retries`, and matches
   // the M5b Task 4 brief's explicit call: per-attempt semantics are simplest
-  // and sufficient here. Undefined (the default, and what every M4 caller —
-  // harness/generate.ts — still passes) forwards `timeoutMs: undefined` to
-  // session.prompt, which is a harmless no-op for any FrontierSession
-  // implementation (equivalent to the pre-Task-4 `session.prompt(text)` call
-  // with no opts at all).
+  // and sufficient here. Undefined forwards `timeoutMs: undefined` to
+  // session.prompt, which remains a harmless no-op for callers that do not
+  // need a deadline. Harness generation supplies 600,000 ms explicitly.
   timeoutMs?: number;
   // M7b Task 2: this run's own cancellation signal — checked/threaded
   // per-ATTEMPT (see the loop below), matching timeoutMs's own per-attempt
@@ -149,7 +154,11 @@ function parseJsonCandidate<S extends z.ZodType>(text: string, schema: S): Parse
       ],
     };
   }
-  const result = schema.safeParse(json);
+  return validateValue(json, schema);
+}
+
+function validateValue<S extends z.ZodType>(value: unknown, schema: S): ParseAttempt<z.infer<S>> {
+  const result = schema.safeParse(value);
   if (result.success) return { ok: true, value: result.data };
   return {
     ok: false,
@@ -192,16 +201,19 @@ function addCost(total: number | null, next: number | null): number | null {
 // fully testable with a scripted fake session.
 //
 // Per attempt: sends the current prompt text to the SAME session, collects
-// every `text` event's content (concatenated, in order) as the turn's
-// answer, aggregates `result` events' costUsd (see addCost), and forwards
-// `notice` events to opts.notify as DriverNotice `{ kind: "notice" }`. A
+// every `text` event's content (concatenated, in order) as the portable
+// fallback answer, captures native structured output from a `result` event
+// when available, aggregates costUsd (see addCost), and forwards `notice`
+// events to opts.notify as DriverNotice `{ kind: "notice" }`. A
 // `type: "error"` event is treated as an unrecoverable session-level failure
 // (not a validation problem to retry past) and rethrown immediately as a
 // plain Error — an adapter/session-level failure, not a JSON-shape issue,
 // so validation-feedback retry does not apply to it.
 //
-// Once the turn ends, the accumulated text is parsed (fenced-JSON, else
-// whole-text fallback) and zod-validated. On success, returns immediately.
+// Once the turn ends, structured output is zod-validated directly when it
+// exists; otherwise accumulated text is parsed (fenced-JSON, else whole-text
+// fallback) and zod-validated. No malformed JSON repair is attempted. On
+// success, returns immediately.
 // On failure with attempts remaining, notifies "validation-retry" and
 // re-prompts with buildRetryPrompt's issue-feedback text. On failure with no
 // attempts remaining, throws HarnessGenError carrying the total attempt
@@ -211,22 +223,37 @@ export async function promptForJson<S extends z.ZodType>(
   prompt: string,
   schema: S,
   opts: PromptForJsonOpts = {},
-): Promise<{ value: z.infer<S>; attempts: number; costUsd: number | null }> {
+): Promise<{
+  value: z.infer<S>;
+  attempts: number;
+  costUsd: number | null;
+  pricedCalls: number;
+  unpricedCalls: number;
+}> {
   const maxAttempts = 1 + (opts.retries ?? 1);
   const notify = opts.notify ?? ((): void => {});
+  const outputSchema = z.toJSONSchema(schema) as Record<string, unknown>;
 
   let currentPrompt = prompt;
   let costUsd: number | null = null;
+  let pricedCalls = 0;
+  let unpricedCalls = 0;
   let lastIssues: Issue[] = [];
 
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
     if (opts.abortSignal?.aborted) throw new RunCancelledError();
+    opts.beforePrompt?.();
     notify({ kind: "attempt", detail: `prompt attempt ${attempt}/${maxAttempts}` });
 
-    const handle = session.prompt(currentPrompt, { timeoutMs: opts.timeoutMs });
+    const handle = session.prompt(currentPrompt, { timeoutMs: opts.timeoutMs, outputSchema });
     const onCancel = (): void => handle.abort();
     opts.abortSignal?.addEventListener("abort", onCancel, { once: true });
     let text = "";
+    let structuredOutput: unknown;
+    let hasStructuredOutput = false;
+    let attemptSawResult = false;
+    let attemptUnpriced = false;
+    let attemptKnownUsd = 0;
     try {
       for await (const event of handle.events) {
         switch (event.type) {
@@ -234,7 +261,14 @@ export async function promptForJson<S extends z.ZodType>(
             text += event.text;
             break;
           case "result":
+            attemptSawResult = true;
             costUsd = addCost(costUsd, event.costUsd);
+            if (event.costUsd === null) attemptUnpriced = true;
+            else attemptKnownUsd += event.costUsd;
+            if ("structuredOutput" in event) {
+              structuredOutput = event.structuredOutput;
+              hasStructuredOutput = true;
+            }
             break;
           case "notice":
             notify({ kind: "notice", detail: event.message });
@@ -251,6 +285,10 @@ export async function promptForJson<S extends z.ZodType>(
       throw err;
     } finally {
       opts.abortSignal?.removeEventListener("abort", onCancel);
+      const attemptCost = attemptSawResult && !attemptUnpriced ? attemptKnownUsd : null;
+      if (attemptCost === null) unpricedCalls += 1;
+      else pricedCalls += 1;
+      opts.onAttemptCost?.(attemptCost);
     }
     // Checked right after this attempt's loop ends NORMALLY, before ever
     // falling through into JSON-parse/validation-retry logic — a
@@ -258,9 +296,17 @@ export async function promptForJson<S extends z.ZodType>(
     // finished must never be scored as "produced malformed JSON, retry".
     if (opts.abortSignal?.aborted) throw new RunCancelledError();
 
-    const attemptResult = parseJsonCandidate(text, schema);
+    const attemptResult = hasStructuredOutput
+      ? validateValue(structuredOutput, schema)
+      : parseJsonCandidate(text, schema);
     if (attemptResult.ok) {
-      return { value: attemptResult.value, attempts: attempt, costUsd };
+      return {
+        value: attemptResult.value,
+        attempts: attempt,
+        costUsd,
+        pricedCalls,
+        unpricedCalls,
+      };
     }
 
     lastIssues = attemptResult.issues;
@@ -272,6 +318,11 @@ export async function promptForJson<S extends z.ZodType>(
       currentPrompt = buildRetryPrompt(lastIssues);
     }
   }
+
+  notify({
+    kind: "validation-failure",
+    detail: `validation failed on final attempt ${maxAttempts}/${maxAttempts}: ${formatIssues(lastIssues)}`,
+  });
 
   throw new HarnessGenError(
     `promptForJson: exhausted ${maxAttempts} attempt(s) without producing schema-valid JSON`,

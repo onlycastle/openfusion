@@ -5,7 +5,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { RpcErrorCodes } from "@openfusion/shared";
 import { createEngine, type Engine } from "../src/engine.js";
 import { CARD_SLUG, type AgentDef, type HarnessBundle, type Manifest, type Routing, type WikiPage } from "../src/harness/schema.js";
-import { writeHarness } from "../src/harness/store.js";
+import { activeHarnessDir, writeHarness } from "../src/harness/store.js";
 
 let dir: string;
 let engine: Engine;
@@ -102,7 +102,7 @@ describe("engine.harness.export — no valid harness", () => {
     expect(res.error?.message).toMatch(/no valid harness/i);
   });
 
-  it("returns SERVER_ERROR when the on-disk harness fails validateHarness (dangling routing reference)", async () => {
+  it("returns SERVER_ERROR when an active immutable generation was edited directly", async () => {
     makeDir();
     engine = createEngine();
     await writeHarness(dir, validBundle());
@@ -111,23 +111,18 @@ describe("engine.harness.export — no valid harness", () => {
     // referentially broken, exactly what validateHarness (not the zod
     // schema) is responsible for catching.
     writeFileSync(
-      path.join(dir, ".openfusion/routing.yaml"),
+      path.join(activeHarnessDir(dir)!, "routing.yaml"),
       "version: 1\ntaskClasses:\n  codegen:\n    agent: ghost-worker\nescalation:\n  failuresBeforeFrontier: 2\ndefaults:\n  agent: ghost-worker\n",
     );
 
     const res = await call("engine.harness.export", { projectDir: dir, format: "agents-md" });
     expect(res.error?.code).toBe(RpcErrorCodes.SERVER_ERROR);
-    expect(res.error?.message).toMatch(/no valid harness/i);
-    // Unlike the loadHarness-null case (nothing on disk to report), THIS
-    // failure is a validateHarness cross-check with concrete issues — the
-    // error must carry them in data.issues rather than discarding them.
-    expect(Array.isArray(res.error?.data?.issues)).toBe(true);
-    expect(res.error?.data?.issues.length).toBeGreaterThan(0);
+    expect(res.error?.message).toMatch(/modified outside an approved write/i);
   });
 });
 
 describe("engine.harness.export — agents-md", () => {
-  it("writes AGENTS.md with project summary, build/test info, conventions, roster table, and the UNVERIFIED caveat", async () => {
+  it("writes AGENTS.md with project summary, build/test info, conventions, and roster table", async () => {
     makeDir();
     engine = createEngine();
     await writeHarness(dir, validBundle());
@@ -158,11 +153,10 @@ describe("engine.harness.export — agents-md", () => {
     expect(content).toContain("docs-worker");
     expect(content).toContain("frontier");
 
-    // UNVERIFIED caveat — manifest.verification.evals is "pending".
-    expect(content).toMatch(/UNVERIFIED/);
+    expect(content).not.toMatch(/UNVERIFIED/);
   });
 
-  it("omits the UNVERIFIED caveat once manifest.verification.evals is pass", async () => {
+  it("ignores legacy project-local benchmark state", async () => {
     makeDir();
     engine = createEngine();
     await writeHarness(
@@ -297,12 +291,10 @@ describe("engine.harness.export — agents-md project card", () => {
     expect(summaryIndex).toBeGreaterThan(-1);
     expect(cardIndex).toBeLessThan(summaryIndex);
 
-    // The card-led branch does not replace the UNVERIFIED caveat gate — it
-    // still gates on evals, independently of card approval.
-    expect(content).toMatch(/UNVERIFIED/);
+    expect(content).not.toMatch(/UNVERIFIED/);
   });
 
-  it("still omits the UNVERIFIED caveat once evals pass, even with an approved card", async () => {
+  it("renders an approved card independently of legacy benchmark state", async () => {
     makeDir();
     engine = createEngine();
     const base = validBundle();
@@ -338,8 +330,7 @@ describe("engine.harness.export — agents-md project card", () => {
 
     expect(withDraftCard).toEqual(withoutCard);
     expect(withDraftCard).not.toContain("## Project card");
-    // Draft card still doesn't touch the UNVERIFIED gate.
-    expect(withDraftCard).toMatch(/UNVERIFIED/);
+    expect(withDraftCard).not.toMatch(/UNVERIFIED/);
   });
 
   it("emits no Project card section when verification.card is approved but no card page exists on the bundle", async () => {
@@ -464,20 +455,16 @@ describe("engine.harness.export — claude-subagents", () => {
     expect(content).not.toContain("Follow the wiki digest and keep diffs minimal.");
   });
 
-  it("adds an UNVERIFIED comment to frontmatter when the harness has not passed evals", async () => {
+  it("does not export legacy project-local benchmark state into subagent prompts", async () => {
     makeDir();
     engine = createEngine();
-    // validBundle()'s default manifest has verification.evals: "pending".
     await writeHarness(dir, validBundle());
 
     await call("engine.harness.export", { projectDir: dir, format: "claude-subagents" });
 
     for (const name of ["codegen-worker", "docs-worker"]) {
       const content = readFileSync(path.join(dir, ".claude", "agents", `${name}.md`), "utf8");
-      // A YAML COMMENT inside the frontmatter block, not a real field — an
-      // agent exported alone (without AGENTS.md) must still carry the
-      // ETH-gate caveat somewhere a reviewer will actually see it.
-      expect(content).toMatch(/^# UNVERIFIED:.*evals.*$/m);
+      expect(content).not.toMatch(/^# UNVERIFIED:.*evals.*$/m);
       expect(content).not.toMatch(/^unverified:/im);
     }
   });

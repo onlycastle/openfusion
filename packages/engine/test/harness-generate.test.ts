@@ -9,6 +9,7 @@ import type {
   FrontierAdapter,
   FrontierEvent,
   FrontierPromptHandle,
+  FrontierPromptOptions,
   FrontierSession,
 } from "../src/engines/types.js";
 import { harnessStatus, loadHarness } from "../src/harness/store.js";
@@ -84,9 +85,11 @@ function badJsonScript(): FrontierEvent[] {
 }
 
 interface ScriptedAdapterOptions {
+  kind?: string;
   scripts: FrontierEvent[][];
   closeSpy?: { closed: boolean; count: number };
   capturedPrompts?: string[];
+  capturedPromptOptions?: Array<FrontierPromptOptions | undefined>;
   capturedToolPolicy?: Array<{ writeScope?: string[] } | undefined>;
   createSessionSpy?: { count: number };
   // Final review Fix 2: captures createSession's `resultLabel` argument so
@@ -94,21 +97,24 @@ interface ScriptedAdapterOptions {
   // (not the pre-fix default of "frontier-review", which mislabeled an
   // hour-long harness-generation run as per-task review overhead).
   capturedResultLabel?: Array<string | undefined>;
+  capturedModel?: Array<string | undefined>;
 }
 
 function makeScriptedAdapter(opts: ScriptedAdapterOptions): FrontierAdapter {
   return {
-    kind: "claude-code",
-    async createSession({ projectDir, toolPolicy, resultLabel }): Promise<FrontierSession> {
+    kind: opts.kind ?? "claude-code",
+    async createSession({ projectDir, model, toolPolicy, resultLabel }): Promise<FrontierSession> {
       if (opts.createSessionSpy !== undefined) opts.createSessionSpy.count += 1;
       opts.capturedToolPolicy?.push(toolPolicy);
       opts.capturedResultLabel?.push(resultLabel);
+      opts.capturedModel?.push(model);
       let callIndex = 0;
       return {
         id: "scripted-session",
         projectDir,
-        prompt(text: string): FrontierPromptHandle {
+        prompt(text: string, promptOptions?: FrontierPromptOptions): FrontierPromptHandle {
           opts.capturedPrompts?.push(text);
+          opts.capturedPromptOptions?.push(promptOptions);
           const events = opts.scripts[Math.min(callIndex, opts.scripts.length - 1)] ?? [];
           callIndex += 1;
           async function* gen(): AsyncGenerator<FrontierEvent> {
@@ -210,6 +216,21 @@ function happyScripts(): FrontierEvent[][] {
 }
 
 describe("engine.harness.generate — happy path (scripted fake adapter)", () => {
+  it("passes each harness stage a JSON schema and ten-minute per-attempt timeout", async () => {
+    dir = makeRepo();
+    engine = createEngine();
+    const capturedPromptOptions: Array<FrontierPromptOptions | undefined> = [];
+    engine.frontier.registerAdapter(makeScriptedAdapter({ scripts: happyScripts(), capturedPromptOptions }));
+
+    const res = await call("engine.harness.generate", { projectDir: dir });
+
+    expect(res.error).toBeUndefined();
+    expect(capturedPromptOptions).toHaveLength(7);
+    for (const options of capturedPromptOptions) {
+      expect(options).toMatchObject({ timeoutMs: 600_000, outputSchema: { type: "object" } });
+    }
+  }, 30_000);
+
   it("writes a full harness bundle, returns the report card, and emits stages in order", async () => {
     dir = makeRepo();
     const notifications: Array<{ method: string; params: unknown }> = [];
@@ -223,15 +244,18 @@ describe("engine.harness.generate — happy path (scripted fake adapter)", () =>
     const result = res.result;
     expect(result.pages).toBe(5);
     expect(result.agents).toBe(2);
-    expect(result.reportCard).toEqual({ structural: "pass", evals: "pending" });
-    expect(result.note).toContain("UNVERIFIED");
-    expect(result.note).toContain("M6");
+    expect(result.reportCard).toEqual({ structural: "pass", operational: "insufficient-evidence" });
+    expect(result.note).toContain("operational health");
     expect(typeof result.estimatedCostUsd).toBe("number");
     expect(result.estimatedCostUsd).toBeGreaterThan(0);
     expect(Array.isArray(result.files)).toBe(true);
-    expect(result.files).toContain(path.join(".openfusion", "manifest.json"));
-    expect(result.files).toContain(path.join(".openfusion", "routing.yaml"));
-    expect(result.files).toContain(path.join(".openfusion", "wiki", "project-card.md"));
+    expect(result.files).toContain(path.join(".openfusion", "current.json"));
+    expect(result.files.some((file: string) =>
+      file.includes(path.join(".openfusion", "generations") + path.sep)
+      && file.endsWith(path.join("manifest.json")),
+    )).toBe(true);
+    expect(result.files.some((file: string) => file.endsWith(path.join("routing.yaml")))).toBe(true);
+    expect(result.files.some((file: string) => file.endsWith(path.join("wiki", "project-card.md")))).toBe(true);
 
     // The unmined `npm run ghost` command must have been stripped at
     // generation (validateCardContent, M4 task 3) — surfaced on the result
@@ -245,7 +269,7 @@ describe("engine.harness.generate — happy path (scripted fake adapter)", () =>
     expect(bundle!.pages).toHaveLength(5);
     expect(bundle!.pages.map((p) => p.slug).sort()).toEqual([...PROSE_PAGE_SLUGS, CARD_SLUG].sort());
     expect(bundle!.agents).toHaveLength(2);
-    expect(bundle!.manifest.verification).toEqual({ structural: "pass", evals: "pending", card: "draft" });
+    expect(bundle!.manifest.verification).toEqual({ structural: "pass", card: "draft" });
     expect(bundle!.manifest.generatorVersion).toBe(ENGINE_VERSION);
     expect(bundle!.manifest.engine).toBe("claude-code");
     expect(bundle!.manifest.headSha).toHaveLength(40);
@@ -310,6 +334,30 @@ describe("engine.harness.generate — happy path (scripted fake adapter)", () =>
     // Session must be closed once the pipeline finishes.
     expect(closeSpy.closed).toBe(true);
     expect(closeSpy.count).toBe(1);
+  }, 30_000);
+
+  it("uses the selected planning runtime/model and records the runtime in the manifest", async () => {
+    dir = makeRepo();
+    engine = createEngine();
+    const capturedModel: Array<string | undefined> = [];
+    engine.frontier.registerAdapter(makeScriptedAdapter({
+      kind: "planning-runtime",
+      scripts: happyScripts(),
+      capturedModel,
+    }));
+
+    const res = await call("engine.harness.generate", {
+      projectDir: dir,
+      frontier: { engine: "planning-runtime", model: "planning-model" },
+    });
+
+    expect(res.error).toBeUndefined();
+    expect(capturedModel).toEqual(["planning-model"]);
+    expect(loadHarness(dir)?.manifest.engine).toBe("planning-runtime");
+    expect(loadHarness(dir)?.manifest.planningFrontier).toEqual({
+      engine: "planning-runtime",
+      model: "planning-model",
+    });
   }, 30_000);
 
   // M6 Task 1 (eval-batch safety gate): generateHarness opens its session
@@ -433,7 +481,8 @@ describe("engine.harness.generate — validation-retry path", () => {
 describe("engine.harness.generate — hard failure (retry exhaustion)", () => {
   it("returns SERVER_ERROR with data.stage === 'page:architecture' and writes nothing when a page stage is exhausted", async () => {
     dir = makeRepo();
-    engine = createEngine();
+    const notifications: Array<{ method: string; params: unknown }> = [];
+    engine = createEngine({ notify: (method, params) => notifications.push({ method, params }) });
     const closeSpy = { closed: false, count: 0 };
     // Overview succeeds, then page:architecture (first page slug) fails
     // validation on BOTH of its attempts (default retries: 1 => 2 attempts).
@@ -444,8 +493,17 @@ describe("engine.harness.generate — hard failure (retry exhaustion)", () => {
     expect(res.error).toBeDefined();
     expect(res.error.code).toBe(RpcErrorCodes.SERVER_ERROR);
     expect(res.error.data.stage).toBe("page:architecture");
+    expect(res.error.data.attempts).toBe(2);
     expect(Array.isArray(res.error.data.issues)).toBe(true);
     expect(res.error.data.issues.length).toBeGreaterThan(0);
+    expect(
+      notifications.some(
+        (notification) =>
+          notification.method === "harness.progress" &&
+          (notification.params as { stage: string; detail: string }).stage === "page:architecture" &&
+          (notification.params as { stage: string; detail: string }).detail.includes("validation-failure"),
+      ),
+    ).toBe(true);
 
     // Nothing under .openfusion beyond the wiki cache — no manifest.json,
     // so loadHarness reports "nothing generated yet".
@@ -550,7 +608,7 @@ describe("engine.harness.status", () => {
     expect(after.error).toBeUndefined();
     expect(after.result.present).toBe(true);
     expect(after.result.structural).toBe("pass");
-    expect(after.result.evals).toBe("pending");
+    expect(after.result).not.toHaveProperty("evals");
     expect(after.result.headSha).toHaveLength(40);
   }, 30_000);
 });

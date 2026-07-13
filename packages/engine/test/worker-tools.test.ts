@@ -13,14 +13,23 @@ import path from "node:path";
 import type { Tool } from "ai";
 import { afterEach, describe, expect, it } from "vitest";
 import { createEngine, type Engine } from "../src/engine.js";
-import { createWorkerTools } from "../src/worker/tools.js";
+import { MacOsSandboxBackend } from "../src/runtime/sandbox.js";
+import { RuntimeStore } from "../src/runtime/store.js";
+import { createPassthroughSandboxRunner } from "./native-sandbox-fixture.js";
+import {
+  createWorkerTools,
+  type ToolContext,
+  type ToolLifecycleEvent,
+} from "../src/worker/tools.js";
 
 let dir: string;
 let outsideDir: string;
 let engine: Engine | undefined;
+const runtimeStores: RuntimeStore[] = [];
 afterEach(async () => {
   if (engine !== undefined) await engine.close();
   engine = undefined;
+  for (const runtimeStore of runtimeStores.splice(0)) runtimeStore.close();
   if (dir) rmSync(dir, { recursive: true, force: true });
   if (outsideDir) rmSync(outsideDir, { recursive: true, force: true });
 });
@@ -52,25 +61,49 @@ function makeRoot(prefix = "of-tools-"): string {
   return realpathSync(root);
 }
 
+function createSandboxedTools(ctx: ToolContext): Record<string, Tool> {
+  const runner = createPassthroughSandboxRunner(
+    ctx.root,
+    `.sandbox-test-${runtimeStores.length}.mjs`,
+  );
+  const runtimeStore = new RuntimeStore({
+    projectDir: ctx.root,
+    key: Buffer.alloc(32, runtimeStores.length + 1),
+  });
+  runtimeStores.push(runtimeStore);
+  const session = runtimeStore.createSession({ kind: "worker" });
+  const backend = new MacOsSandboxBackend({
+    platform: "darwin",
+    runnerExecutable: runner,
+    probe: async () => ({ ok: true }),
+  });
+  return createWorkerTools({
+    ...ctx,
+    includeBash: true,
+    sandboxCertified: true,
+    sandbox: { backend, store: runtimeStore, sessionId: session.id },
+  });
+}
+
 describe("bash", () => {
   it("runs a command and returns stdout with exit code 0", async () => {
     dir = makeRoot();
-    const tools = createWorkerTools({ root: dir });
+    const tools = createSandboxedTools({ root: dir });
     const result = await getExecute(tools.bash)({ command: "echo hi" }, FAKE_OPTS);
-    expect(result.stdout.trim()).toBe("hi");
+    expect(result.stdout).toContain("hi");
     expect(result.exitCode).toBe(0);
   });
 
   it("returns a nonzero exit code as a normal result, not a throw", async () => {
     dir = makeRoot();
-    const tools = createWorkerTools({ root: dir });
+    const tools = createSandboxedTools({ root: dir });
     const result = await getExecute(tools.bash)({ command: "exit 3" }, FAKE_OPTS);
     expect(result.exitCode).toBe(3);
   });
 
   it("returns an error result (not a hang) when the command exceeds bashTimeoutMs", async () => {
     dir = makeRoot();
-    const tools = createWorkerTools({ root: dir, bashTimeoutMs: 50 });
+    const tools = createSandboxedTools({ root: dir, bashTimeoutMs: 50 });
     const result = await getExecute(tools.bash)({ command: "sleep 5" }, FAKE_OPTS);
     expect(result.exitCode).not.toBe(0);
     expect(result.error).toBeTruthy();
@@ -78,7 +111,7 @@ describe("bash", () => {
 
   it("truncates stdout to ~10KB", async () => {
     dir = makeRoot();
-    const tools = createWorkerTools({ root: dir });
+    const tools = createSandboxedTools({ root: dir });
     const result = await getExecute(tools.bash)(
       { command: "yes x | head -c 200000" },
       FAKE_OPTS,
@@ -86,17 +119,47 @@ describe("bash", () => {
     expect(result.stdout.length).toBeLessThan(15 * 1024);
   });
 
+  it("preserves both the beginning and end when stdout is truncated", async () => {
+    dir = makeRoot();
+    const tools = createSandboxedTools({ root: dir });
+    const result = await getExecute(tools.bash)(
+      {
+        command:
+          "printf 'BEGIN\\n'; yes middle | head -c 30000; printf '\\nEND_FAILURE_SUMMARY\\n'",
+      },
+      FAKE_OPTS,
+    );
+
+    expect(result.stdout).toContain("BEGIN");
+    expect(result.stdout).toContain("use read_tool_output");
+    expect(result.stdout).toContain("END_FAILURE_SUMMARY");
+  });
+
   it("fires onToolEvent with only the (truncated) command, never the command's stdout", async () => {
     dir = makeRoot();
     const events: { tool: string; detail: string }[] = [];
-    const tools = createWorkerTools({ root: dir, onToolEvent: (e) => events.push(e) });
+    const tools = createSandboxedTools({ root: dir, onToolEvent: (e) => events.push(e) });
     const result = await getExecute(tools.bash)({ command: "pwd" }, FAKE_OPTS);
 
-    expect(result.stdout.trim()).toBe(dir); // sanity: stdout really does contain the marker (the cwd)
+    expect(result.stdout).toContain(dir); // sanity: stdout really does contain the marker (the cwd)
     expect(events).toHaveLength(1);
     expect(events[0]?.tool).toBe("bash");
     expect(events[0]?.detail).toBe("pwd");
     expect(events[0]?.detail).not.toContain(dir); // detail must not leak stdout
+  });
+
+  it("ignores a lifecycle observer failure", async () => {
+    dir = makeRoot();
+    const tools = createSandboxedTools({
+      root: dir,
+      onToolLifecycleEvent: () => {
+        throw new Error("observer failed");
+      },
+    });
+
+    const result = await getExecute(tools.bash)({ command: "echo still-runs" }, FAKE_OPTS);
+    expect(result.stdout).toContain("still-runs");
+    expect(result.exitCode).toBe(0);
   });
 
   // Fix 4: a command/path with an embedded newline (or other control char)
@@ -105,7 +168,7 @@ describe("bash", () => {
   it("strips control characters (e.g. a newline) from the emitted onToolEvent detail", async () => {
     dir = makeRoot();
     const events: { tool: string; detail: string }[] = [];
-    const tools = createWorkerTools({ root: dir, onToolEvent: (e) => events.push(e) });
+    const tools = createSandboxedTools({ root: dir, onToolEvent: (e) => events.push(e) });
 
     await getExecute(tools.bash)({ command: "echo hi\necho bye" }, FAKE_OPTS);
 
@@ -128,7 +191,7 @@ describe("abortSignal propagation (Fix 1, review round 1)", () => {
     // bashTimeoutMs is deliberately large (30s) so a prompt resolution here
     // can ONLY be explained by the abortSignal killing the child -- not by
     // bash's own timeout coincidentally firing first.
-    const tools = createWorkerTools({ root: dir, bashTimeoutMs: 30_000 });
+    const tools = createSandboxedTools({ root: dir, bashTimeoutMs: 30_000 });
     const ac = new AbortController();
     setTimeout(() => ac.abort(), 100);
 
@@ -228,6 +291,25 @@ describe("read_file", () => {
     const result = await getExecute(tools.read_file)({ path: "big.txt" }, FAKE_OPTS);
     expect(result.content.length).toBeLessThan(big.length);
     expect(result.content.length).toBeLessThan(60 * 1024);
+  });
+
+  it("supports paged line reads and reports how to continue", async () => {
+    dir = makeRoot();
+    writeFileSync(path.join(dir, "paged.txt"), "one\ntwo\nthree\nfour\nfive");
+    const tools = createWorkerTools({ root: dir });
+    const result = await getExecute(tools.read_file)(
+      { path: "paged.txt", offset: 2, limit: 2 },
+      FAKE_OPTS,
+    );
+
+    expect(result).toEqual({
+      content: "two\nthree",
+      startLine: 2,
+      endLine: 3,
+      totalLines: 5,
+      truncated: true,
+      nextOffset: 4,
+    });
   });
 });
 
@@ -404,12 +486,24 @@ describe("edit", () => {
   it("errors distinctly when find has zero matches", async () => {
     dir = makeRoot();
     writeFileSync(path.join(dir, "a.txt"), "foo bar baz");
-    const tools = createWorkerTools({ root: dir });
+    const lifecycle: ToolLifecycleEvent[] = [];
+    const tools = createWorkerTools({
+      root: dir,
+      onToolLifecycleEvent: (event) => lifecycle.push(event),
+    });
     const result = await getExecute(tools.edit)(
       { path: "a.txt", find: "nope", replace: "x" },
       FAKE_OPTS,
     );
     expect(result.error).toBe("find not found");
+    expect(result.errorKind).toBe("not_found");
+    expect(lifecycle[0]).toEqual({ phase: "started", tool: "edit" });
+    expect(lifecycle[1]).toMatchObject({
+      phase: "failed",
+      tool: "edit",
+      errorKind: "not_found",
+      truncated: false,
+    });
   });
 
   it("errors distinctly when find matches more than once", async () => {
@@ -530,10 +624,10 @@ describe("wiki tools (Task 7)", () => {
       },
     });
     expect(Object.keys(withWiki).sort()).toEqual(
-      ["bash", "edit", "read_file", "wiki_map", "wiki_query", "write_file"].sort(),
+      ["edit", "read_file", "wiki_map", "wiki_query", "write_file"].sort(),
     );
 
-    const queryResult = await getExecute(withWiki.wiki_query)({ query: "alphaBeta" }, FAKE_OPTS);
+    const queryResult = await getExecute(withWiki.wiki_query)({ symbol: "alphaBeta" }, FAKE_OPTS);
     expect(queryResult.definitions.length).toBeGreaterThanOrEqual(1);
     expect(queryResult.definitions[0].file).toBe("a.ts");
     expect(queryResult.pages).toHaveLength(1);
@@ -546,7 +640,7 @@ describe("wiki tools (Task 7)", () => {
     expect(mapResult).toContain("a.ts");
 
     const withoutWiki = createWorkerTools({ root: dir });
-    expect(Object.keys(withoutWiki).sort()).toEqual(["bash", "edit", "read_file", "write_file"].sort());
+    expect(Object.keys(withoutWiki).sort()).toEqual(["edit", "read_file", "write_file"].sort());
   });
 
   it("fires onToolEvent for wiki_query/wiki_map without leaking page/store content in the detail", async () => {
@@ -563,7 +657,7 @@ describe("wiki tools (Task 7)", () => {
       onToolEvent: (e) => events.push(e),
     });
 
-    await getExecute(tools.wiki_query)({ query: "alphaBeta" }, FAKE_OPTS);
+    await getExecute(tools.wiki_query)({ symbol: "alphaBeta" }, FAKE_OPTS);
     await getExecute(tools.wiki_map)({}, FAKE_OPTS);
 
     expect(events.map((e) => e.tool)).toEqual(["wiki_query", "wiki_map"]);

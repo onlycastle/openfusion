@@ -1,5 +1,7 @@
-// Open-model worker tool loop: the AI SDK v7 multi-step generateText-with-
-// tools call that drives an open model through a coding task. `model` and
+// Open-model worker tool loop owned by OpenFusion. Each AI SDK generateText
+// invocation is deliberately capped at ONE response-message batch; the
+// completed batch can then be durably persisted before this module decides
+// whether to continue. `model` and
 // `tools` are dependency-injected (see WorkerRunInput) so this module never
 // picks a provider or a toolset itself -- CI drives it with
 // MockLanguageModelV4 (see test/worker-loop.test.ts); WorkerService (M5a
@@ -13,8 +15,16 @@
 // passes one explicitly. `result.usage` is CUMULATIVE across every step in
 // v7 (summed, not final-step-only), which is what gets metered here via
 // the same `normalizeUsage` the frontier-model path uses.
-import { generateText, isStepCount, type LanguageModel, type StepResult, type Tool } from "ai";
+import {
+  generateText,
+  isStepCount,
+  type LanguageModel,
+  type ModelMessage,
+  type Tool,
+  type ToolApprovalConfiguration,
+} from "ai";
 import { normalizeUsage, type NormalizedUsage } from "../models/pricing.js";
+import { compactModelHistory, type CompactedHistory } from "../runtime/context.js";
 
 export interface WorkerRunInput {
   model: LanguageModel;
@@ -32,7 +42,32 @@ export interface WorkerRunInput {
   // AbortController it can fire on engine.close() -- runWorkerLoop itself
   // stays deadline-agnostic and just plumbs whatever signal it's given.
   abortSignal?: AbortSignal;
+  /** Central provider admission/cancellation wrapper for each model batch. */
+  executeModelCall?: <T>(operation: (signal: AbortSignal | undefined) => Promise<T>) => Promise<T>;
   onStep?: (s: { step: number; toolCalls: number; text?: string }) => void;
+  onModelStart?: (s: { step: number }) => Promise<void> | void;
+  beforeModelMessages?: () => Promise<ModelMessage[]> | ModelMessage[];
+  /** Existing authoritative history when resuming an exact trace. */
+  messages?: ModelMessage[];
+  /** A response to the pending approval at the end of `messages`. */
+  approvalResponse?: {
+    approvalId: string;
+    approved: boolean;
+    reason?: string;
+  };
+  /** AI SDK v7 approval policy, normally derived from PolicyEvaluator. */
+  toolApproval?: ToolApprovalConfiguration<Record<string, Tool>, Record<string, unknown>>;
+  /** Model-family context limit used by the 70% derived-view compactor. */
+  contextWindow?: number;
+  onCompaction?: (compaction: CompactedHistory) => Promise<void> | void;
+  /** Awaited before the next model call, making persistence load-bearing. */
+  onResponseBatch?: (batch: {
+    step: number;
+    messages: ModelMessage[];
+    usage: NormalizedUsage;
+    finishReason: string;
+    toolCalls: number;
+  }) => Promise<void> | void;
 }
 
 export interface WorkerRunResult {
@@ -41,6 +76,13 @@ export interface WorkerRunResult {
   usage: NormalizedUsage;
   finishReason: string;
   toolCallCount: number;
+  messages: ModelMessage[];
+  pendingApproval?: {
+    approvalId: string;
+    toolCallId: string;
+    toolName: string;
+    input: unknown;
+  };
 }
 
 const DEFAULT_MAX_STEPS = 30;
@@ -80,36 +122,111 @@ function buildPrompt(
   return sections.join("\n\n");
 }
 
+/** Deterministic initial history used by both a fresh run and exact replay. */
+export function createInitialWorkerMessages(
+  input: Pick<WorkerRunInput, "task" | "wikiDigest" | "instructions">,
+): ModelMessage[] {
+  return [{ role: "user", content: buildPrompt(input) }];
+}
+
 export async function runWorkerLoop(input: WorkerRunInput): Promise<WorkerRunResult> {
   const maxSteps = input.maxSteps ?? DEFAULT_MAX_STEPS;
-  const prompt = buildPrompt(input);
+  let messages: ModelMessage[] = input.messages === undefined
+    ? createInitialWorkerMessages(input)
+    : [...input.messages];
+  if (input.approvalResponse !== undefined) {
+    messages.push({
+      role: "tool",
+      content: [{
+        type: "tool-approval-response",
+        approvalId: input.approvalResponse.approvalId,
+        approved: input.approvalResponse.approved,
+        ...(input.approvalResponse.reason === undefined
+          ? {}
+          : { reason: input.approvalResponse.reason }),
+      }],
+    });
+  }
 
-  const result = await generateText({
-    model: input.model,
-    tools: input.tools,
-    // This IS the runaway cap: without it generateText defaults to
-    // isStepCount(1) and would never continue past a single tool call.
-    stopWhen: isStepCount(maxSteps),
-    prompt,
-    abortSignal: input.abortSignal,
-    onStepEnd: (step: StepResult<Record<string, Tool>>) => {
-      input.onStep?.({
-        step: step.stepNumber,
-        toolCalls: step.toolCalls.length,
-        text: truncate(step.text, ON_STEP_TEXT_TRUNCATE_CHARS),
+  let summary = "";
+  let finishReason = "other";
+  let toolCallCount = 0;
+  let steps = 0;
+  let usage: NormalizedUsage = { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0 };
+  let pendingApproval: WorkerRunResult["pendingApproval"];
+
+  while (steps < maxSteps) {
+    const incoming = await input.beforeModelMessages?.();
+    if (incoming !== undefined && incoming.length > 0) messages.push(...incoming);
+    if (input.contextWindow !== undefined) {
+      const compacted = compactModelHistory(messages, input.contextWindow);
+      if (compacted !== null) {
+        await input.onCompaction?.(compacted);
+        messages = compacted.messages;
+      }
+    }
+    // The SDK owns provider normalization and execution of this one batch;
+    // OpenFusion owns every continuation decision outside the call.
+    await input.onModelStart?.({ step: steps });
+    const call = (signal: AbortSignal | undefined) => generateText({
+        model: input.model,
+        tools: input.tools,
+        messages,
+        stopWhen: isStepCount(1),
+        abortSignal: signal,
+        toolApproval: input.toolApproval,
       });
-    },
-  });
+    const result = input.executeModelCall === undefined
+      ? await call(input.abortSignal)
+      : await input.executeModelCall(call);
+    const stepUsage = normalizeUsage(result.usage);
+    usage = {
+      inputTokens: usage.inputTokens + stepUsage.inputTokens,
+      outputTokens: usage.outputTokens + stepUsage.outputTokens,
+      cacheReadTokens: usage.cacheReadTokens + stepUsage.cacheReadTokens,
+    };
+    const batch = result.responseMessages as ModelMessage[];
+    await input.onResponseBatch?.({
+      step: steps,
+      messages: batch,
+      usage: stepUsage,
+      finishReason: result.finishReason,
+      toolCalls: result.toolCalls.length,
+    });
+    messages.push(...batch);
 
-  const toolCallCount = result.steps.reduce((sum, step) => sum + step.toolCalls.length, 0);
+    summary = result.text;
+    finishReason = result.finishReason;
+    toolCallCount += result.toolCalls.length;
+    input.onStep?.({
+      step: steps,
+      toolCalls: result.toolCalls.length,
+      text: truncate(result.text, ON_STEP_TEXT_TRUNCATE_CHARS),
+    });
+    steps += 1;
+
+    const approval = result.content.find(
+      (part) => part.type === "tool-approval-request" && part.isAutomatic !== true,
+    );
+    if (approval?.type === "tool-approval-request") {
+      pendingApproval = {
+        approvalId: approval.approvalId,
+        toolCallId: approval.toolCall.toolCallId,
+        toolName: approval.toolCall.toolName,
+        input: approval.toolCall.input,
+      };
+      break;
+    }
+    if (result.toolCalls.length === 0) break;
+  }
 
   return {
-    summary: result.text,
-    steps: result.steps.length,
-    // result.usage is the SUM across all steps in v7 -- exactly what a
-    // multi-step worker run should meter.
-    usage: normalizeUsage(result.usage),
-    finishReason: result.finishReason,
+    summary,
+    steps,
+    usage,
+    finishReason,
     toolCallCount,
+    messages,
+    ...(pendingApproval === undefined ? {} : { pendingApproval }),
   };
 }

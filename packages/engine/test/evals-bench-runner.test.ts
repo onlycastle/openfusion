@@ -4,16 +4,26 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { createEngine, type Engine } from "../src/engine.js";
+import { createEngine, type Engine, type VerificationRunner } from "../src/engine.js";
 import type { FrontierAdapter, FrontierEvent, FrontierPromptHandle, FrontierSession } from "../src/engines/types.js";
 import { clonePath, harnessBundlePath } from "../src/evals/bench/paths.js";
 import { runBench } from "../src/evals/bench/runner.js";
 import type { AgentDef, HarnessBundle, Routing, WikiPage } from "../src/harness/schema.js";
 import { writeHarness } from "../src/harness/store.js";
 import type { CostMeter } from "../src/models/meter.js";
+import { runtimeCapabilities } from "../src/runtime/capabilities.js";
 
 let dirs: string[] = [];
 let engine: Engine | undefined;
+
+const TEST_VERIFICATION_RUNNER: VerificationRunner = {
+  async status() {
+    return { available: true };
+  },
+  async run() {
+    return { exitCode: 0 };
+  },
+};
 
 afterEach(async () => {
   if (engine !== undefined) await engine.close();
@@ -107,6 +117,21 @@ function frontierOnlyHarness(headSha: string): HarnessBundle {
 function makeFakeBenchFrontierAdapter(meter: CostMeter): FrontierAdapter {
   return {
     kind: "claude-code",
+    async capabilities() {
+      return runtimeCapabilities({
+        runtimeId: "claude-code",
+        runtimeVersion: "test",
+        protocolVersion: "test-v1",
+        structuredOutput: true,
+        toolCalls: true,
+        pathAwareApprovals: true,
+        mcp: false,
+        resume: false,
+        fork: false,
+        compaction: false,
+        sandboxCompatibility: "certified",
+      });
+    },
     async createSession({ projectDir, resultLabel }): Promise<FrontierSession> {
       return {
         id: randomUUID(),
@@ -114,13 +139,21 @@ function makeFakeBenchFrontierAdapter(meter: CostMeter): FrontierAdapter {
         prompt(_text: string, _opts?: { timeoutMs?: number }): FrontierPromptHandle {
           async function* events(): AsyncGenerator<FrontierEvent> {
             const isBaseline = resultLabel === "eval-baseline";
+            const isReview = resultLabel === "frontier-review";
             const content = isBaseline ? "baseline patch\n" : "harness patch\n";
-            const costUsd = isBaseline ? 1 : 0.25;
-            writeFileSync(path.join(projectDir, "solution.txt"), content);
-            yield { type: "tool_use", name: "Write", summary: "wrote solution.txt" };
+            const costUsd = isReview ? 0 : isBaseline ? 1 : 0.25;
+            if (isReview) {
+              yield {
+                type: "text",
+                text: "```json\n" + JSON.stringify({ decision: "approve", reasons: [], severity: "none" }) + "\n```",
+              };
+            } else {
+              writeFileSync(path.join(projectDir, "solution.txt"), content);
+              yield { type: "tool_use", name: "Write", summary: "wrote solution.txt" };
+            }
             const result: FrontierEvent = {
               type: "result",
-              resultText: "done",
+              resultText: isReview ? "approve" : "done",
               costUsd,
               usage: { inputTokens: 20, outputTokens: 10, cacheReadTokens: 0 },
               numTurns: 1,
@@ -159,7 +192,7 @@ describe("runBench", () => {
     const hPath = harnessBundlePath(benchRoot, repo);
     await writeHarness(hPath, frontierOnlyHarness(baseCommit));
 
-    engine = createEngine();
+    engine = createEngine({ verificationRunner: TEST_VERIFICATION_RUNNER });
     engine.frontier.registerAdapter(makeFakeBenchFrontierAdapter(engine.models.meter));
 
     const result = await runBench(engine, {

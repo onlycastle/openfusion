@@ -1,12 +1,15 @@
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdtempSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { MockLanguageModelV4 } from "ai/test";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { RpcErrorCodes } from "@openfusion/shared";
 import { createEngine, type Engine } from "../src/engine.js";
 import { estimateCostUsd, lookupPricing } from "../src/models/pricing.js";
+import { readRunEvents, runEventsPath } from "../src/runs/events.js";
+import { unknownRuntimeCapabilities } from "../src/runtime/capabilities.js";
+import type { RunSupervisor } from "../src/runtime/supervisor.js";
 
 // Fixture literal only — must never appear outside test files (see task
 // self-review grep).
@@ -113,6 +116,8 @@ describe("engine.worker.run", () => {
     engine = createEngine();
     engine.models.registry.configure({ id: "p1", kind: "deepseek", apiKey: TEST_API_KEY });
     engine.models.registry.setTestModel("p1", makeWorkerMock());
+    const kernelRun = vi.spyOn(engine.runKernel, "run");
+    const workerRun = vi.spyOn(engine.worker, "run");
 
     const res = await call(engine, "engine.worker.run", {
       projectDir: dir,
@@ -128,17 +133,51 @@ describe("engine.worker.run", () => {
     expect(res.result.summary).toBe("Created hello.txt");
     expect(res.result.toolCallCount).toBe(1);
     expect(res.result.usage).toEqual({ inputTokens: 300, outputTokens: 80, cacheReadTokens: 0 });
+    expect(kernelRun).toHaveBeenCalledWith(
+      expect.objectContaining({ projectDir: dir, kind: "worker", writer: true }),
+      expect.any(Function),
+    );
+    const forwarded = workerRun.mock.calls[0]![1];
+    expect(forwarded.baseSha).toBe(git(dir, "rev-parse", "HEAD"));
+    expect(forwarded.harnessGeneration).toBeNull();
+    expect(forwarded.harnessFingerprint).toBeNull();
+    expect(forwarded.taskWikiHeadSha).toBeNull();
+    expect(forwarded.taskWikiDigest).toBeNull();
+    expect(workerRun.mock.calls[0]![2]).toBeDefined();
 
     const pricing = lookupPricing("deepseek", "deepseek-v4-flash");
     expect(pricing).not.toBeNull();
     expect(res.result.costUsd).toBeCloseTo(estimateCostUsd(pricing!, res.result.usage), 10);
 
     expect(typeof res.result.worktree.path).toBe("string");
-    expect(res.result.worktree.branch).toMatch(/^worker\//);
+    expect(res.result.worktree.branch).toBe("detached");
 
     // The worktree is LEFT IN PLACE — not auto-removed after a successful run.
     expect(existsSync(res.result.worktree.path)).toBe(true);
     expect(existsSync(path.join(res.result.worktree.path, "hello.txt"))).toBe(true);
+  });
+
+  it("charges the owning supervisor for every actual model turn and tool invocation", async () => {
+    dir = makeRepo();
+    engine = createEngine();
+    engine.models.registry.configure({ id: "p1", kind: "deepseek", apiKey: TEST_API_KEY });
+    engine.models.registry.setTestModel("p1", makeWorkerMock());
+    const reserveModelCall = vi.fn();
+    const reserveToolCall = vi.fn();
+    const recordCost = vi.fn();
+    const supervisor = { reserveModelCall, reserveToolCall, recordCost } as unknown as RunSupervisor;
+
+    const result = await engine.worker.run(engine, {
+      projectDir: dir,
+      task: "create hello.txt",
+      providerId: "p1",
+      model: "deepseek-v4-flash",
+    }, supervisor);
+
+    expect(result.summary).toBe("Created hello.txt");
+    expect(reserveModelCall).toHaveBeenCalledTimes(2);
+    expect(reserveToolCall).toHaveBeenCalledTimes(1);
+    expect(recordCost).toHaveBeenCalledTimes(2);
   });
 
   it("records the worker's usage into engine.models.usage", async () => {
@@ -198,6 +237,49 @@ describe("engine.worker.run", () => {
     const toolEvent = progress.find((n) => (n.params as { kind: string }).kind === "tool")!
       .params as { tool: string; detail: string };
     expect(toolEvent.tool).toBe("write_file");
+  });
+
+  it("persists an ordered metadata-only event stream for the worker run", async () => {
+    dir = makeRepo();
+    engine = createEngine();
+    engine.models.registry.configure({ id: "p1", kind: "deepseek", apiKey: TEST_API_KEY });
+    engine.models.registry.setTestModel("p1", makeWorkerMock());
+
+    const runId = "worker-events-1";
+    const res = await call(engine, "engine.worker.run", {
+      projectDir: dir,
+      task: "UNIQUE_TASK_CONTENT_create hello.txt",
+      providerId: "p1",
+      model: "deepseek-v4-flash",
+      runId,
+    });
+
+    expect(res.error).toBeUndefined();
+    expect(res.result.runId).toBe(runId);
+    const recorded = readRunEvents(dir, runId);
+    expect(recorded.skipped).toBe(0);
+    expect(recorded.events.map((event) => event.seq)).toEqual(
+      recorded.events.map((_, index) => index + 1),
+    );
+    expect(recorded.events.map((event) => event.type)).toEqual([
+      "run.started",
+      "context.selected",
+      "attempt.started",
+      "tool.started",
+      "tool.finished",
+      "attempt.finished",
+      "run.finished",
+    ]);
+    expect(recorded.events.find((event) => event.type === "tool.finished")).toMatchObject({
+      tool: "write_file",
+      truncated: false,
+    });
+
+    const raw = readFileSync(runEventsPath(dir, runId), "utf8");
+    expect(raw).not.toContain("UNIQUE_TASK_CONTENT");
+    expect(raw).not.toContain("hello.txt");
+    expect(raw).not.toContain("HELLO FROM WORKER");
+    expect(raw).not.toContain("Created hello.txt");
   });
 
   // Task 7: names+counts-only tool-call telemetry, logged once the run
@@ -289,6 +371,64 @@ describe("engine.worker.run", () => {
     // resolves.
     const worktreeList = git(dir, "worktree", "list", "--porcelain");
     expect(worktreeList).not.toContain("worker/");
+  });
+
+  it("rejects caller-supplied snapshot pins that differ from the admitted snapshot", async () => {
+    dir = makeRepo();
+    engine = createEngine();
+    engine.models.registry.configure({ id: "p1", kind: "deepseek", apiKey: TEST_API_KEY });
+    engine.models.registry.setTestModel("p1", makeWorkerMock());
+
+    const res = await call(engine, "engine.worker.run", {
+      projectDir: dir,
+      task: "must not start",
+      providerId: "p1",
+      model: "deepseek-v4-flash",
+      baseSha: "f".repeat(40),
+    });
+
+    expect(res.result).toBeUndefined();
+    expect(res.error.code).toBe(RpcErrorCodes.INVALID_PARAMS);
+    expect(res.error.message).toContain("baseSha does not match");
+    await expect((await engine.worker.getManager(dir)).list()).resolves.toEqual([]);
+  });
+
+  it("fails closed when the committed wiki identity changes after admission capture", async () => {
+    dir = makeRepo();
+    engine = createEngine();
+    engine.models.registry.configure({ id: "p1", kind: "deepseek", apiKey: TEST_API_KEY });
+    engine.models.registry.setTestModel("p1", makeWorkerMock());
+    await engine.wiki.build(dir);
+    const store = engine.wiki.getStore(dir);
+    const original = store.getSourceIdentity();
+    expect(original.headSha).toBe(git(dir, "rev-parse", "HEAD"));
+    engine.frontier.registerAdapter({
+      kind: "wiki-mutator-fixture",
+      capabilities: async () => {
+        store.applyBuild([], [], {
+          headSha: "b".repeat(40),
+          sourceFingerprint: `sha256:${"b".repeat(64)}`,
+        });
+        return unknownRuntimeCapabilities("wiki-mutator-fixture");
+      },
+      createSession: async () => {
+        throw new Error("not used");
+      },
+    });
+
+    const res = await call(engine, "engine.worker.run", {
+      projectDir: dir,
+      task: "must not see a mixed wiki",
+      providerId: "p1",
+      model: "deepseek-v4-flash",
+    });
+
+    expect(res.result).toBeUndefined();
+    expect(res.error.code).toBe(RpcErrorCodes.SERVER_ERROR);
+    expect(res.error.message).toContain("wiki changed after task snapshot");
+    expect(engine.runtime.getStore(dir).listSessions({ kind: "worker" })).toEqual([
+      expect.objectContaining({ status: "failed", outcome: "setup-failed" }),
+    ]);
   });
 
   // Final-review Fix 2 (consistency): a RAW (non-RpcMethodError) throw from
@@ -503,19 +643,11 @@ describe("engine.worker.run", () => {
       timeoutMs: 1_800_000,
     });
 
-    // Let the run actually start (worktree created, controller registered
-    // with WorkerService) before racing engine.close() against it. Polled
-    // (via the real engine.worker.list RPC, not a fixed sleep) rather than
-    // guessing a fixed delay: `manager.create()`'s own `git worktree add`
-    // is a real subprocess spawn whose wall-clock time is NOT bounded by a
-    // small constant under a loaded machine (M6 Task 4: observed this fixed
-    // 50ms wait let engine.close() race ahead of `beginRun()` registering
-    // its controller often enough, under a heavily parallel full-suite run,
-    // that the hanging mock's promise never got aborted at all -- the test
-    // would then hang until ITS OWN timeout, no matter how generous, since
-    // the abort event that was supposed to end it never fired). Mirrors
-    // orchestrate.test.ts's own "in-flight review + engine.close()" test's
-    // identical poll-until-started pattern, for the same reason.
+    // Let the run actually reach worktree setup before racing engine.close()
+    // against it. WorkerService now admits the handler before its first
+    // setup await, so observing the worktree no longer has to imply a later
+    // controller-registration point. Poll the real worker list instead of
+    // guessing how long `git worktree add` takes under full-suite load.
     const startDeadline = Date.now() + 10_000;
     for (;;) {
       const listRes = await call(engine, "engine.worker.list", { projectDir: dir });
@@ -533,11 +665,29 @@ describe("engine.worker.run", () => {
 
     const res = await runPromise;
     expect(res.result).toBeUndefined();
-    expect(res.error.code).toBe(RpcErrorCodes.SERVER_ERROR);
+    expect(res.error.code, JSON.stringify(res.error)).toBe(RpcErrorCodes.SERVER_ERROR);
     expect(res.error.message).toContain("aborted");
     // afterEach calls engine.close() again -- must be harmless once the
     // in-flight set this test emptied out is already empty.
   }, 15_000);
+
+  it("returns stable BUSY after shutdown without touching the closed runtime store", async () => {
+    dir = makeRepo();
+    engine = createEngine();
+    await engine.close();
+
+    const res = await call(engine, "engine.worker.run", {
+      projectDir: dir,
+      task: "must not start",
+      providerId: "p1",
+      model: "deepseek-v4-flash",
+    });
+
+    expect(res.result).toBeUndefined();
+    expect(res.error.code).toBe(RpcErrorCodes.BUSY);
+    expect(res.error.message).toContain("retry later");
+    expect(res.error.data).toMatchObject({ reasonCode: "admission-stopped", retryAfterMs: 1_000 });
+  });
 });
 
 // M5b Task 5: the worktree lifecycle policy's discovery (list) and sweep
@@ -623,7 +773,7 @@ describe("engine.worker.gc", () => {
     expect(git(dir, "branch", "--list", w1.branch)).toBe("");
 
     expect(existsSync(survivor.path)).toBe(true);
-    expect(git(dir, "branch", "--list", survivor.branch)).toContain(survivor.branch);
+    expect(git(dir, "branch", "--list", "worker/task-2")).toBe("");
   });
 
   it("returns an empty removed list for a clean project with no worker worktrees", async () => {
@@ -672,7 +822,7 @@ describe("engine.worker.gc", () => {
     expect(existsSync(w3.path)).toBe(false);
     // ...but the one whose remove() failed is still there, untouched.
     expect(existsSync(w2.path)).toBe(true);
-    expect(git(dir, "branch", "--list", w2.branch)).toContain(w2.branch);
+    expect(git(dir, "branch", "--list", "worker/task-2")).toBe("");
   });
 
   it("matches a symlinked-spelling keep path via realpath comparison, not string equality", async () => {
@@ -695,7 +845,7 @@ describe("engine.worker.gc", () => {
       expect(res.error).toBeUndefined();
       expect(res.result.removed).toEqual([w1.path]);
       expect(existsSync(survivor.path)).toBe(true);
-      expect(git(dir, "branch", "--list", survivor.branch)).toContain(survivor.branch);
+      expect(git(dir, "branch", "--list", "worker/task-2")).toBe("");
     } finally {
       // unlinkSync, not rmSync: symlinkPath is a symlink POINTING AT a
       // directory, and Node's rmSync (even non-recursive) stats through the

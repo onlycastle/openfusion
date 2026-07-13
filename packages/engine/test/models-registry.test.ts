@@ -50,6 +50,17 @@ describe("ProviderRegistry", () => {
     registry.setTestModel("z1", mock);
     expect(registry.resolve("z1", "glm-5.2")).toBe(mock);
   });
+
+  it("unconfigure() removes both the live provider and its test-model override", () => {
+    const registry = new ProviderRegistry();
+    registry.configure({ id: "z1", kind: "zai", apiKey: TEST_API_KEY });
+    registry.setTestModel("z1", new MockLanguageModelV4());
+
+    expect(registry.unconfigure("z1")).toBe(true);
+    expect(registry.list()).toEqual([]);
+    expect(() => registry.resolve("z1", "glm-5.2")).toThrow(/provider not configured/i);
+    expect(registry.unconfigure("z1")).toBe(false);
+  });
 });
 
 describe("engine.models RPC", () => {
@@ -86,6 +97,41 @@ describe("engine.models RPC", () => {
         apiKey: TEST_API_KEY,
       });
       expect(res.error?.code).toBe(RpcErrorCodes.INVALID_PARAMS);
+    } finally {
+      await engine.close();
+    }
+  });
+
+  it("rejects an OpenAI-compatible connection check without a baseURL before making a request", async () => {
+    const engine = createEngine();
+    try {
+      const res = await call(engine, "engine.models.check", {
+        id: "custom",
+        kind: "openai-compatible",
+        apiKey: TEST_API_KEY,
+        model: "custom-model",
+      });
+      expect(res.error?.code).toBe(RpcErrorCodes.INVALID_PARAMS);
+    } finally {
+      await engine.close();
+    }
+  });
+
+  it("unconfigure removes a provider from the live RPC registry", async () => {
+    const engine = createEngine();
+    try {
+      await call(engine, "engine.models.configure", {
+        id: "z1",
+        kind: "zai",
+        apiKey: TEST_API_KEY,
+      });
+
+      const removed = await call(engine, "engine.models.unconfigure", { id: "z1" });
+      expect(removed.error).toBeUndefined();
+      expect(removed.result).toEqual({ unconfigured: true });
+
+      const list = await call(engine, "engine.models.list", {});
+      expect(list.result).toEqual({ providers: [] });
     } finally {
       await engine.close();
     }

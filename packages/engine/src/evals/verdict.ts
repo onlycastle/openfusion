@@ -1,9 +1,8 @@
 // Pure M6.1 two-dimensional cost/quality verdict math.
 //
 // Extracted from runEvals so the same definition can score (a) repo-tests
-// oracle rows and (b) SWE-bench official-resolved-status rows. Side effects
-// (setEvalsVerdict on a project manifest) stay in runEvals — this module
-// only computes numbers and notes.
+// oracle rows and (b) SWE-bench official-resolved-status rows. Benchmark
+// computation is side-effect free with respect to project harness state.
 //
 // CRITICAL: unpricedCalls is a required input. Omitting it reopens the C1
 // mixed-priced false-pass path (addCost null-skips undercount one arm).
@@ -82,9 +81,8 @@ export function buildEvalsNote(opts: {
     parts.push(note);
   }
   parts.push(
-    "Eval integrity assumes a NON-ADVERSARIAL worker: a worker that deliberately reaches outside its scratch " +
-      "directory (e.g. git-fetching the real project directory, or a raw filesystem read) could defeat this " +
-      "run's isolation -- full worker process sandboxing is deferred to M7.",
+    "Repository commands and evaluator-owned oracles run under the fail-closed eval-v1 sandbox with network " +
+      "disabled. A missing or failed sandbox probe prevents the benchmark from starting.",
   );
   if (opts.sampleNote !== undefined && opts.sampleNote.length > 0) {
     parts.push(opts.sampleNote);
@@ -118,10 +116,14 @@ export function computeEvalsVerdict(params: ComputeEvalsVerdictParams): EvalsRep
   const qualityHeld = harnessPassed >= baselinePassed;
 
   const measurementFailureIds = new Set(perTask.filter(isMeasurementFailure).map((t) => t.id));
+  const policyViolationIds = new Set(perTask
+    .filter((task) => task.baselinePolicyViolation === true || task.harnessPolicyViolation === true)
+    .map((task) => task.id));
   const harnessApplyFailedCount = perTask.filter((t) => t.harnessOutcome === "apply-failed").length;
   const harnessErrorCount = perTask.filter((t) => t.harnessOutcome === "error").length;
   const baselineErrorCount = perTask.filter((t) => t.baselineOutcome === "error").length;
   const measurementFailureCount = measurementFailureIds.size;
+  const policyViolationCount = policyViolationIds.size;
 
   const extraNotes: string[] = [...(params.extraNotes ?? [])];
   if (measurementFailureCount > 0) {
@@ -132,8 +134,15 @@ export function computeEvalsVerdict(params: ComputeEvalsVerdictParams): EvalsRep
         `pass/fail/inconclusive determination accounts for them.`,
     );
   }
+  if (policyViolationCount > 0) {
+    extraNotes.push(
+      `${policyViolationCount} of ${taskCount} task(s) violated eval-v1 policy. ` +
+        "Those rows are excluded from quality evidence and trigger the independent safety veto.",
+    );
+  }
 
-  const cleanTasks = perTask.filter((t) => !measurementFailureIds.has(t.id));
+  const cleanTasks = perTask.filter((t) =>
+    !measurementFailureIds.has(t.id) && !policyViolationIds.has(t.id));
   const cleanBaselinePassed = cleanTasks.filter((t) => t.baselinePassed).length;
   const cleanHarnessPassed = cleanTasks.filter((t) => t.harnessPassed).length;
   const qualityHeldClean = cleanHarnessPassed >= cleanBaselinePassed;
@@ -163,7 +172,9 @@ export function computeEvalsVerdict(params: ComputeEvalsVerdictParams): EvalsRep
   }
 
   let verdict: EvalsReportCard["verdict"];
-  if (measurementFailureFractionIsMaterial) {
+  if (policyViolationCount > 0) {
+    verdict = "fail";
+  } else if (measurementFailureFractionIsMaterial) {
     verdict = "inconclusive";
     extraNotes.push(
       `${measurementFailureCount} of ${taskCount} task(s) (>= the ` +
@@ -234,6 +245,7 @@ export function computeEvalsVerdict(params: ComputeEvalsVerdictParams): EvalsRep
     cleanHarnessPassed,
     cleanSavingsPct,
     measurementFailureCount,
+    policyViolationCount,
     qualityGapWithinNoise,
     ...(params.harnessConfig !== undefined ? { harnessConfig: params.harnessConfig } : {}),
   };

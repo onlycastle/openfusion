@@ -3,21 +3,21 @@
 // harness/generate.ts split: the pipeline function stays a plain,
 // re-entrant, engine-parametrized function; this file is only the thin RPC
 // registration + params validation layer over it.
-import { execFile } from "node:child_process";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
-import os from "node:os";
-import path from "node:path";
-import { promisify } from "node:util";
+import { randomUUID } from "node:crypto";
 import { z } from "zod";
-import { RpcErrorCodes } from "@openfusion/shared";
+import {
+  ApprovalGrantSchema,
+  RpcErrorCodes,
+  TaskContractSchema,
+} from "@openfusion/shared";
 import type { Engine } from "../engine.js";
 import { RpcMethodError } from "../rpc/errors.js";
 import { requireGitRepo } from "../rpc/guards.js";
 import { registerMethod } from "../rpc/register.js";
 import { recordRun } from "../runs/ledger.js";
-import { orchestrate, type OrchestrateParams, type OrchestrateResult } from "./orchestrate.js";
-
-const execFileAsync = promisify(execFile);
+import type { OrchestrateParams, OrchestrateResult } from "./orchestrate.js";
+import { OrchestrateFrontierSelectionsSchema } from "../engines/selection.js";
+import { applyGitPatchFromMemory } from "../worker/worktree.js";
 
 // Bounds mirror worker/methods.ts's own RunParamsSchema.timeoutMs (1s..30m)
 // — workerTimeoutMs is forwarded straight through to engine.worker.run's own
@@ -45,6 +45,8 @@ const OrchestrateParamsSchema = z.object({
   maxWorkerAttempts: z.number().int().min(1).max(3).optional(),
   workerTimeoutMs: z.number().int().min(WORKER_TIMEOUT_MIN_MS).max(WORKER_TIMEOUT_MAX_MS).optional(),
   reviewTimeoutMs: z.number().int().min(REVIEW_TIMEOUT_MIN_MS).max(REVIEW_TIMEOUT_MAX_MS).optional(),
+  frontier: OrchestrateFrontierSelectionsSchema.optional(),
+  taskContract: TaskContractSchema.optional(),
   // M7b Task 2: client-supplied (or evals.run-forwarded) run identifier —
   // OPTIONAL, so an omitted runId keeps this run entirely un-cancellable
   // (no engine.cancel({runId}) call could ever reach it) without changing
@@ -55,10 +57,22 @@ const OrchestrateParamsSchema = z.object({
   runId: z.string().min(1).optional(),
 });
 
-const ApplyParamsSchema = z.object({
+const CandidateApplyParamsSchema = z.object({
+  projectDir: z.string().min(1),
+  candidateId: z.string().min(1),
+  approvalGrant: ApprovalGrantSchema,
+  runId: z.string().min(1).optional(),
+}).strict();
+
+const UnsafeLegacyApplyParamsSchema = z.object({
   projectDir: z.string().min(1),
   diff: z.string(),
-});
+  // Links the apply observation to the originating orchestration run without
+  // storing the task or diff in the metadata ledger.
+  runId: z.string().min(1).optional(),
+}).strict();
+
+const ApplyParamsSchema = z.union([CandidateApplyParamsSchema, UnsafeLegacyApplyParamsSchema]);
 
 // Sibling-pattern marker class (mirrors ModelsService/HarnessService on
 // Engine) — holds no state of its own today. engine.orchestrate does not
@@ -72,6 +86,7 @@ export class OrchestrateService {}
 
 export function registerOrchestrateMethods(engine: Engine): void {
   registerMethod(engine.dispatcher, "engine.orchestrate", OrchestrateParamsSchema, async (params) => {
+    requireGitRepo(params.projectDir);
     // M7b Task 2: THIS handler is the outermost owner of `runId`'s
     // lifecycle — register() right before the run starts, deregister() in
     // `finally` regardless of outcome (success, failure, or cancellation),
@@ -83,14 +98,22 @@ export function registerOrchestrateMethods(engine: Engine): void {
     // Run-ledger write point (spec 2026-07-08): records only RPC-layer
     // orchestrate calls — evals/run.ts's direct orchestrate() calls bypass
     // this handler and are captured under kind:"evals" instead.
-    const runId = params.runId;
-    if (runId !== undefined) engine.cancelRegistry.register(runId);
+    const runId = params.runId ?? randomUUID();
     const startedAt = Date.now();
-    try {
-      const result: OrchestrateResult = await orchestrate(engine, params as OrchestrateParams);
-      engine.log(
-        `orchestrate ${params.projectDir}: outcome=${result.outcome} attempts=${result.attempts.length}`,
+    return engine.runKernel.run(
+      { runId, projectDir: params.projectDir, kind: "orchestrate", writer: true },
+      async (supervisor) => {
+      try {
+      const runtimeOutcome = await engine.runtime.runOrchestrate(
+        engine,
+        { ...(params as OrchestrateParams), runId },
+        supervisor,
       );
+      if (!("result" in runtimeOutcome)) {
+        throw new Error("blocking orchestration unexpectedly paused for approval");
+      }
+      const result: OrchestrateResult = runtimeOutcome.result;
+      engine.log(`orchestrate: outcome=${result.outcome} attempts=${result.attempts.length}`);
       recordRun(engine, params.projectDir, {
         v: 1,
         kind: "orchestrate",
@@ -102,7 +125,7 @@ export function registerOrchestrateMethods(engine: Engine): void {
         outcome: result.outcome,
         escalated: result.outcome === "escalated",
         reviews: result.attempts.flatMap((a) =>
-          a.verdict ? [{ decision: a.verdict.decision, reasons: a.verdict.reasons }] : [],
+          a.verdict ? [{ decision: a.verdict.decision, reasonCount: a.verdict.reasons.length }] : [],
         ),
         contextBranch: result.contextBranch,
         ...(result.toolCallCounts !== undefined ? { toolCallCounts: result.toolCallCounts } : {}),
@@ -118,7 +141,7 @@ export function registerOrchestrateMethods(engine: Engine): void {
           totalUsd: result.cost.totalUsd,
         },
         durationMs: Date.now() - startedAt,
-        ...(runId !== undefined ? { runId } : {}),
+        runId,
       });
       return result;
     } catch (err) {
@@ -150,33 +173,81 @@ export function registerOrchestrateMethods(engine: Engine): void {
         cost: { workerUsd: null, reviewUsd: null, escalateUsd: null, totalUsd: null },
         durationMs: Date.now() - startedAt,
         errorCategory,
-        ...(runId !== undefined ? { runId } : {}),
+        runId,
       });
       throw err;
-    } finally {
-      if (runId !== undefined) engine.cancelRegistry.deregister(runId);
-    }
+      }
+    });
   });
 
-  registerMethod(engine.dispatcher, "engine.orchestrate.apply", ApplyParamsSchema, async ({ projectDir, diff }) => {
+  registerMethod(engine.dispatcher, "engine.orchestrate.apply", ApplyParamsSchema, async (params) => {
+    const { projectDir, runId } = params;
     requireGitRepo(projectDir);
+    const startedAt = Date.now();
+    const effectiveRunId = runId ?? randomUUID();
+    return engine.runKernel.run(
+      { runId: effectiveRunId, projectDir, kind: "apply", writer: true },
+      async () => {
+    if ("candidateId" in params) {
+      try {
+        await engine.candidates.apply(
+          params.candidateId,
+          params.approvalGrant,
+          projectDir,
+        );
+        recordRun(engine, projectDir, {
+          v: 1,
+          kind: "apply",
+          at: new Date().toISOString(),
+          outcome: "succeeded",
+          durationMs: Date.now() - startedAt,
+          runId: effectiveRunId,
+        });
+        return { applied: true, candidateId: params.candidateId };
+      } catch (err) {
+        recordRun(engine, projectDir, {
+          v: 1,
+          kind: "apply",
+          at: new Date().toISOString(),
+          outcome: "failed",
+          errorCategory: "git-apply-failed",
+          durationMs: Date.now() - startedAt,
+          runId: effectiveRunId,
+        });
+        const message = err instanceof Error ? err.message : String(err);
+        throw new RpcMethodError(RpcErrorCodes.SERVER_ERROR, `candidate apply failed: ${message}`);
+      }
+    }
+
+    const unsafeLegacyEnabled =
+      process.env.OPENFUSION_UNSAFE_RAW_DIFF_APPLY === "1" &&
+      process.env.NODE_ENV !== "production" &&
+      process.env.OPENFUSION_PACKAGED_BUILD !== "1";
+    if (!unsafeLegacyEnabled) {
+      throw new RpcMethodError(
+        RpcErrorCodes.INVALID_PARAMS,
+        "raw-diff Apply is disabled; use candidateId plus approvalGrant",
+      );
+    }
+    const diff = params.diff;
 
     if (diff.trim().length === 0) {
       // Nothing to apply — a no-op success rather than handing `git apply`
       // an empty patch file (behavior across git versions for a truly empty
       // patch is not worth relying on).
+      recordRun(engine, projectDir, {
+        v: 1,
+        kind: "apply",
+        at: new Date().toISOString(),
+        outcome: "succeeded",
+        errorCategory: "empty-diff",
+        durationMs: Date.now() - startedAt,
+        runId: effectiveRunId,
+      });
       return { applied: true };
     }
 
-    // Written to a real tmp file (not piped over stdin) so this stays a
-    // plain execFile call with no child-process stdin-stream handling to
-    // get right — the diff can be arbitrarily large (worker diffs already
-    // use a 64MB execFile buffer elsewhere, worktree.ts), and a file avoids
-    // any pipe-backpressure edge case entirely.
-    const tmpDir = await mkdtemp(path.join(os.tmpdir(), "of-orchestrate-apply-"));
-    const patchPath = path.join(tmpDir, "change.patch");
     try {
-      await writeFile(patchPath, diff, "utf8");
       // --3way is more robust to drift than a plain apply (falls back to a
       // three-way merge using the blobs already in the repo's object store
       // when a plain context-based apply would fail) — this call NEVER
@@ -184,14 +255,30 @@ export function registerOrchestrateMethods(engine: Engine): void {
       // to resolve conflicts; the working tree is left for the caller to
       // review/commit (M7's approval gate lives above this method, per the
       // task brief).
-      await execFileAsync("git", ["-C", projectDir, "apply", "--3way", patchPath]);
-      engine.log(`orchestrate.apply ${projectDir}: applied`);
+      await applyGitPatchFromMemory(projectDir, Buffer.from(diff, "utf8"), ["--3way"]);
+      engine.log("orchestrate.apply: applied");
+      recordRun(engine, projectDir, {
+        v: 1,
+        kind: "apply",
+        at: new Date().toISOString(),
+        outcome: "succeeded",
+        durationMs: Date.now() - startedAt,
+        runId: effectiveRunId,
+      });
       return { applied: true };
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
+      recordRun(engine, projectDir, {
+        v: 1,
+        kind: "apply",
+        at: new Date().toISOString(),
+        outcome: "failed",
+        errorCategory: "git-apply-failed",
+        durationMs: Date.now() - startedAt,
+        runId: effectiveRunId,
+      });
       throw new RpcMethodError(RpcErrorCodes.SERVER_ERROR, `git apply failed: ${message}`);
-    } finally {
-      await rm(tmpDir, { recursive: true, force: true });
     }
+    });
   });
 }

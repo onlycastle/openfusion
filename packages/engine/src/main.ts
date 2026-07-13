@@ -29,14 +29,19 @@ async function main(): Promise<void> {
       process.stderr.write(
         `ndjson writer: stdout unavailable, stopped writing (${err instanceof Error ? err.message : String(err)})\n`,
       ),
-    onQueueWarning: (queueLength) =>
+    onQueueWarning: (bufferedBytes) =>
       process.stderr.write(
-        `ndjson writer: outbound queue crossed ${queueLength} pending lines (slow or stalled consumer?)\n`,
+        `ndjson writer: outbound queue pressure at ${bufferedBytes} buffered bytes (slow or stalled consumer?)\n`,
       ),
   });
   const engine = createEngine({
     log: (message) => process.stderr.write(`${message}\n`),
-    notify: (method, params) => write(encodeNdjson({ jsonrpc: "2.0", method, params })),
+    notify: (method, params) => {
+      const key = method.endsWith(".progress")
+        ? `${method}:${typeof params === "object" && params !== null && "runId" in params ? String((params as { runId?: unknown }).runId ?? "") : ""}`
+        : undefined;
+      write.notification(encodeNdjson({ jsonrpc: "2.0", method, params }), key);
+    },
   });
   const decoder = new NdjsonDecoder();
   // Deliberately NOT process.stdin.setEncoding("utf8") here: NdjsonDecoder
@@ -56,9 +61,12 @@ async function main(): Promise<void> {
   const shutdown = async (): Promise<void> => {
     if (shuttingDown) return;
     shuttingDown = true;
+    pipeline.stopAdmission();
+    engine.runKernel.stopAdmission();
+    engine.runKernel.abortAll();
     engine.frontier.abortAll();
-    await pipeline.drain();
     await engine.close();
+    await pipeline.drain();
     // Give any notifications still queued at shutdown (e.g. a final
     // frontier.event emitted while draining/closing above) a bounded chance
     // to actually reach stdout before the process exits — exiting mid-flush
@@ -75,7 +83,7 @@ async function main(): Promise<void> {
 
   for await (const chunk of process.stdin as AsyncIterable<Buffer>) {
     for (const line of decoder.push(chunk)) {
-      pipeline.handleDecoded(line);
+      await pipeline.handleDecoded(line);
     }
   }
   // stdin closed: client is gone — same shutdown as a signal (abortAll → drain → close)

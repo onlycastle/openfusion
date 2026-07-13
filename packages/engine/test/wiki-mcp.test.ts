@@ -7,6 +7,8 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { afterEach, describe, expect, it } from "vitest";
 import { createEngine, type Engine } from "../src/engine.js";
+import { WIKI_QUERY_TOOL_SPEC } from "../src/tools/registry.js";
+import { renderToolDescription } from "../src/tools/spec.js";
 
 let dir: string;
 let engine: Engine;
@@ -33,7 +35,13 @@ async function rpc(method: string, params: unknown): Promise<any> {
 // Opens a raw TCP connection to the MCP server's port and writes a POST
 // /mcp request whose body never completes (Content-Length: 999 but the
 // socket is never ended) — simulates a client that stalls mid-request.
-async function openStalledConnection(url: string): Promise<net.Socket> {
+function authenticatedTransport(url: string, bearerToken: string): StreamableHTTPClientTransport {
+  return new StreamableHTTPClientTransport(new URL(url), {
+    requestInit: { headers: { Authorization: `Bearer ${bearerToken}` } },
+  });
+}
+
+async function openStalledConnection(url: string, bearerToken: string): Promise<net.Socket> {
   const parsed = new URL(url);
   const socket = net.createConnection({
     host: parsed.hostname,
@@ -44,7 +52,7 @@ async function openStalledConnection(url: string): Promise<net.Socket> {
     socket.once("error", reject);
   });
   socket.write(
-    `POST ${parsed.pathname} HTTP/1.1\r\nHost: ${parsed.host}\r\nContent-Type: application/json\r\nContent-Length: 999\r\n\r\n{"partial":`,
+    `POST ${parsed.pathname} HTTP/1.1\r\nHost: ${parsed.host}\r\nAuthorization: Bearer ${bearerToken}\r\nContent-Type: application/json\r\nContent-Length: 999\r\n\r\n{"partial":`,
   );
   return socket;
 }
@@ -56,18 +64,30 @@ describe("MCP wiki server", () => {
     const started = await rpc("engine.mcp.start", { projectDir: dir });
     expect(started.error).toBeUndefined();
     const url = started.result.url as string;
+    const bearerToken = started.result.bearerToken as string;
     expect(url).toMatch(/^http:\/\/127\.0\.0\.1:\d+\/mcp$/);
 
     const client = new Client({ name: "test-client", version: "0.0.1" });
-    await client.connect(new StreamableHTTPClientTransport(new URL(url)));
+    await client.connect(authenticatedTransport(url, bearerToken));
     const tools = await client.listTools();
     expect(tools.tools.map((t) => t.name).sort()).toEqual(["wiki_map", "wiki_query"]);
+    const queryTool = tools.tools.find((tool) => tool.name === "wiki_query");
+    expect(queryTool?.description).toBe(renderToolDescription(WIKI_QUERY_TOOL_SPEC));
+    expect(queryTool?.inputSchema).toMatchObject({
+      type: "object",
+      required: ["symbol"],
+      properties: { symbol: { type: "string", minLength: 1 } },
+      additionalProperties: false,
+    });
+    expect(queryTool?.inputSchema).not.toHaveProperty("properties.query");
     const result = await client.callTool({
       name: "wiki_query",
       arguments: { symbol: "mercury" },
     });
     const text = (result.content as Array<{ type: string; text: string }>)[0]!.text;
-    expect(JSON.parse(text).definitions[0].file).toBe("m.ts");
+    const payload = JSON.parse(text);
+    expect(payload.definitions[0].file).toBe("m.ts");
+    expect(payload.pages).toEqual([]);
     await client.close();
   }, 30_000);
 
@@ -79,6 +99,7 @@ describe("MCP wiki server", () => {
     expect(b.result.url).toBe(a.result.url);
     const status = await rpc("engine.mcp.status", {});
     expect(status.result.servers).toHaveLength(1);
+    expect(JSON.stringify(status.result)).not.toContain(a.result.bearerToken);
     const stopped = await rpc("engine.mcp.stop", { projectDir: dir });
     expect(stopped.result.stopped).toBe(true);
     const after = await rpc("engine.mcp.status", {});
@@ -92,6 +113,30 @@ describe("MCP wiki server", () => {
     expect(res.error?.code).toBe(-32000);
   });
 
+  it("requires its ephemeral bearer token and rejects oversized requests", async () => {
+    makeRepo();
+    const started = await rpc("engine.mcp.start", { projectDir: dir });
+    const url = started.result.url as string;
+    const bearerToken = started.result.bearerToken as string;
+
+    const unauthorized = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" }),
+    });
+    expect(unauthorized.status).toBe(401);
+
+    const oversized = await fetch(url, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${bearerToken}`,
+        "Content-Type": "application/json",
+      },
+      body: Buffer.alloc(1024 * 1024 + 1, 32),
+    });
+    expect(oversized.status).toBe(413);
+  });
+
   // Finding 1: a stalled client used to wedge the shared McpServer — every
   // later request would 500 forever once a prior transport was left
   // attached. A fresh McpServer per request must keep later requests
@@ -102,11 +147,12 @@ describe("MCP wiki server", () => {
     const started = await rpc("engine.mcp.start", { projectDir: dir });
     expect(started.error).toBeUndefined();
     const url = started.result.url as string;
+    const bearerToken = started.result.bearerToken as string;
 
-    const socket = await openStalledConnection(url);
+    const socket = await openStalledConnection(url, bearerToken);
     try {
       const client = new Client({ name: "test-client", version: "0.0.1" });
-      await client.connect(new StreamableHTTPClientTransport(new URL(url)));
+      await client.connect(authenticatedTransport(url, bearerToken));
       const tools = await client.listTools();
       expect(tools.tools.map((t) => t.name).sort()).toEqual(["wiki_map", "wiki_query"]);
       await client.close();
@@ -124,8 +170,9 @@ describe("MCP wiki server", () => {
     const started = await rpc("engine.mcp.start", { projectDir: dir });
     expect(started.error).toBeUndefined();
     const url = started.result.url as string;
+    const bearerToken = started.result.bearerToken as string;
 
-    const socket = await openStalledConnection(url);
+    const socket = await openStalledConnection(url, bearerToken);
     try {
       const TIMEOUT = Symbol("timeout");
       const winner = await Promise.race([
@@ -190,9 +237,10 @@ describe("MCP wiki server", () => {
     const started = await rpc("engine.mcp.start", { projectDir: dir });
     expect(started.error).toBeUndefined();
     const url = started.result.url as string;
+    const bearerToken = started.result.bearerToken as string;
 
     const client = new Client({ name: "test-client", version: "0.0.1" });
-    await client.connect(new StreamableHTTPClientTransport(new URL(url)));
+    await client.connect(authenticatedTransport(url, bearerToken));
     const result = await client.callTool({
       name: "wiki_query",
       arguments: { symbol: "unbuilt" },

@@ -26,15 +26,22 @@ vi.mock("node:fs/promises", async (importOriginal) => {
 });
 
 const {
+  activeHarnessDir,
   harnessDir,
   harnessStatus,
   loadHarness,
+  loadHarnessSnapshot,
   writeHarness,
-  setEvalsVerdict,
   setCardState,
   HarnessValidationError,
 } = await import("../src/harness/store.js");
 const { upgradeHarnessV1ToV2 } = await import("../src/harness/upgrade.js");
+
+function activeRoot(): string {
+  const root = activeHarnessDir(dir);
+  if (root === null) throw new Error("expected an active harness generation");
+  return root;
+}
 
 /** Expected in-memory shape after loadHarness (always upgrades v1 → v2). */
 function expectedLoaded(bundle: HarnessBundle): HarnessBundle {
@@ -135,24 +142,37 @@ describe("harnessDir", () => {
 });
 
 describe("writeHarness", () => {
+  it("loads bundle, generation, and fingerprint from one pinned pointer snapshot", async () => {
+    makeDir();
+    const bundle = validBundle();
+    const written = await writeHarness(dir, bundle);
+
+    const snapshot = loadHarnessSnapshot(dir);
+    expect(snapshot).not.toBeNull();
+    expect(snapshot!.generationId).toBe(written.generationId);
+    expect(snapshot!.fingerprint.digest).toBe(written.fingerprint);
+    expect(snapshot!.bundle).toEqual(expectedLoaded(bundle));
+  });
+
   it("writes manifest.json, wiki pages, agent defs, and routing.yaml", async () => {
     makeDir();
     const bundle = validBundle();
-    const { files } = await writeHarness(dir, bundle);
+    const { files, generationId } = await writeHarness(dir, bundle);
 
-    expect(existsSync(path.join(dir, ".openfusion/manifest.json"))).toBe(true);
-    expect(existsSync(path.join(dir, ".openfusion/wiki/architecture.md"))).toBe(true);
-    expect(existsSync(path.join(dir, ".openfusion/wiki/build-and-test.md"))).toBe(true);
-    expect(existsSync(path.join(dir, ".openfusion/agents/codegen-worker.yaml"))).toBe(true);
-    expect(existsSync(path.join(dir, ".openfusion/routing.yaml"))).toBe(true);
+    expect(existsSync(path.join(activeRoot(), "manifest.json"))).toBe(true);
+    expect(existsSync(path.join(activeRoot(), "wiki", "architecture.md"))).toBe(true);
+    expect(existsSync(path.join(activeRoot(), "wiki", "build-and-test.md"))).toBe(true);
+    expect(existsSync(path.join(activeRoot(), "agents", "codegen-worker.yaml"))).toBe(true);
+    expect(existsSync(path.join(activeRoot(), "routing.yaml"))).toBe(true);
 
     expect(files.sort()).toEqual(
       [
-        path.join(".openfusion", "manifest.json"),
-        path.join(".openfusion", "routing.yaml"),
-        path.join(".openfusion", "wiki", "architecture.md"),
-        path.join(".openfusion", "wiki", "build-and-test.md"),
-        path.join(".openfusion", "agents", "codegen-worker.yaml"),
+        path.join(".openfusion", "generations", generationId, "manifest.json"),
+        path.join(".openfusion", "generations", generationId, "routing.yaml"),
+        path.join(".openfusion", "generations", generationId, "wiki", "architecture.md"),
+        path.join(".openfusion", "generations", generationId, "wiki", "build-and-test.md"),
+        path.join(".openfusion", "generations", generationId, "agents", "codegen-worker.yaml"),
+        path.join(".openfusion", "current.json"),
       ].sort(),
     );
   });
@@ -160,7 +180,7 @@ describe("writeHarness", () => {
   it("writes wiki pages as frontmatter (title + digest) followed by the body", async () => {
     makeDir();
     await writeHarness(dir, validBundle());
-    const raw = readFileSync(path.join(dir, ".openfusion/wiki/architecture.md"), "utf8");
+    const raw = readFileSync(path.join(activeRoot(), "wiki", "architecture.md"), "utf8");
     expect(raw.startsWith("---\n")).toBe(true);
     expect(raw).toContain("title: Architecture");
     expect(raw).toContain("digest:");
@@ -210,9 +230,10 @@ describe("writeHarness atomicity", () => {
     fsFailure.matchSubstring = ".manifest.json.tmp-";
     await expect(writeHarness(dir, validBundle())).rejects.toThrow("injected write failure");
 
-    expect(existsSync(path.join(dir, ".openfusion/manifest.json"))).toBe(false);
-    const leftovers = existsSync(path.join(dir, ".openfusion"))
-      ? readdirSync(path.join(dir, ".openfusion")).filter((f) => f.includes("manifest.json.tmp-"))
+    expect(activeHarnessDir(dir)).toBeNull();
+    const generations = path.join(dir, ".openfusion", "generations");
+    const leftovers = existsSync(generations)
+      ? readdirSync(generations).filter((entry) => entry.startsWith(".tmp-"))
       : [];
     expect(leftovers).toEqual([]);
   });
@@ -222,9 +243,10 @@ describe("writeHarness atomicity", () => {
     fsFailure.matchSubstring = ".codegen-worker.yaml.tmp-";
     await expect(writeHarness(dir, validBundle())).rejects.toThrow("injected write failure");
 
-    expect(existsSync(path.join(dir, ".openfusion/agents/codegen-worker.yaml"))).toBe(false);
-    const leftovers = existsSync(path.join(dir, ".openfusion/agents"))
-      ? readdirSync(path.join(dir, ".openfusion/agents")).filter((f) => f.includes("codegen-worker.yaml.tmp-"))
+    expect(activeHarnessDir(dir)).toBeNull();
+    const generations = path.join(dir, ".openfusion", "generations");
+    const leftovers = existsSync(generations)
+      ? readdirSync(generations).filter((entry) => entry.startsWith(".tmp-"))
       : [];
     expect(leftovers).toEqual([]);
   });
@@ -232,20 +254,20 @@ describe("writeHarness atomicity", () => {
   it("does not corrupt a pre-existing file when a re-write of it fails", async () => {
     makeDir();
     await writeHarness(dir, validBundle());
-    const before = readFileSync(path.join(dir, ".openfusion/routing.yaml"), "utf8");
+    const before = readFileSync(path.join(activeRoot(), "routing.yaml"), "utf8");
 
     fsFailure.matchSubstring = ".routing.yaml.tmp-";
     const nextBundle = validBundle({
       routing: {
         version: 1,
-        taskClasses: { docs: { agent: "codegen-worker" } },
+        taskClasses: { codegen: { agent: "codegen-worker" } },
         escalation: { failuresBeforeFrontier: 3 },
         defaults: { agent: "codegen-worker" },
       },
     });
     await expect(writeHarness(dir, nextBundle)).rejects.toThrow("injected write failure");
 
-    const after = readFileSync(path.join(dir, ".openfusion/routing.yaml"), "utf8");
+    const after = readFileSync(path.join(activeRoot(), "routing.yaml"), "utf8");
     expect(after).toBe(before);
   });
 });
@@ -256,7 +278,8 @@ describe("writeHarness manifest-last ordering", () => {
     fsFailure.matchSubstring = ".codegen-worker.yaml.tmp-";
     await expect(writeHarness(dir, validBundle())).rejects.toThrow("injected write failure");
 
-    expect(existsSync(path.join(dir, ".openfusion/manifest.json"))).toBe(false);
+    expect(activeHarnessDir(dir)).toBeNull();
+    expect(existsSync(path.join(dir, ".openfusion", "current.json"))).toBe(false);
     expect(loadHarness(dir)).toBeNull();
   });
 
@@ -277,7 +300,7 @@ describe("writeHarness manifest-last ordering", () => {
     });
     await expect(writeHarness(dir, nextBundle)).rejects.toThrow("injected write failure");
 
-    const manifestRaw = readFileSync(path.join(dir, ".openfusion/manifest.json"), "utf8");
+    const manifestRaw = readFileSync(path.join(activeRoot(), "manifest.json"), "utf8");
     expect(JSON.parse(manifestRaw).headSha).toBe("abc123");
     expect(loadHarness(dir)).toEqual(expectedLoaded(bundle));
   });
@@ -302,9 +325,17 @@ describe("writeHarness manifest-last ordering", () => {
       model: { kind: "deepseek", model: "deepseek-chat" },
       escalation: { maxAttempts: 1 },
     };
-    const bundleA = validBundle({ agents: [agentA, agentB] });
+    const bundleA = validBundle({
+      agents: [agentA, agentB],
+      routing: {
+        version: 1,
+        taskClasses: { codegen: { agent: "agent-a" }, docs: { agent: "agent-b" } },
+        escalation: { failuresBeforeFrontier: 2 },
+        defaults: { agent: "agent-a" },
+      },
+    });
     await writeHarness(dir, bundleA);
-    expect(existsSync(path.join(dir, ".openfusion/agents/agent-b.yaml"))).toBe(true);
+    expect(existsSync(path.join(activeRoot(), "agents", "agent-b.yaml"))).toBe(true);
 
     fsFailure.matchSubstring = ".manifest.json.tmp-";
     // bundle B drops agent-b — if prune ran before the (failing) manifest
@@ -314,13 +345,19 @@ describe("writeHarness manifest-last ordering", () => {
     const bundleB = validBundle({
       manifest: validManifest({ headSha: "new-sha-999" }),
       agents: [agentA],
+      routing: {
+        version: 1,
+        taskClasses: { codegen: { agent: "agent-a" } },
+        escalation: { failuresBeforeFrontier: 2 },
+        defaults: { agent: "agent-a" },
+      },
     });
     await expect(writeHarness(dir, bundleB)).rejects.toThrow("injected write failure");
 
-    expect(existsSync(path.join(dir, ".openfusion/agents/agent-b.yaml"))).toBe(true);
-    expect(existsSync(path.join(dir, ".openfusion/agents/agent-a.yaml"))).toBe(true);
+    expect(existsSync(path.join(activeRoot(), "agents", "agent-b.yaml"))).toBe(true);
+    expect(existsSync(path.join(activeRoot(), "agents", "agent-a.yaml"))).toBe(true);
 
-    const manifestRaw = readFileSync(path.join(dir, ".openfusion/manifest.json"), "utf8");
+    const manifestRaw = readFileSync(path.join(activeRoot(), "manifest.json"), "utf8");
     expect(JSON.parse(manifestRaw).headSha).toBe("abc123");
 
     const loaded = loadHarness(dir);
@@ -349,21 +386,37 @@ describe("writeHarness stale artifact pruning", () => {
       model: { kind: "deepseek", model: "deepseek-chat" },
       escalation: { maxAttempts: 1 },
     };
-    await writeHarness(dir, validBundle({ agents: [agentA, agentB] }));
-    expect(existsSync(path.join(dir, ".openfusion/agents/agent-a.yaml"))).toBe(true);
-    expect(existsSync(path.join(dir, ".openfusion/agents/agent-b.yaml"))).toBe(true);
+    await writeHarness(dir, validBundle({
+      agents: [agentA, agentB],
+      routing: {
+        version: 1,
+        taskClasses: { codegen: { agent: "agent-a" }, docs: { agent: "agent-b" } },
+        escalation: { failuresBeforeFrontier: 2 },
+        defaults: { agent: "agent-a" },
+      },
+    }));
+    expect(existsSync(path.join(activeRoot(), "agents", "agent-a.yaml"))).toBe(true);
+    expect(existsSync(path.join(activeRoot(), "agents", "agent-b.yaml"))).toBe(true);
 
     // The manifest this generation just wrote must record agent-b.yaml as
     // one of its artifacts — that's what makes it legitimately prunable on
     // the NEXT regeneration (as opposed to a hand-authored file, which is
     // never in any manifest.artifacts and must never be pruned).
-    const manifestAfterFirstWrite = JSON.parse(readFileSync(path.join(dir, ".openfusion/manifest.json"), "utf8"));
+    const manifestAfterFirstWrite = JSON.parse(readFileSync(path.join(activeRoot(), "manifest.json"), "utf8"));
     expect(manifestAfterFirstWrite.artifacts).toContain("agents/agent-b.yaml");
 
-    await writeHarness(dir, validBundle({ agents: [agentA] }));
+    await writeHarness(dir, validBundle({
+      agents: [agentA],
+      routing: {
+        version: 1,
+        taskClasses: { codegen: { agent: "agent-a" } },
+        escalation: { failuresBeforeFrontier: 2 },
+        defaults: { agent: "agent-a" },
+      },
+    }));
 
-    expect(existsSync(path.join(dir, ".openfusion/agents/agent-b.yaml"))).toBe(false);
-    expect(existsSync(path.join(dir, ".openfusion/agents/agent-a.yaml"))).toBe(true);
+    expect(existsSync(path.join(activeRoot(), "agents", "agent-b.yaml"))).toBe(false);
+    expect(existsSync(path.join(activeRoot(), "agents", "agent-a.yaml"))).toBe(true);
     const loaded = loadHarness(dir);
     expect(loaded?.agents.map((a) => a.name)).toEqual(["agent-a"]);
 
@@ -377,19 +430,19 @@ describe("writeHarness stale artifact pruning", () => {
     makeDir();
     const bundle = validBundle();
     await writeHarness(dir, bundle);
-    expect(existsSync(path.join(dir, ".openfusion/wiki/architecture.md"))).toBe(true);
+    expect(existsSync(path.join(activeRoot(), "wiki", "architecture.md"))).toBe(true);
 
     const renamedPage: WikiPage = { ...bundle.pages[0]!, slug: "architecture-renamed" };
     await writeHarness(dir, validBundle({ pages: [renamedPage, bundle.pages[1]!] }));
 
-    expect(existsSync(path.join(dir, ".openfusion/wiki/architecture.md"))).toBe(false);
-    expect(existsSync(path.join(dir, ".openfusion/wiki/architecture-renamed.md"))).toBe(true);
-    expect(existsSync(path.join(dir, ".openfusion/wiki/build-and-test.md"))).toBe(true);
+    expect(existsSync(path.join(activeRoot(), "wiki", "architecture.md"))).toBe(false);
+    expect(existsSync(path.join(activeRoot(), "wiki", "architecture-renamed.md"))).toBe(true);
+    expect(existsSync(path.join(activeRoot(), "wiki", "build-and-test.md"))).toBe(true);
     const loaded = loadHarness(dir);
     expect(loaded?.pages.map((p) => p.slug).sort()).toEqual(["architecture-renamed", "build-and-test"]);
   });
 
-  it("never prunes hand-authored wiki/agent files that were never recorded in any manifest", async () => {
+  it("treats direct active-generation edits as untrusted and does not import them", async () => {
     makeDir();
     const bundle = validBundle();
     await writeHarness(dir, bundle);
@@ -398,21 +451,26 @@ describe("writeHarness stale artifact pruning", () => {
     // wiki/ and agents/ WITHOUT going through writeHarness — they were
     // never part of ANY generation's manifest.artifacts.
     writeFileSync(
-      path.join(dir, ".openfusion/agents/handmade.yaml"),
+      path.join(activeRoot(), "agents", "handmade.yaml"),
       "name: handmade\nrole: worker\ndescription: Hand-authored via the Harness editor.\nprompt: You are a hand-authored agent.\ntaskClasses:\n  - custom\nmodel: frontier\nescalation:\n  maxAttempts: 1\n",
     );
     writeFileSync(
-      path.join(dir, ".openfusion/wiki/notes.md"),
+      path.join(activeRoot(), "wiki", "notes.md"),
       "---\ntitle: Notes\ndigest: Hand-authored notes page.\n---\n\n# Notes\n\nHand-authored content.\n",
     );
 
-    // Regenerate the SAME bundle again — neither hand-authored file is (or
-    // ever was) in bundle.pages/bundle.agents, so a manifest-driven prune
-    // must leave both alone.
+    const modifiedGeneration = activeRoot();
+    expect(() => loadHarness(dir)).toThrow(HarnessValidationError);
+
+    // A validated write publishes a fresh immutable generation from the
+    // approved bundle; it never silently promotes direct edits.
     await writeHarness(dir, bundle);
 
-    expect(existsSync(path.join(dir, ".openfusion/agents/handmade.yaml"))).toBe(true);
-    expect(existsSync(path.join(dir, ".openfusion/wiki/notes.md"))).toBe(true);
+    expect(activeRoot()).not.toBe(modifiedGeneration);
+    expect(existsSync(path.join(activeRoot(), "agents", "handmade.yaml"))).toBe(false);
+    expect(existsSync(path.join(activeRoot(), "wiki", "notes.md"))).toBe(false);
+    expect(existsSync(path.join(modifiedGeneration, "agents", "handmade.yaml"))).toBe(true);
+    expect(existsSync(path.join(modifiedGeneration, "wiki", "notes.md"))).toBe(true);
   });
 });
 
@@ -443,7 +501,7 @@ describe("loadHarness", () => {
   it("throws HarnessValidationError when manifest.json is corrupt JSON", async () => {
     makeDir();
     await writeHarness(dir, validBundle());
-    writeFileSync(path.join(dir, ".openfusion/manifest.json"), "{ not json");
+    writeFileSync(path.join(activeRoot(), "manifest.json"), "{ not json");
     expect(() => loadHarness(dir)).toThrow(HarnessValidationError);
   });
 
@@ -451,7 +509,7 @@ describe("loadHarness", () => {
     makeDir();
     await writeHarness(dir, validBundle());
     writeFileSync(
-      path.join(dir, ".openfusion/manifest.json"),
+      path.join(activeRoot(), "manifest.json"),
       JSON.stringify({ ...validManifest(), schemaVersion: 99 }),
     );
     expect(() => loadHarness(dir)).toThrow(HarnessValidationError);
@@ -460,16 +518,16 @@ describe("loadHarness", () => {
   it("throws HarnessValidationError when routing.yaml is invalid YAML", async () => {
     makeDir();
     await writeHarness(dir, validBundle());
-    writeFileSync(path.join(dir, ".openfusion/routing.yaml"), "not: valid: yaml: [");
+    writeFileSync(path.join(activeRoot(), "routing.yaml"), "not: valid: yaml: [");
     expect(() => loadHarness(dir)).toThrow(HarnessValidationError);
   });
 
   it("throws HarnessValidationError when an agent file's name does not match its filename", async () => {
     makeDir();
     await writeHarness(dir, validBundle());
-    rmSync(path.join(dir, ".openfusion/agents/codegen-worker.yaml"));
+    rmSync(path.join(activeRoot(), "agents", "codegen-worker.yaml"));
     writeFileSync(
-      path.join(dir, ".openfusion/agents/codegen-worker.yaml"),
+      path.join(activeRoot(), "agents", "codegen-worker.yaml"),
       "name: some-other-name\nrole: worker\ndescription: d\nprompt: p\ntaskClasses:\n  - codegen\nmodel: frontier\nescalation:\n  maxAttempts: 1\n",
     );
     expect(() => loadHarness(dir)).toThrow(HarnessValidationError);
@@ -478,14 +536,14 @@ describe("loadHarness", () => {
   it("throws HarnessValidationError when the wiki directory is missing", async () => {
     makeDir();
     await writeHarness(dir, validBundle());
-    rmSync(path.join(dir, ".openfusion/wiki"), { recursive: true, force: true });
+    rmSync(path.join(activeRoot(), "wiki"), { recursive: true, force: true });
     expect(() => loadHarness(dir)).toThrow(HarnessValidationError);
   });
 
   it("throws HarnessValidationError when a wiki page is missing its frontmatter fence", async () => {
     makeDir();
     await writeHarness(dir, validBundle());
-    writeFileSync(path.join(dir, ".openfusion/wiki/architecture.md"), "# no frontmatter here\n");
+    writeFileSync(path.join(activeRoot(), "wiki", "architecture.md"), "# no frontmatter here\n");
     expect(() => loadHarness(dir)).toThrow(HarnessValidationError);
   });
 });
@@ -496,7 +554,6 @@ describe("harnessStatus", () => {
     expect(harnessStatus(dir)).toEqual({
       present: false,
       structural: null,
-      evals: null,
       headSha: null,
       card: null,
     });
@@ -505,20 +562,19 @@ describe("harnessStatus", () => {
   it("reports manifest fields without requiring wiki/agents/routing to be readable", async () => {
     makeDir();
     await writeHarness(dir, validBundle());
-    rmSync(path.join(dir, ".openfusion/wiki"), { recursive: true, force: true });
-    rmSync(path.join(dir, ".openfusion/agents"), { recursive: true, force: true });
-    rmSync(path.join(dir, ".openfusion/routing.yaml"), { force: true });
+    rmSync(path.join(activeRoot(), "wiki"), { recursive: true, force: true });
+    rmSync(path.join(activeRoot(), "agents"), { recursive: true, force: true });
+    rmSync(path.join(activeRoot(), "routing.yaml"), { force: true });
 
     expect(harnessStatus(dir)).toEqual({
       present: true,
       structural: "pass",
-      evals: "pending",
       headSha: "abc123",
       card: null,
     });
   });
 
-  it("reflects verification.structural: fail and evals: fail from the manifest", async () => {
+  it("reflects verification.structural without exposing legacy benchmark state", async () => {
     makeDir();
     await writeHarness(
       dir,
@@ -527,7 +583,6 @@ describe("harnessStatus", () => {
     expect(harnessStatus(dir)).toEqual({
       present: true,
       structural: "fail",
-      evals: "fail",
       headSha: "abc123",
       card: null,
     });
@@ -551,63 +606,22 @@ describe("harnessStatus", () => {
   });
 });
 
-describe("setEvalsVerdict", () => {
-  it("updates ONLY manifest.verification.evals, preserving structural + artifacts + every other field", async () => {
-    makeDir();
-    const bundle = validBundle();
-    await writeHarness(dir, bundle);
-    const before = JSON.parse(readFileSync(path.join(dir, ".openfusion/manifest.json"), "utf8")) as Manifest;
-    expect(before.verification).toEqual({ structural: "pass", evals: "pending" });
-
-    await setEvalsVerdict(dir, "pass");
-
-    const after = JSON.parse(readFileSync(path.join(dir, ".openfusion/manifest.json"), "utf8")) as Manifest;
-    expect(after.verification).toEqual({ structural: "pass", evals: "pass" });
-    expect(after.artifacts).toEqual(before.artifacts);
-    expect(after.headSha).toBe(before.headSha);
-    expect(after.generatedAt).toBe(before.generatedAt);
-    expect(after.schemaVersion).toBe(before.schemaVersion);
-    expect(after.generatorVersion).toBe(before.generatorVersion);
-    expect(after.engine).toBe(before.engine);
-
-    // Only manifest.json was touched -- every wiki/agent/routing file this
-    // generation wrote is untouched (still present, still readable).
-    expect(loadHarness(dir)).not.toBeNull();
-  });
-
-  it("flips to 'fail' and back to 'pending'", async () => {
-    makeDir();
-    await writeHarness(dir, validBundle());
-
-    await setEvalsVerdict(dir, "fail");
-    expect(harnessStatus(dir).evals).toBe("fail");
-
-    await setEvalsVerdict(dir, "pending");
-    expect(harnessStatus(dir).evals).toBe("pending");
-  });
-
-  it("throws HarnessValidationError when no harness has been generated yet", async () => {
-    makeDir();
-    await expect(setEvalsVerdict(dir, "pass")).rejects.toThrow(HarnessValidationError);
-  });
-});
-
 describe("setCardState", () => {
-  it("updates ONLY manifest.verification.card, preserving evals + structural + artifacts + every other field", async () => {
+  it("publishes card approval in a new canonical generation while preserving semantic fields", async () => {
     makeDir();
     const bundle = validBundle();
     await writeHarness(dir, bundle);
-    const before = JSON.parse(readFileSync(path.join(dir, ".openfusion/manifest.json"), "utf8")) as Manifest;
+    const before = JSON.parse(readFileSync(path.join(activeRoot(), "manifest.json"), "utf8")) as Manifest;
     expect(before.verification).toEqual({ structural: "pass", evals: "pending" });
 
     await setCardState(dir, "approved");
 
-    const after = JSON.parse(readFileSync(path.join(dir, ".openfusion/manifest.json"), "utf8")) as Manifest;
+    const after = JSON.parse(readFileSync(path.join(activeRoot(), "manifest.json"), "utf8")) as Manifest;
     expect(after.verification).toEqual({ structural: "pass", evals: "pending", card: "approved" });
     expect(after.artifacts).toEqual(before.artifacts);
     expect(after.headSha).toBe(before.headSha);
     expect(after.generatedAt).toBe(before.generatedAt);
-    expect(after.schemaVersion).toBe(before.schemaVersion);
+    expect(after.schemaVersion).toBe(2);
     expect(after.generatorVersion).toBe(before.generatorVersion);
     expect(after.engine).toBe(before.engine);
 

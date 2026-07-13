@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { FrontierSelectionSchema } from "../engines/selection.js";
 import {
   DIALECT_PACK_CATALOG_VERSION,
   FAMILY_CATALOG_VERSION,
@@ -48,6 +49,9 @@ export const ManifestSchema = z.object({
   schemaVersion: z.union([z.literal(1), z.literal(2)]),
   generatorVersion: z.string().min(1),
   engine: z.string().min(1),
+  // The exact planning runtime/model used to generate this bundle. Optional
+  // for legacy manifests that recorded only `engine`.
+  planningFrontier: FrontierSelectionSchema.optional(),
   headSha: z.string().min(1),
   // Full ISO-8601 datetime (zod v4's `z.iso.datetime()`), not a bare date —
   // generation timestamps need sub-day precision for the report card / eval
@@ -59,9 +63,11 @@ export const ManifestSchema = z.object({
     // refused outright, so a partially-broken harness is still inspectable
     // in the editor instead of vanishing on generation failure.
     structural: z.enum(["pass", "fail"]),
-    // ETH hazard gate (spec §12.1): stays "pending" until M6's eval loop
-    // runs baseline-vs-harness and flips it. Never silently trusted.
-    evals: z.enum(["pending", "pass", "fail"]),
+    // Legacy only: older bundles stored a project-local benchmark verdict.
+    // New generation omits it because benchmark correctness does not certify
+    // an individual project harness. Kept optional so existing bundles load
+    // and can be regenerated without a migration cliff.
+    evals: z.enum(["pending", "pass", "fail"]).optional(),
     // Human-approval gate for the project-card wiki page (spec §3.4):
     // "draft" until a human reviews and approves it, then "approved". A
     // missing card is a LEGACY manifest — written before this field existed,
@@ -71,17 +77,11 @@ export const ManifestSchema = z.object({
     // "never had a card" and "has a card, still in draft" stay distinguishable.
     card: z.enum(["draft", "approved"]).optional(),
   }),
-  // Relative POSIX paths (under `.openfusion/`, e.g. "routing.yaml",
-  // "wiki/architecture.md", "agents/coder.yaml") of every harness artifact
-  // THIS generation wrote — excludes manifest.json itself and anything
-  // under cache/. store.ts's writeHarness populates this on every write and
-  // reads the PRIOR manifest's list back to know exactly which on-disk
-  // files it, itself, is responsible for and may prune on the next
-  // regeneration — as opposed to a file a user hand-added via the Harness
-  // editor (spec §7.4), which was never recorded here and must never be
-  // pruned. `.default([])` lets an older-shaped manifest (written before
-  // this field existed) still parse, as an empty — i.e. "prune nothing,
-  // I don't know what I wrote" — list.
+  // Relative POSIX paths owned by this immutable generation (for example
+  // routing.yaml, wiki/architecture.md, agents/coder.yaml). manifest.json
+  // and cache state are excluded. Readers use the inventory for validation;
+  // new generations never prune or rewrite an active older generation.
+  // `.default([])` keeps legacy flat manifests readable.
   artifacts: z.array(z.string()).default([]),
   // Phase 1 additive pins (optional on v1 manifests; required on new v2
   // generates). Eval report cards echo these so a "pass" is comparable.

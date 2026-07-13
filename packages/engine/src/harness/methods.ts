@@ -2,17 +2,20 @@ import { z } from "zod";
 import { RpcErrorCodes } from "@openfusion/shared";
 import type { Engine } from "../engine.js";
 import { RpcMethodError } from "../rpc/errors.js";
-import { resolveProjectKey } from "../rpc/guards.js";
+import { requireGitRepo, resolveProjectKey } from "../rpc/guards.js";
 import { registerMethod } from "../rpc/register.js";
 import { HarnessGenError } from "./driver.js";
+import { FrontierSelectionSchema, type FrontierSelection } from "../engines/selection.js";
 import { resolveDialectPackId, resolveFamily } from "../models/catalog.js";
 import { recordRun } from "../runs/ledger.js";
 import { exportHarness } from "./exporters.js";
 import { generateHarness, type GenerateHarnessResult } from "./generate.js";
+import { evaluateHarnessHealth } from "./health.js";
 import { AgentModelSchema, CARD_SLUG, validateHarness, type HarnessBundle } from "./schema.js";
 import { HarnessValidationError, harnessStatus, loadHarness, setCardState, writeHarness } from "./store.js";
 
 const ProjectParamsSchema = z.object({ projectDir: z.string().min(1) });
+const GenerateParamsSchema = ProjectParamsSchema.extend({ frontier: FrontierSelectionSchema.optional() });
 
 const ExportParamsSchema = z.object({
   projectDir: z.string().min(1),
@@ -66,12 +69,18 @@ export class HarnessService {
   // distinct spellings/symlinks of the same project share one queue.
   #writeChain = new Map<string, Promise<unknown>>();
 
-  generate(engine: Engine, projectDir: string): Promise<GenerateHarnessResult> {
+  generate(engine: Engine, projectDir: string, frontier?: FrontierSelection): Promise<GenerateHarnessResult> {
+    // Validate before admission/snapshot capture so callers receive the
+    // stable public SERVER_ERROR instead of an internal git subprocess error.
+    requireGitRepo(projectDir);
     const key = resolveProjectKey(projectDir);
     const inFlight = this.#generating.get(key);
     if (inFlight !== undefined) return inFlight;
 
-    const promise = generateHarness(engine, projectDir).finally(() => {
+    const promise = engine.runKernel.run(
+      { projectDir, kind: "generate", writer: true },
+      (supervisor) => generateHarness(engine, projectDir, frontier, supervisor),
+    ).finally(() => {
       this.#generating.delete(key);
     });
     this.#generating.set(key, promise);
@@ -129,11 +138,11 @@ export class HarnessService {
 }
 
 export function registerHarnessMethods(engine: Engine): void {
-  registerMethod(engine.dispatcher, "engine.harness.generate", ProjectParamsSchema, async ({ projectDir }) => {
+  registerMethod(engine.dispatcher, "engine.harness.generate", GenerateParamsSchema, async ({ projectDir, frontier }) => {
     const startedAt = Date.now();
     try {
-      const result = await engine.harness.generate(engine, projectDir);
-      engine.log(`harness.generate ${projectDir}: ${result.pages} pages, ${result.agents} agents`);
+      const result = await engine.harness.generate(engine, projectDir, frontier);
+      engine.log(`harness.generate: ${result.pages} pages, ${result.agents} agents`);
       let headSha = "unknown";
       try {
         headSha = harnessStatus(projectDir).headSha ?? "unknown";
@@ -159,9 +168,10 @@ export function registerHarnessMethods(engine: Engine): void {
       // unregistered frontier engine) already arrives as an RpcMethodError
       // and passes through the rethrow below untouched.
       if (err instanceof HarnessGenError) {
-        engine.log(`harness.generate ${projectDir} failed at stage ${err.stage ?? "unknown"}`);
+        engine.log(`harness.generate failed at stage ${err.stage ?? "unknown"}`);
         throw new RpcMethodError(RpcErrorCodes.SERVER_ERROR, err.message, {
           stage: err.stage,
+          attempts: err.attempts,
           issues: err.issues,
         });
       }
@@ -178,6 +188,11 @@ export function registerHarnessMethods(engine: Engine): void {
       }
       throw err;
     }
+  });
+
+  registerMethod(engine.dispatcher, "engine.harness.health", ProjectParamsSchema, async ({ projectDir }) => {
+    requireGitRepo(projectDir);
+    return evaluateHarnessHealth(engine, projectDir);
   });
 
   registerMethod(engine.dispatcher, "engine.harness.export", ExportParamsSchema, async ({ projectDir, format }) => {
@@ -212,7 +227,7 @@ export function registerHarnessMethods(engine: Engine): void {
       });
     }
     const result = await exportHarness(projectDir, bundle, format);
-    engine.log(`harness.export ${projectDir} (${format}): ${result.files.length} files`);
+    engine.log(`harness.export (${format}): ${result.files.length} files`);
     return result;
   });
 

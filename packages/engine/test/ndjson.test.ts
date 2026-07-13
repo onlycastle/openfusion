@@ -100,8 +100,8 @@ describe("NdjsonDecoder", () => {
   });
 
   describe("oversized-line cap", () => {
-    it("exports a documented default cap of 32 MiB", () => {
-      expect(MAX_NDJSON_LINE_BYTES).toBe(32 * 1024 * 1024);
+    it("exports a documented default cap of 8 MiB", () => {
+      expect(MAX_NDJSON_LINE_BYTES).toBe(8 * 1024 * 1024);
     });
 
     it("rejects a partial line that grows past the cap before a newline arrives, and resets the buffer", () => {

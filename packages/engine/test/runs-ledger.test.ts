@@ -37,7 +37,7 @@ function orchestrateRec(overrides: Partial<Extract<RunRecord, { kind: "orchestra
     attempts: 1,
     outcome: "worker-approved",
     escalated: false,
-    reviews: [{ decision: "approve", reasons: ["looks good"] }],
+    reviews: [{ decision: "approve", reasonCount: 1 }],
     contextBranch: "approved-card",
     cost: { workerUsd: 0.01, reviewUsd: 0.02, escalateUsd: null, totalUsd: 0.03 },
     durationMs: 100,
@@ -56,19 +56,33 @@ describe("runs ledger", () => {
     await appendRun(dir, orchestrateRec({ at: "2026-07-09T12:00:00.000Z", agent: "a" }));
     await appendRun(dir, orchestrateRec({ at: "2026-07-09T12:01:00.000Z", agent: "b" }));
     await appendRun(dir, { v: 1, kind: "card", at: "2026-07-09T12:02:00.000Z", action: "approve" });
+    await appendRun(dir, {
+      v: 1,
+      kind: "apply",
+      at: "2026-07-09T12:03:00.000Z",
+      outcome: "succeeded",
+      durationMs: 12,
+      runId: "run-1",
+    });
 
     const all = readRuns(dir, { limit: 10 });
-    expect(all.records[0]?.kind).toBe("card");
-    expect(all.records[1]).toMatchObject({ kind: "orchestrate", agent: "b" });
-    expect(all.records[2]).toMatchObject({ kind: "orchestrate", agent: "a" });
+    expect(all.records[0]?.kind).toBe("apply");
+    expect(all.records[1]?.kind).toBe("card");
+    expect(all.records[2]).toMatchObject({ kind: "orchestrate", agent: "b" });
+    expect(all.records[3]).toMatchObject({ kind: "orchestrate", agent: "a" });
 
     const cards = readRuns(dir, { kind: "card" });
     expect(cards.records).toHaveLength(1);
     expect(cards.records[0]?.kind).toBe("card");
 
+    const applies = readRuns(dir, { kind: "apply" });
+    expect(applies.records).toEqual([
+      expect.objectContaining({ kind: "apply", outcome: "succeeded", runId: "run-1" }),
+    ]);
+
     const limited = readRuns(dir, { limit: 1 });
     expect(limited.records).toHaveLength(1);
-    expect(limited.records[0]?.kind).toBe("card");
+    expect(limited.records[0]?.kind).toBe("apply");
   });
 
   it("tolerates corrupt lines", async () => {
@@ -101,14 +115,14 @@ describe("runs ledger", () => {
     expect(logs.some((l) => l.includes("run-ledger: append failed"))).toBe(true);
   });
 
-  it("does not write task text into records (content line)", async () => {
+  it("stores review counts without model-authored review text", async () => {
     makeDir();
     const rec = orchestrateRec();
     await appendRun(dir, rec);
     const raw = readFileSyncSafe(runsLedgerPath(dir));
     expect(raw).not.toContain("UNIQUE-TASK-MARKER");
-    // reviews reasons are allowed (failure-cause text)
-    expect(raw).toContain("looks good");
+    expect(raw).toContain('"reasonCount":1');
+    expect(raw).not.toContain("looks good");
   });
 });
 

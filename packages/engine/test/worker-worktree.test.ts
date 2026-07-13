@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdtempSync, realpathSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -26,13 +26,13 @@ function makeBaseRepo(): string {
 }
 
 describe("WorktreeManager.create", () => {
-  it("creates a real git worktree on branch worker/<taskId>", async () => {
+  it("creates a detached host-private git worktree at the captured base", async () => {
     dir = makeBaseRepo();
     const manager = new WorktreeManager(dir);
     const wt = await manager.create("t1");
 
     expect(wt.id).toBe("t1");
-    expect(wt.branch).toBe("worker/t1");
+    expect(wt.branch).toBe("detached");
     expect(wt.base).toBe(realpathSync(dir));
     // baseSha is the base repo's HEAD at creation time -- with a single
     // commit on the base repo (makeBaseRepo's "init"), that's also the
@@ -40,20 +40,20 @@ describe("WorktreeManager.create", () => {
     expect(wt.baseSha).toBe(git(wt.path, "rev-parse", "HEAD"));
     expect(existsSync(wt.path)).toBe(true);
     expect(git(wt.path, "rev-parse", "--is-inside-work-tree")).toBe("true");
-    expect(git(wt.path, "rev-parse", "--abbrev-ref", "HEAD")).toBe("worker/t1");
+    expect(git(wt.path, "rev-parse", "--abbrev-ref", "HEAD")).toBe("HEAD");
     // Shares the base repo's object store rather than a full clone: the
     // linked worktree's `.git` is a file pointing at the base repo's
     // admin dir, not a directory of its own.
     expect(existsSync(path.join(wt.path, ".git"))).toBe(true);
   });
 
-  it("ensures .openfusion/.gitignore guards worktrees/", async () => {
+  it("keeps worker files outside the selected repository", async () => {
     dir = makeBaseRepo();
     const manager = new WorktreeManager(dir);
-    await manager.create("t1");
+    const wt = await manager.create("t1");
 
-    const gitignore = readFileSync(path.join(dir, ".openfusion", ".gitignore"), "utf8");
-    expect(gitignore.split("\n").map((l) => l.trim())).toContain("worktrees/");
+    expect(wt.path.startsWith(path.join(dir, ".openfusion"))).toBe(false);
+    expect(existsSync(path.join(dir, ".openfusion", "worktrees"))).toBe(false);
   });
 
   it("rejects a taskId that escapes the worktrees directory", async () => {
@@ -71,8 +71,8 @@ describe("WorktreeManager.create", () => {
 
     expect(existsSync(a.path)).toBe(true);
     expect(existsSync(b.path)).toBe(true);
-    expect(a.branch).toBe("worker/concurrent-a");
-    expect(b.branch).toBe("worker/concurrent-b");
+    expect(a.branch).toBe("detached");
+    expect(b.branch).toBe("detached");
   });
 });
 
@@ -90,7 +90,7 @@ describe("WorktreeManager.list", () => {
     expect(listed).toContainEqual<Worktree>({
       id: "t1",
       path: wt.path,
-      branch: "worker/t1",
+      branch: "detached",
       base: wt.base,
       baseSha: wt.baseSha,
     });
@@ -172,8 +172,7 @@ describe("WorktreeManager.remove", () => {
     await manager.remove(wt);
 
     expect(existsSync(wt.path)).toBe(false);
-    // The branch survives removal unless deleteBranch is requested.
-    expect(git(dir, "branch", "--list", "worker/t1")).not.toBe("");
+    expect(git(dir, "branch", "--list", "worker/t1")).toBe("");
   });
 
   it("also deletes the branch when deleteBranch is true", async () => {

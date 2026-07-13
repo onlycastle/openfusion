@@ -186,9 +186,12 @@ export function createWorkerRuntime(
 ): WorkerRuntime {
   const pack = typeof packOrId === "string" ? requireDialectPack(packOrId) : packOrId;
   const flags = toolsetFlags(pack, opts, ctx);
+  const retryHintFor = (tool: string, errorKind: ToolErrorKind) =>
+    retryHintForPack(pack, tool, errorKind);
   const tools = createWorkerTools({
     ...ctx,
     ...flags,
+    retryHintFor,
     // For standard packs, wiki tools follow pack toolset + ctx.wiki presence.
     includeWikiTools: flags.includeWikiTools,
   });
@@ -200,7 +203,7 @@ export function createWorkerRuntime(
     tools,
     instructions: buildInstructions(pack),
     maxSteps: pack.maxSteps,
-    retryHintFor: (tool, errorKind) => retryHintForPack(pack, tool, errorKind),
+    retryHintFor,
     telemetryBase: {
       dialectPack: pack.id,
       dialectPackVersion: pack.version,

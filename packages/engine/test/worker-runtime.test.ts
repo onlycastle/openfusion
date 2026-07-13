@@ -10,33 +10,54 @@ function makeRoot(): string {
 }
 
 describe("createWorkerRuntime", () => {
-  it("string-edit-default includes edit + write_file and emits base instructions", () => {
+  it("string-edit-default includes file tools but omits Bash without a certified sandbox", () => {
     const root = makeRoot();
     const runtime = createWorkerRuntime("string-edit-default", { root });
     expect(runtime.dialectPackId).toBe("string-edit-default");
     expect(runtime.tools.edit).toBeDefined();
     expect(runtime.tools.write_file).toBeDefined();
-    expect(runtime.tools.bash).toBeDefined();
+    expect(runtime.tools.bash).toBeUndefined();
     expect(runtime.instructions).toContain("coding worker");
     expect(runtime.telemetryBase.editDialect).toBe("string-replace");
   });
 
-  it("whole-file-prefer omits edit and mentions write_file in instructions", () => {
+  it("whole-file-prefer omits edit and returns write recovery guidance", async () => {
     const root = makeRoot();
     const runtime = createWorkerRuntime("whole-file-prefer", { root });
     expect(runtime.tools.edit).toBeUndefined();
     expect(runtime.tools.write_file).toBeDefined();
     expect(runtime.instructions).toContain("write_file");
     expect(runtime.editDialect).toBe("whole-file");
+
+    const write = runtime.tools.write_file as unknown as {
+      execute: (
+        args: { path: string; content: string },
+        opts: { abortSignal?: AbortSignal },
+      ) => Promise<{ error?: string; recovery?: string }>;
+    };
+    const result = await write.execute({ path: ".", content: "cannot overwrite a directory" }, {});
+    expect(result.error).toContain("write failed");
+    expect(result.recovery).toContain("Check the path");
   });
 
-  it("string-edit-strict tightens edit description and retry hints", () => {
+  it("string-edit-strict tightens edit description and returns retry hints to the model", async () => {
     const root = makeRoot();
+    writeFileSync(path.join(root, "f.txt"), "same same\n", "utf8");
     const runtime = createWorkerRuntime("string-edit-strict", { root });
     expect(runtime.tools.edit).toBeDefined();
     expect(runtime.instructions).toContain("unique");
     expect(runtime.retryHintFor("edit", "not_unique")).toContain("widen");
     expect(runtime.retryHintFor("edit", "not_found")).toContain("Re-read");
+
+    const edit = runtime.tools.edit as unknown as {
+      execute: (
+        args: { path: string; find: string; replace: string },
+        opts: { abortSignal?: AbortSignal },
+      ) => Promise<{ error?: string; recovery?: string }>;
+    };
+    const result = await edit.execute({ path: "f.txt", find: "same", replace: "x" }, {});
+    expect(result.error).toContain("matched 2 times");
+    expect(result.recovery).toContain("widen");
   });
 
   it("packs produce different tool sets (measurable, not cosmetic)", () => {
@@ -58,7 +79,7 @@ describe("tool error telemetry", () => {
       onToolEvent: (e) => events.push(e),
     });
 
-    const edit = tools.edit as {
+    const edit = tools.edit as unknown as {
       execute: (
         args: { path: string; find: string; replace: string },
         opts: { abortSignal?: AbortSignal },
