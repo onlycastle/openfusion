@@ -432,14 +432,11 @@ function progress(engine: Engine, stage: string, detail: string, runId?: string)
 
 // Lifts the worktree breadcrumb a failed engine.worker.run (worker/
 // methods.ts) or runEscalation (below) call carries in its thrown
-// RpcMethodError's `data` — both leave the failed attempt's worktree ON
-// DISK for inspection (see each's own "never remove on a failure path" doc
-// comment), but only the error THEY threw reliably knows that attempt's
-// path; the caller's own `lastWorktree` local can already be stale/null by
-// the time this fires — e.g. an earlier attempt's worktree was cleaned up
-// (rejected verdict) before this LATER attempt threw — so trusting
-// `lastWorktree` instead of this lift would silently discard a real,
-// still-on-disk worktree (M5b Task 4 review round 1, Finding 2).
+// RpcMethodError's `data` -- only the error THEY threw reliably knows that
+// attempt's path; the caller's own `lastWorktree` local can already be
+// stale/null by the time this fires (an earlier attempt's worktree was
+// cleaned up before this LATER attempt threw), so trusting it instead of
+// this lift would silently discard a real, still-on-disk worktree.
 function liftWorktreeFromError(err: unknown): { path: string; branch: string } | undefined {
   if (
     err instanceof RpcMethodError &&
@@ -451,6 +448,20 @@ function liftWorktreeFromError(err: unknown): { path: string; branch: string } |
     return (err.data as { worktree: { path: string; branch: string } }).worktree;
   }
   return undefined;
+}
+
+// Fix 2 (final review): candidates.prepare's own thrown errors must NOT be
+// blanket-downgraded to "verification incomplete" -- only a genuine
+// verification-COMMAND failure (candidates/service.ts's "command-failed"
+// reasonCode) earns that soft path; a cancellation or any other error (e.g.
+// an unavailable backend, a real bug) must propagate to the caller.
+function isVerificationCommandFailure(err: unknown): boolean {
+  return (
+    err instanceof RpcMethodError &&
+    typeof err.data === "object" &&
+    err.data !== null &&
+    (err.data as { reasonCode?: unknown }).reasonCode === "command-failed"
+  );
 }
 
 interface EscalationResult {
@@ -987,7 +998,9 @@ export async function orchestrate(engine: Engine, params: OrchestrateParams): Pr
             contract: taskContract,
             signal: cancelSignal,
           });
-        } catch {
+        } catch (err) {
+          if (cancelSignal?.aborted) throw err;
+          if (!isVerificationCommandFailure(err)) throw err;
           verificationIncomplete = true;
           const verdict: ReviewVerdict = {
             decision: "request-changes",
@@ -1171,7 +1184,9 @@ export async function orchestrate(engine: Engine, params: OrchestrateParams): Pr
         contract: taskContract,
         signal: cancelSignal,
       });
-    } catch {
+    } catch (err) {
+      if (cancelSignal?.aborted) throw err;
+      if (!isVerificationCommandFailure(err)) throw err;
       verificationIncomplete = true;
       attempts.push({
         n,
@@ -1299,23 +1314,13 @@ export async function orchestrate(engine: Engine, params: OrchestrateParams): Pr
     );
   } catch (err) {
     if (err instanceof OrchestrateApprovalPause) throw err;
-    // M7b Task 2: determined by checking the resolved cancelSignal's OWN
-    // `.aborted` flag directly (mirrors worker/methods.ts's existing
-    // timeoutSignal.aborted / controller.signal.aborted convention) rather
-    // than `err instanceof RunCancelledError` — an intermediate catch
-    // (runEscalation's own, notably) already wraps a RunCancelledError into
-    // a plain RpcMethodError by the time it reaches here, so an
-    // `instanceof` check would miss it. Checking the signal itself stays
-    // robust no matter how many layers re-wrapped the error on the way up.
+    // M7b Task 2: checked via cancelSignal's OWN `.aborted` flag rather than
+    // `instanceof RunCancelledError` -- an intermediate catch (e.g.
+    // runEscalation's) may have already re-wrapped it by the time it lands here.
     const cancelled = cancelSignal?.aborted === true;
-    // Nothing ran yet (a load/route failure before any attempt or worktree
-    // existed) -> pass the original, already-correctly-coded error through
-    // untouched, matching every sibling pipeline's own guard/routing errors
-    // -- UNLESS this is a cancellation, which always gets its own dedicated
-    // "orchestrate cancelled" SERVER_ERROR with the `cancelled` marker (a
-    // caller must be able to tell "cancelled" apart from "failed" even when
-    // cancellation landed before any attempt/worktree existed at all, e.g.
-    // during the load/route stage).
+    // Nothing ran yet (a load/route failure) -> pass the original error
+    // through untouched, UNLESS this is a cancellation, which always gets
+    // its own dedicated "orchestrate cancelled" marker.
     if (attempts.length === 0 && lastWorktree === null) {
       if (cancelled) {
         throw new RpcMethodError(RpcErrorCodes.SERVER_ERROR, "orchestrate cancelled", {
@@ -1326,14 +1331,8 @@ export async function orchestrate(engine: Engine, params: OrchestrateParams): Pr
       }
       throw err;
     }
-    // No special-case cleanup is added for the cancelled case here: a
-    // cancellation flows through the exact SAME "leave lastWorktree in
-    // place, report its path" discipline every other failure already uses
-    // (the worker-attempt catch's liftWorktreeFromError, the escalation
-    // catch's identical lift, above) — cancelling mid-run is deliberately
-    // treated just like any other failure for worktree-preservation
-    // purposes: leave a breadcrumb on disk for inspection, don't auto-delete
-    // possibly-uncommitted work.
+    // Cancellation flows through the same "leave lastWorktree, report its
+    // path" breadcrumb discipline every other failure here already uses.
     const message = err instanceof Error ? err.message : String(err);
     throw new RpcMethodError(RpcErrorCodes.SERVER_ERROR, `orchestrate failed: ${message}`, {
       attempts,

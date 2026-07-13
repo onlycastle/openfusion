@@ -1545,6 +1545,60 @@ describe("engine.orchestrate — cancellation via engine.cancel (M7b Task 2)", (
     expect(engine.cancelRegistry.size()).toBe(0);
   }, 15_000);
 
+  it("cancel mid-run during candidates.prepare's verification step surfaces the cancelled marker, never a downgraded 'failed' result (final review Fix 2)", async () => {
+    dir = makeRepo();
+    await writeTestHarness(dir);
+    let verifyStarted: () => void = () => {};
+    const verifyStartedPromise = new Promise<void>((resolve) => { verifyStarted = resolve; });
+    let verifyCalls = 0;
+    // Two verification commands (the default git-diff-check plus this one
+    // extra) so cancelling mid-way through the FIRST leaves the loop's
+    // per-iteration abort check (candidates/service.ts) to catch it before a
+    // second command ever runs.
+    engine = createEngine({
+      verificationRunner: {
+        async status() {
+          return { available: true };
+        },
+        async run() {
+          verifyCalls += 1;
+          if (verifyCalls === 1) {
+            verifyStarted();
+            await new Promise((resolve) => setTimeout(resolve, 100));
+          }
+          return { exitCode: 0 };
+        },
+      },
+    });
+    engine.models.registry.configure({ id: "p1", kind: "deepseek", apiKey: TEST_API_KEY });
+    engine.models.registry.setTestModel("p1", makeWorkerMock("hello.txt", "HELLO", "Created hello.txt"));
+    engine.frontier.registerAdapter(makeFakeFrontierAdapter({}));
+
+    const orchestratePromise = call(engine, "engine.orchestrate", {
+      projectDir: dir,
+      task: "add hello.txt with a greeting",
+      taskContract: {
+        schemaVersion: 1,
+        requirements: ["add hello.txt"],
+        constraints: [],
+        verificationCommands: [["true"]],
+      },
+      runId: "r-cancel-verify",
+    });
+
+    await verifyStartedPromise;
+    const cancelRes = await call(engine, "engine.cancel", { runId: "r-cancel-verify" });
+    expect(cancelRes.result.cancelled).toBe(true);
+
+    const res = await orchestratePromise;
+    // THE FIX: this must be the cancelled marker, never a "verification
+    // incomplete -> failed" downgrade -- the old blanket catch swallowed the
+    // cancellation and returned a normal "failed" result instead.
+    expect(res.result).toBeUndefined();
+    expect(res.error).toBeDefined();
+    expect(res.error.data.cancelled).toBe(true);
+  }, 15_000);
+
   it("engine.cancel on an unknown runId resolves { cancelled: false } without erroring", async () => {
     dir = makeRepo();
     engine = createTestEngine();
