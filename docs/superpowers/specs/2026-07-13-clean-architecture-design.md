@@ -61,7 +61,7 @@ Three layers inside the engine, one-way dependency rule:
 │                 runtime/supervisor (RunKernel)      │  never on concrete siblings
 ├─────────────────────────────────────────────────────┤
 │  MODULES        worker, harness, wiki, models,      │  each sealed behind ONE
-│                 engines, runtime, runs, tools,      │  public index.ts
+│                 engines, runtime, runs,             │  public index.ts
 │                 verification                        │
 └─────────────────────────────────────────────────────┘
         shared/  = the RPC contract (Zod), imported by engine AND desktop
