@@ -82,6 +82,38 @@ describe("runtime RPC", () => {
     expect(notifications.some((entry) => entry.method === "session.changed")).toBe(true);
   });
 
+  it("an admission failure BEFORE runOrchestrate ever executes still persists a terminal session state, never a zombie 'created' (final review Fix 3)", async () => {
+    const projectDir = project();
+    const notifications: Array<{ method: string; params: any }> = [];
+    engine = createEngine({ notify: (method, params) => notifications.push({ method, params }) });
+
+    // Forces engine.runKernel.run(...) to reject IMMEDIATELY, before it ever
+    // invokes #runOrchestrate's callback -- the same "admission failed before
+    // the callback ran" shape as queue-full or a duplicate caller-supplied
+    // runId (RunKernel.register throwing synchronously), just reached
+    // deterministically instead of via a queue-filling/racing setup.
+    engine.runKernel.stopAdmission();
+
+    const started = await rpc("engine.orchestrate.start", { projectDir, task: "add a greeting" });
+    expect(started.error).toBeUndefined();
+    expect(started.result).toMatchObject({ status: "created", version: 1 });
+
+    let session: any;
+    for (let index = 0; index < 100; index += 1) {
+      const response = await rpc("engine.sessions.get", { projectDir, sessionId: started.result.sessionId });
+      session = response.result.session;
+      if (["completed", "failed", "cancelled"].includes(session.status)) break;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    // THE FIX: before this, #runOrchestrate's blanket catch assumed
+    // runOrchestrate had already persisted a terminal state -- false here,
+    // since RunKernel rejected before runOrchestrate ever ran. The session
+    // was left stuck at "created" forever, with no failure event and no
+    // notification, so an engine.sessions.get poller would spin forever.
+    expect(session.status).toBe("failed");
+    expect(notifications.some((entry) => entry.method === "session.changed")).toBe(true);
+  });
+
   it("rejects stale session actions with the current version", async () => {
     const projectDir = project();
     engine = createEngine();

@@ -137,9 +137,8 @@ export class RuntimeService {
     const key = path.resolve(projectDir);
     const existing = this.#projects.get(key);
     if (existing !== undefined) return existing.store;
-    // Compatibility/headless calls still need encrypted transient artifacts.
-    // This key is intentionally not durable, so exact restart resume remains
-    // unavailable until the host supplies the Keychain-backed project key.
+    // Compatibility/headless calls still need encrypted transient artifacts;
+    // not durable, so exact restart resume needs a host-supplied Keychain key.
     const runtimeKey = randomBytes(32);
     const store = this.#createStore(key, runtimeKey);
     const runtime = { key: runtimeKey, keySource: "ephemeral" as const, store };
@@ -218,9 +217,8 @@ export class RuntimeService {
   /**
    * Executes one orchestration under an existing RunKernel admission. SQLite
    * owns lifecycle/content; RunSupervisor contributes bounded admission,
-   * cancellation, the immutable task snapshot, and a rebuildable observer
-   * journal. Blocking compatibility RPCs and async sessions both use this
-   * method so they cannot drift into separate runtime authorities.
+   * cancellation, the snapshot, and a rebuildable observer journal. Blocking
+   * compatibility RPCs and async sessions both use this method for that reason.
    */
   async runOrchestrate(
     engine: Engine,
@@ -602,10 +600,12 @@ export class RuntimeService {
           await this.runOrchestrate(engine, params, supervisor, sessionId);
         },
       );
-    } catch {
-      // runOrchestrate has already transactionally persisted the terminal
-      // failure. Async start intentionally has no rejected RPC promise to
-      // surface after its immediate acknowledgement.
+    } catch (error) {
+      // Fix 3 (final review): RunKernel.run can reject before this ever runs (admission-stopped, queue-full, dup runId) -- else a zombie "created" session.
+      const latest = store.requireSession(sessionId);
+      if (latest.status !== "created" && latest.status !== "running") return;
+      store.appendEvent(sessionId, { type: "orchestrate.failed", metadata: { category: safeFailureCategory(error) }, payload: { message: error instanceof Error ? error.message : String(error) } });
+      this.#notify(engine, store.updateSession(latest.id, latest.version, { status: "failed", outcome: safeFailureCategory(error) }));
     }
   }
 
