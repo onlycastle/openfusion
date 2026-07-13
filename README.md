@@ -1,21 +1,28 @@
 # OpenFusion
 
 OpenFusion is an open-source macOS app and local engine for building an
-AI coding harness around a repository.
+evidence-driven AI coding harness around a repository.
 
-It indexes your codebase, asks a frontier model to generate project-specific
-working knowledge, then uses that knowledge to route coding tasks to cheaper
-worker models with frontier review before anything is applied.
+It indexes your codebase, generates a human-reviewable project layer, and
+measures complete model-harness routes before using lower-cost workers with
+mechanical verification, independent review, and explicit approval. Models and
+APIs remain replaceable; the durable asset is the project's evaluation,
+routing, policy, execution, and verified-outcome loop.
 
 Put more simply:
 
 1. Build a symbol-aware wiki for a local git repo.
-2. Generate a `.openfusion/` harness: project notes, specialist agents, and a routing policy.
-3. Run tasks through the harness: classify -> worker model -> frontier review -> optional retry/escalation.
-4. Measure whether the harness preserves quality while reducing estimated model cost.
+2. Generate a versioned `.openfusion/` harness: approved project knowledge,
+   optional workflow profiles, and routing and policy configuration.
+3. Compare candidate model-harness routes on identical project tasks and
+   protected oracles.
+4. Run suitable tasks through isolated workers, exact candidate verification,
+   independent review, and optional retry or escalation.
+5. Measure fully burdened cost per accepted result, not nominal token price.
 
-OpenFusion never commits or merges on your behalf. It returns diffs for review,
-and `engine.orchestrate.apply` only applies a reviewed diff with `git apply --3way`.
+OpenFusion never commits or merges on your behalf. It returns a verified,
+independently reviewed `CandidateRef`; Apply requires a short-lived one-use
+grant bound to that exact candidate, base SHA, diff digest, and destination.
 
 ## Status
 
@@ -25,23 +32,27 @@ What works today:
 
 | Area | Status |
 |---|---|
-| Repo wiki | Indexes TypeScript, JavaScript, Python, Go, Rust, and Java repositories into a per-project symbol store. |
-| Wiki tools | Serves `wiki_query` and `wiki_map` over a local MCP server for model sessions. |
-| Harness generation | Generates `.openfusion/` with wiki pages, agents, `routing.yaml`, and `manifest.json`. |
+| Repo wiki | Indexes the exact Git `HEAD` for TypeScript, JavaScript, Python, Go, Rust, and Java into a searchable per-project symbol store. |
+| Wiki tools | Serves exact-symbol `wiki_query` and task-conditioned `wiki_map` retrieval over a local MCP server. |
+| Harness generation | Publishes validated immutable `.openfusion/generations/<id>` bundles through an atomic `current.json` pointer. |
 | Project Card | Drafts a human-reviewable project summary. It must be approved before it is trusted in worker prompts. |
 | Exports | Writes `AGENTS.md` and Claude Code subagents from a valid harness. |
-| Orchestration | Routes a task to a worker model in an isolated git worktree, reviews the diff with a frontier session, retries once, then escalates if needed. |
-| Evals | Compares baseline frontier runs against harness runs and reports quality, estimated cost, and pass/fail/inconclusive verdicts. |
-| Desktop app | Tauri 2 app with Project, Keys, Orchestrate, and Evals screens. Secrets are stored in macOS Keychain. |
+| Orchestration | Pins one task snapshot, authors in detached host-private worktrees, verifies the exact candidate, and requires an independent read-only review before Apply. |
+| Runtime gateways | Bounds every production model turn through one provider gateway and intersects dynamic core-tool claims through one policy gateway. |
+| Native sandbox | Bundles a Rust macOS runner with role-specific filesystem/process/network/environment containment; unsupported backends fail closed. |
+| Evals | Supports directional paired runs plus durable seeded repeated experiments with pass@k/pass^k, intervals, latency, complete cost, and safety gates. |
+| Desktop app | Tauri 2 app with Studio, Harness, and Health workspaces plus Settings. Secrets are stored in macOS Keychain. |
 | Bench CLI | Includes a SWE-bench Verified Mini workflow for paired baseline-vs-harness experiments. |
 
 Important caveats:
 
-- Cost numbers are estimates from token usage and pricing tables, not billed amounts.
-- A generated harness is marked unverified until evals pass.
+- Cost numbers are estimates from token usage and pricing tables, not billed amounts. Partial priced sums are never presented as total cost.
+- Generated project context, specialist profiles, and model mixtures are
+  hypotheses until matched project evaluation shows that they earn their cost.
+- Evaluation reports never certify, mutate, or automatically promote a project harness.
 - The Project Card approval gate is intentional: the card is not trusted in worker prompts until a human approves it.
 - Desktop signing and notarization require your own Apple Developer credentials.
-- Live smokes require real model access, for example a logged-in frontier CLI and/or an open-model API key.
+- Live smokes require real model access, for example a logged-in Claude/Codex runtime and/or a worker-model API key.
 
 ## Quick Start
 
@@ -79,8 +90,9 @@ Launch the desktop cockpit:
 ./dev.sh app
 ```
 
-The Project screen can build a repo wiki without model keys. Harness generation,
-orchestration, and evals need the model access described above.
+The Studio workspace can inspect and build a repo wiki without model keys.
+Harness generation, orchestration, and evals need the model access described
+above.
 
 ## Common Commands
 
@@ -129,10 +141,12 @@ harness generation
 orchestration
   - classify task
   - pick agent and model
-  - run worker in isolated worktree
-  - review diff with frontier model
-  - retry or escalate
-  - return diff for human review
+  - run worker in a detached, natively sandboxed worktree
+  - materialize and deterministically verify the exact candidate
+  - review the candidate tree with an independent lead session
+  - retry or escalate with its selected runtime/model
+  - return CandidateRef plus diff presentation for human review
+  - require a one-use approval grant before Apply
 ```
 
 The key design choice is selective context. Workers get the approved Project
@@ -180,19 +194,20 @@ engine.harness.export       { "projectDir": "/path/to/repo", "format": "claude-s
 Run the harness loop:
 
 ```text
-engine.orchestrate       { "projectDir": "/path/to/repo", "task": "add input validation to the signup form" }
-engine.orchestrate.apply { "projectDir": "/path/to/repo", "diff": "<reviewed diff>" }
-engine.cancel            { "runId": "<client-generated run id>" }
+engine.orchestrate { "projectDir": "/path/to/repo", "task": "add input validation to the signup form" }
+engine.candidates.prepareApply { "projectDir": "/path/to/repo", "candidateId": "<candidate id>" }
+engine.orchestrate.apply { "projectDir": "/path/to/repo", "candidateId": "<candidate id>", "approvalGrant": { "...": "returned grant" } }
+engine.cancel { "runId": "<client-generated run id>" }
 ```
 
 Clean up worker worktrees:
 
 ```text
 engine.worker.list { "projectDir": "/path/to/repo" }
-engine.worker.gc   { "projectDir": "/path/to/repo", "keep": ["/path/to/repo/.openfusion/worktrees/<id>"] }
+engine.worker.gc   { "projectDir": "/path/to/repo", "keep": ["<host-private worktree path>"] }
 ```
 
-Measure a harness:
+Run an occasional controlled system benchmark:
 
 ```text
 engine.evals.run {
@@ -201,9 +216,17 @@ engine.evals.run {
     { "commitSha": "<bug-fix commit>", "testCommand": ["pnpm", "test"] }
   ]
 }
+
+engine.evals.experiment {
+  "projectDir": "/path/to/repo",
+  "tasks": [{ "commitSha": "<bug-fix commit>", "testCommand": ["pnpm", "test"] }],
+  "trials": 5,
+  "seed": "release-candidate-1"
+}
 ```
 
-Eval verdicts are deliberately conservative:
+Benchmark verdicts are deliberately conservative and never update the project
+harness manifest:
 
 | Verdict | Meaning |
 |---|---|
@@ -221,14 +244,14 @@ React + Vite webview
   <-> openfusion-engine sidecar over stdio JSON-RPC
 ```
 
-The app has four screens:
+The app has three project workspaces plus a Settings dialog:
 
-| Screen | Purpose |
+| Workspace | Purpose |
 |---|---|
-| Project | Pick a local git repo and build its wiki with live progress. |
-| Keys | Configure frontier and open-model providers. Secrets are stored in macOS Keychain. |
-| Orchestrate | Run the route -> worker diff -> frontier review -> apply workflow. |
-| Evals | Run baseline-vs-harness evals and inspect the report card. |
+| Studio | Select a project, prepare its wiki/harness, and run the route -> worker -> lead-model review -> apply workflow. |
+| Harness | Review the Project Card, specialist agents, model assignments, and escalation policy. |
+| Health | Verify harness/wiki operation and inspect metadata-only production evidence. |
+| Settings | Connect Claude/Codex runtimes, select lead models for planning/review/escalation/baseline, and configure BYOK worker models. Secrets can be stored in macOS Keychain. |
 
 Desktop-specific architecture, sidecar staging, Rust tests, and operator smoke
 details are documented in [`apps/desktop/README.md`](apps/desktop/README.md).
@@ -254,10 +277,13 @@ and caveats.
 |---|---|
 | `apps/desktop/` | Tauri desktop app and Rust sidecar bridge. |
 | `packages/engine/` | Core indexing, harness generation, model routing, orchestration, evals, and JSON-RPC server. |
-| `packages/shared/` | Shared RPC and wiki types. |
+| `packages/shared/` | Shared RPC, snapshot, candidate, runtime-capability, cost, and verification contracts. |
+| `native/sandbox-runner/` | Standalone Rust macOS containment and process-lifecycle runner. |
 | `benchmarks/` | SWE-bench Verified Mini data and benchmark notes. |
-| `docs/research/` | Research notes and milestone verification docs. |
-| `docs/superpowers/specs/` | Product and architecture specs. |
+| `docs/human/` | Evergreen guides for contributors and operators. |
+| `docs/agents/` | Source-backed agent wiki and machine-readable topic map. |
+| `docs/research/` | Dated research and milestone verification records. |
+| `docs/superpowers/` | Historical product specs and implementation plans. |
 | `dev.sh` | Local development, smoke, and app-launch helper. |
 
 ## Development Notes
@@ -266,6 +292,13 @@ Run this before opening a PR:
 
 ```sh
 ./dev.sh check
+```
+
+Documentation-specific tools:
+
+```sh
+pnpm docs:check
+pnpm docs:query -- orchestration review
 ```
 
 Useful package-level loops:
@@ -299,6 +332,11 @@ credentials are missing.
 
 ## Further Reading
 
+- [Documentation home](docs/README.md)
+- [Human guides](docs/human/README.md)
+- [Agent wiki](docs/agents/README.md)
+- [Evidence-driven harness PRD](docs/superpowers/specs/2026-07-12-evidence-driven-harness-prd.md)
+- [Harness economics, model mix, caching, and the owned loop](docs/research/2026-07-12-harness-economics-model-mix-caching-and-owned-loop.md)
 - [Harness fusion app design](docs/superpowers/specs/2026-07-03-harness-fusion-app-design.md)
 - [Harness team cockpit design](docs/superpowers/specs/2026-07-06-harness-team-cockpit-design.md)
 - [Project Card design](docs/superpowers/specs/2026-07-08-wiki-project-card-design.md)

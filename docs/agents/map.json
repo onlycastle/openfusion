@@ -1,0 +1,111 @@
+{
+  "schemaVersion": 1,
+  "updatedAt": "2026-07-12",
+  "description": "Source-backed retrieval map for the committed OpenFusion agent wiki.",
+  "topics": [
+    {
+      "id": "knowledge-base",
+      "title": "Repository LLM knowledge base",
+      "doc": "docs/agents/README.md",
+      "summary": "Karpathy-style layers, retrieval, ingest, lint, symbol refresh, promotion, and maintenance logging.",
+      "keywords": ["knowledge base", "knowledge_base", "llm wiki", "karpathy", "ingest", "query", "lint", "index", "log", "documentation"],
+      "source_paths": ["AGENTS.md", "docs/knowledge_base/README.md", "docs/knowledge_base/index.md", "docs/knowledge_base/log.md", "scripts/check-docs.mjs"]
+    },
+    {
+      "id": "product-vision",
+      "title": "Product requirements and evidence-driven harness strategy",
+      "doc": "docs/agents/product-vision.md",
+      "summary": "Own the project-specific evaluation and execution loop, qualify complete model-harness routes, and keep models replaceable.",
+      "keywords": ["vision", "strategy", "prd", "product requirements", "own the loop", "own harness", "evaluation loop", "universal runtime", "multi-model", "model mix", "cache-aware routing", "accepted result", "harness A/B", "scout reviewer", "self evolution", "provider-neutral", "Claude Code", "Codex", "worker model", "tool gateway", "context", "delegation"],
+      "source_paths": ["README.md", "docs/human/product-vision.md", "docs/superpowers/specs/2026-07-12-evidence-driven-harness-prd.md", "docs/research/2026-07-12-harness-economics-model-mix-caching-and-owned-loop.md", "packages/engine/src/engines/types.ts", "packages/engine/src/models/gateway.ts", "packages/engine/src/models/catalog.ts", "packages/engine/src/runtime/context-compiler.ts", "packages/engine/src/runtime/context.ts", "packages/engine/src/runtime/evidence.ts", "packages/engine/src/evals/experiment.ts", "packages/engine/src/orchestrate/orchestrate.ts"]
+    },
+    {
+      "id": "project-map",
+      "title": "Repository project map",
+      "doc": "docs/agents/project-map.md",
+      "summary": "Package ownership, directory responsibilities, and primary entry points.",
+      "keywords": ["repository", "package", "directory", "entry point", "ownership", "where"],
+      "source_paths": ["package.json", "pnpm-workspace.yaml"]
+    },
+    {
+      "id": "architecture",
+      "title": "System architecture",
+      "doc": "docs/agents/architecture.md",
+      "summary": "Process boundaries, run ownership, native containment, storage, trust, and shutdown ordering.",
+      "keywords": ["architecture", "process", "tauri", "rpc", "ndjson", "sidecar", "shutdown", "storage", "sandbox", "supervisor"],
+      "source_paths": ["apps/desktop/src-tauri/src/engine_bridge.rs", "packages/engine/src/engine.ts", "packages/engine/src/runtime/supervisor.ts", "native/sandbox-runner/src/main.rs"]
+    },
+    {
+      "id": "workflows",
+      "title": "Runtime workflows",
+      "doc": "docs/agents/workflows.md",
+      "summary": "Project readiness, immutable snapshots, candidate verification, approval-bound Apply, cancellation, health, and experiments.",
+      "keywords": ["workflow", "project", "task", "snapshot", "candidate", "approval grant", "apply", "cancel", "health", "experiment", "readiness"],
+      "source_paths": ["apps/desktop/src/screens/OrchestrateScreen.tsx", "packages/engine/src/models/gateway.ts", "packages/engine/src/tools/gateway.ts", "packages/engine/src/runtime/context-compiler.ts", "packages/engine/src/runtime/snapshot.ts", "packages/engine/src/worker/methods.ts", "packages/engine/src/wiki/store.ts", "packages/engine/src/candidates/service.ts", "packages/engine/src/evals/experiment.ts"]
+    },
+    {
+      "id": "conventions",
+      "title": "Engineering conventions",
+      "doc": "docs/agents/conventions.md",
+      "summary": "Transport, privacy, immutable identity, containment, verification, cost, persistence, and documentation invariants.",
+      "keywords": ["convention", "invariant", "logging", "secret", "validation", "snapshot", "sandbox", "stage report", "cost", "generation"],
+      "source_paths": ["packages/shared/src/contracts.ts", "packages/engine/src/harness/registry.ts", "packages/engine/src/runtime/sandbox.ts", "packages/engine/src/candidates/service.ts"]
+    },
+    {
+      "id": "testing",
+      "title": "Verification matrix",
+      "doc": "docs/agents/testing.md",
+      "summary": "Focused TypeScript loops, native sandbox tests, desktop Rust tests, full checks, staged sidecars, and opt-in live smokes.",
+      "keywords": ["test", "build", "typecheck", "ci", "smoke", "sidecar", "sandbox", "rust", "verify", "command"],
+      "source_paths": ["dev.sh", "native/sandbox-runner/Cargo.toml", "apps/desktop/scripts/stage-sandbox-runner.mjs", ".github/workflows/ci.yml"]
+    },
+    {
+      "id": "desktop",
+      "title": "Desktop subsystem",
+      "doc": "docs/agents/subsystems/desktop.md",
+      "summary": "React workspace, candidate Apply, runtime settings, Keychain secrets, project state, and bridge lifecycle.",
+      "keywords": ["desktop", "react", "ui", "candidate", "approval", "settings", "project", "keychain", "rust", "tauri", "engineclient"],
+      "source_paths": ["apps/desktop/src/App.tsx", "apps/desktop/src/screens/OrchestrateScreen.tsx", "apps/desktop/src-tauri/src/lib.rs"]
+    },
+    {
+      "id": "engine-rpc",
+      "title": "Engine and RPC subsystem",
+      "doc": "docs/agents/subsystems/engine.md",
+      "summary": "Typed services, bounded transport/admission, runtime capabilities, journals, cancellation, and ordered shutdown.",
+      "keywords": ["engine", "rpc", "dispatcher", "stdio", "notification", "provider gateway", "busy", "backpressure", "supervisor", "journal", "shutdown"],
+      "source_paths": ["packages/engine/src/engine.ts", "packages/engine/src/models/gateway.ts", "packages/engine/src/orchestrate/orchestrate.ts", "packages/engine/src/worker/methods.ts", "packages/engine/src/rpc/stdio.ts", "packages/engine/src/rpc/writer.ts", "packages/engine/src/runtime/supervisor.ts"]
+    },
+    {
+      "id": "universal-runtime",
+      "title": "Universal runtime subsystem",
+      "doc": "docs/agents/subsystems/runtime.md",
+      "summary": "SQLite sessions, encrypted traces and artifacts, approvals, recovery, context, policy, sandbox, extensions, children, and deterministic evidence routing.",
+      "keywords": ["runtime", "session", "sqlite", "wal", "trace", "encryption", "artifact", "approval", "recovery", "checkpoint", "policy", "sandbox", "hook", "skill", "mcp", "child", "subagent", "evidence", "routing-v3", "rollback"],
+      "source_paths": ["packages/shared/src/contracts.ts", "packages/engine/src/runtime/store.ts", "packages/engine/src/runtime/service.ts", "packages/engine/src/runtime/context.ts", "packages/engine/src/runtime/context-compiler.ts", "packages/engine/src/runtime/children.ts", "packages/engine/src/runtime/evidence.ts", "packages/engine/src/tools/gateway.ts", "packages/engine/src/worker/methods.ts"]
+    },
+    {
+      "id": "wiki-harness",
+      "title": "Wiki and harness subsystem",
+      "doc": "docs/agents/subsystems/wiki-harness.md",
+      "summary": "Commit-pinned wiki retrieval, authenticated MCP, ToolSpec projection, fingerprints, health, and immutable harness generations.",
+      "keywords": ["wiki", "symbol", "fts5", "task query", "mcp", "bearer token", "toolspec", "harness", "generation", "current.json", "fingerprint", "project card", "health"],
+      "source_paths": ["packages/engine/src/wiki/indexer.ts", "packages/engine/src/wiki/store.ts", "packages/engine/src/wiki/mcp.ts", "packages/engine/src/worker/methods.ts", "packages/engine/src/tools/registry.ts", "packages/engine/src/tools/gateway.ts", "packages/engine/src/harness/store.ts", "packages/engine/src/harness/fingerprint.ts"]
+    },
+    {
+      "id": "orchestration",
+      "title": "Orchestration subsystem",
+      "doc": "docs/agents/subsystems/orchestration.md",
+      "summary": "Snapshot-pinned routing, sandboxed authoring, exact candidate verification/review, truthful cost, and approval-bound Apply.",
+      "keywords": ["orchestrate", "route", "worker", "worktree", "sandbox", "review", "verify", "candidate", "approval grant", "apply", "cost estimate"],
+      "source_paths": ["packages/engine/src/orchestrate/orchestrate.ts", "packages/engine/src/tools/gateway.ts", "packages/engine/src/worker/worktree.ts", "packages/engine/src/runtime/sandbox.ts", "packages/engine/src/candidates/service.ts"]
+    },
+    {
+      "id": "evaluations",
+      "title": "System benchmarks subsystem",
+      "doc": "docs/agents/subsystems/evaluations.md",
+      "summary": "Historical snapshots, paired wiki parity, protected sandboxed oracles, durable repeated trials, intervals, and promotion gates.",
+      "keywords": ["eval", "evaluation", "experiment", "baseline", "oracle", "sandbox", "pass@k", "bootstrap", "interval", "promotion", "golden commit"],
+      "source_paths": ["packages/engine/src/evals/run.ts", "packages/engine/src/evals/experiment.ts", "packages/engine/src/runtime/evidence.ts"]
+    }
+  ]
+}
