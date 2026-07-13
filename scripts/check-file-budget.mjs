@@ -48,5 +48,8 @@ if (process.argv[1] === __filename) {
       process.exit(1);
     }
     console.log("file budget: ok");
+  } else {
+    console.error(`unknown mode: ${mode} (expected --check or --rebase)`);
+    process.exit(2);
   }
 }
