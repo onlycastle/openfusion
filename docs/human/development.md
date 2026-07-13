@@ -62,6 +62,16 @@ workspace TypeScript tests on Node 22. The macOS-native containment and Tauri
 host suites remain part of the local `./dev.sh check` workflow when the CI job
 does not provide the required macOS backend.
 
+### Architecture guardrails
+
+`pnpm arch:check` runs in CI: dependency-cruiser boundary rules
+(`.dependency-cruiser.cjs` — layer direction, no cross-module deep imports)
+and a file-size ratchet (`scripts/check-file-budget.mjs` — grandfathered
+files may shrink but never grow; new files are capped at 400 lines).
+Baselines only ever shrink: `pnpm arch:budget:rebase` locks in gains after a
+file split — it must never be used to raise a limit. Rules and rationale:
+`docs/superpowers/specs/2026-07-13-clean-architecture-design.md` (§3, §11).
+
 ## Change discipline
 
 - Prefer package-level tests while iterating, then run `./dev.sh check`.
