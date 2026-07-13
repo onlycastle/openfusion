@@ -7,7 +7,9 @@ const path = require("node:path");
 const APPLICATION = "^packages/engine/src/(orchestrate|evals|candidates)/";
 const MODULES = "^packages/engine/src/(worker|harness|wiki|models|engines|runs|verification|runtime)/";
 const TRANSPORT = "^packages/engine/src/rpc/";
-const FOUNDATION = "^packages/(engine/src/(util|tools)/|shared/)";
+// models/catalog.ts + pricing.ts are foundation-tier data tables (spec §3); models/meter.ts
+// (CostMeter) is deliberately excluded — it is stateful, not side-effect-free data.
+const FOUNDATION = "^packages/(engine/src/(util|tools)/|engine/src/models/(catalog|pricing)\\.ts$|shared/)";
 
 module.exports = {
   forbidden: [

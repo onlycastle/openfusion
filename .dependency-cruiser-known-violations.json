@@ -2355,20 +2355,6 @@
   {
     "type": "dependency",
     "from": "packages/engine/src/evals/run.ts",
-    "to": "packages/engine/src/models/catalog.ts",
-    "unresolvedTo": "../models/catalog.js",
-    "dependencyTypes": [
-      "local",
-      "import"
-    ],
-    "rule": {
-      "severity": "error",
-      "name": "no-cross-module-deep-imports"
-    }
-  },
-  {
-    "type": "dependency",
-    "from": "packages/engine/src/evals/run.ts",
     "to": "packages/engine/src/models/meter.ts",
     "unresolvedTo": "../models/meter.js",
     "dependencyTypes": [
@@ -2500,51 +2486,9 @@
   },
   {
     "type": "dependency",
-    "from": "packages/engine/src/harness/fingerprint.ts",
-    "to": "packages/engine/src/models/catalog.ts",
-    "unresolvedTo": "../models/catalog.js",
-    "dependencyTypes": [
-      "local",
-      "import"
-    ],
-    "rule": {
-      "severity": "error",
-      "name": "no-cross-module-deep-imports"
-    }
-  },
-  {
-    "type": "dependency",
     "from": "packages/engine/src/harness/generate.ts",
     "to": "packages/engine/src/engines/selection.ts",
     "unresolvedTo": "../engines/selection.js",
-    "dependencyTypes": [
-      "local",
-      "import"
-    ],
-    "rule": {
-      "severity": "error",
-      "name": "no-cross-module-deep-imports"
-    }
-  },
-  {
-    "type": "dependency",
-    "from": "packages/engine/src/harness/generate.ts",
-    "to": "packages/engine/src/models/catalog.ts",
-    "unresolvedTo": "../models/catalog.js",
-    "dependencyTypes": [
-      "local",
-      "import"
-    ],
-    "rule": {
-      "severity": "error",
-      "name": "no-cross-module-deep-imports"
-    }
-  },
-  {
-    "type": "dependency",
-    "from": "packages/engine/src/harness/generate.ts",
-    "to": "packages/engine/src/models/pricing.ts",
-    "unresolvedTo": "../models/pricing.js",
     "dependencyTypes": [
       "local",
       "import"
@@ -2642,20 +2586,6 @@
   {
     "type": "dependency",
     "from": "packages/engine/src/harness/methods.ts",
-    "to": "packages/engine/src/models/catalog.ts",
-    "unresolvedTo": "../models/catalog.js",
-    "dependencyTypes": [
-      "local",
-      "import"
-    ],
-    "rule": {
-      "severity": "error",
-      "name": "no-cross-module-deep-imports"
-    }
-  },
-  {
-    "type": "dependency",
-    "from": "packages/engine/src/harness/methods.ts",
     "to": "packages/engine/src/runs/ledger.ts",
     "unresolvedTo": "../runs/ledger.js",
     "dependencyTypes": [
@@ -2672,34 +2602,6 @@
     "from": "packages/engine/src/harness/schema.ts",
     "to": "packages/engine/src/engines/selection.ts",
     "unresolvedTo": "../engines/selection.js",
-    "dependencyTypes": [
-      "local",
-      "import"
-    ],
-    "rule": {
-      "severity": "error",
-      "name": "no-cross-module-deep-imports"
-    }
-  },
-  {
-    "type": "dependency",
-    "from": "packages/engine/src/harness/schema.ts",
-    "to": "packages/engine/src/models/catalog.ts",
-    "unresolvedTo": "../models/catalog.js",
-    "dependencyTypes": [
-      "local",
-      "import"
-    ],
-    "rule": {
-      "severity": "error",
-      "name": "no-cross-module-deep-imports"
-    }
-  },
-  {
-    "type": "dependency",
-    "from": "packages/engine/src/harness/upgrade.ts",
-    "to": "packages/engine/src/models/catalog.ts",
-    "unresolvedTo": "../models/catalog.js",
     "dependencyTypes": [
       "local",
       "import"
@@ -2986,20 +2888,6 @@
   {
     "type": "dependency",
     "from": "packages/engine/src/orchestrate/routing.ts",
-    "to": "packages/engine/src/models/catalog.ts",
-    "unresolvedTo": "../models/catalog.js",
-    "dependencyTypes": [
-      "local",
-      "import"
-    ],
-    "rule": {
-      "severity": "error",
-      "name": "no-cross-module-deep-imports"
-    }
-  },
-  {
-    "type": "dependency",
-    "from": "packages/engine/src/orchestrate/routing.ts",
     "to": "packages/engine/src/models/providers.ts",
     "unresolvedTo": "../models/providers.js",
     "dependencyTypes": [
@@ -3268,20 +3156,6 @@
   {
     "type": "dependency",
     "from": "packages/engine/src/worker/loop.ts",
-    "to": "packages/engine/src/models/pricing.ts",
-    "unresolvedTo": "../models/pricing.js",
-    "dependencyTypes": [
-      "local",
-      "import"
-    ],
-    "rule": {
-      "severity": "error",
-      "name": "no-cross-module-deep-imports"
-    }
-  },
-  {
-    "type": "dependency",
-    "from": "packages/engine/src/worker/loop.ts",
     "to": "packages/engine/src/runtime/context.ts",
     "unresolvedTo": "../runtime/context.js",
     "dependencyTypes": [
@@ -3313,34 +3187,6 @@
     "from": "packages/engine/src/worker/methods.ts",
     "to": "packages/engine/src/harness/store.ts",
     "unresolvedTo": "../harness/store.js",
-    "dependencyTypes": [
-      "local",
-      "import"
-    ],
-    "rule": {
-      "severity": "error",
-      "name": "no-cross-module-deep-imports"
-    }
-  },
-  {
-    "type": "dependency",
-    "from": "packages/engine/src/worker/methods.ts",
-    "to": "packages/engine/src/models/catalog.ts",
-    "unresolvedTo": "../models/catalog.js",
-    "dependencyTypes": [
-      "local",
-      "import"
-    ],
-    "rule": {
-      "severity": "error",
-      "name": "no-cross-module-deep-imports"
-    }
-  },
-  {
-    "type": "dependency",
-    "from": "packages/engine/src/worker/methods.ts",
-    "to": "packages/engine/src/models/pricing.ts",
-    "unresolvedTo": "../models/pricing.js",
     "dependencyTypes": [
       "local",
       "import"
@@ -3567,20 +3413,6 @@
     "from": "packages/engine/src/worker/methods.ts",
     "to": "packages/engine/src/wiki/store.ts",
     "unresolvedTo": "../wiki/store.js",
-    "dependencyTypes": [
-      "local",
-      "import"
-    ],
-    "rule": {
-      "severity": "error",
-      "name": "no-cross-module-deep-imports"
-    }
-  },
-  {
-    "type": "dependency",
-    "from": "packages/engine/src/worker/runtime.ts",
-    "to": "packages/engine/src/models/catalog.ts",
-    "unresolvedTo": "../models/catalog.js",
     "dependencyTypes": [
       "local",
       "import"
