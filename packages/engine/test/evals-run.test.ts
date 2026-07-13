@@ -188,6 +188,8 @@ interface FakeEvalsFrontierOptions {
   harnessCostUsd?: number | null;
   meter?: CostMeter;
   sourceFile?: string;
+  /** Every review call's verdict (both baseline's own review and the harness's). Defaults to "approve". */
+  reviewDecision?: "approve" | "request-changes";
 }
 
 // One fake frontier adapter serves BOTH roles this suite needs:
@@ -220,9 +222,14 @@ function makeFakeEvalsFrontierAdapter(opts: FakeEvalsFrontierOptions): FrontierA
         prompt(_text: string, _promptOpts?: { timeoutMs?: number }): FrontierPromptHandle {
           async function* gen(): AsyncGenerator<FrontierEvent> {
             if (isReview) {
+              const decision = opts.reviewDecision ?? "approve";
               yield {
                 type: "text",
-                text: "```json\n" + JSON.stringify({ decision: "approve", reasons: [], severity: "none" }) + "\n```",
+                text: "```json\n" + JSON.stringify({
+                  decision,
+                  reasons: decision === "approve" ? [] : ["fixture: reviewer rejects every diff"],
+                  severity: decision === "approve" ? "none" : "major",
+                }) + "\n```",
               };
             } else {
               writeFileSync(path.join(projectDir, sourceFile), correct ? CORRECT_SOURCE : WRONG_SOURCE);
@@ -812,6 +819,42 @@ describe("runEvals — ETH hazard", () => {
     // below baseline is an automatic "fail" -- savingsPct is never allowed
     // to paper over an ETH hazard.
     expect(report.verdict).toBe("fail");
+    expect(loadHarness(dir)?.manifest.verification.evals).toBe("pending");
+  });
+});
+
+describe("runEvals — reviewer-rejected non-empty harness diff is a quality failure, not a measurement error (final review Fix 1)", () => {
+  it("harness escalation produces a real diff the reviewer rejects -> harnessOutcome 'failed' (not 'error'), included in the clean subset", async () => {
+    dir = await makeHarnessFixture();
+    engine = createTestEngine();
+    engine.frontier.registerAdapter(
+      makeFakeEvalsFrontierAdapter({
+        baselineCorrect: true,
+        harnessCorrect: true,
+        reviewDecision: "request-changes", // every review (baseline's own + harness's) rejects
+        baselineCostUsd: 0.5,
+        harnessCostUsd: 0.05,
+        meter: engine.models.meter,
+      }),
+    );
+
+    const tasks: EvalTask[] = [synthEvalTask({ id: "t1" }), synthEvalTask({ id: "t2" })];
+    const report = await runEvals(engine, { projectDir: dir, tasks });
+
+    // Both arms wrote a real fix, then review rejected it -- oracle sees the
+    // ORIGINAL unfinished source on both sides, so both genuinely fail. This
+    // is real quality evidence (candidateRef stays null only because review
+    // rejected, not because of an infra/verification hiccup).
+    expect(report.baseline.passed).toBe(0);
+    expect(report.harness.passed).toBe(0);
+    expect(report.perTask.every((t) => t.harnessOutcome === "failed")).toBe(true);
+    expect(report.perTask.every((t) => t.baselineOutcome === "completed")).toBe(true);
+    // THE FIX: a reviewer-rejected non-empty diff must count as quality
+    // evidence -- never excluded from the clean subset as a measurement
+    // "error" (verdict.ts's isHarnessMeasurementFailure).
+    expect(report.measurementFailureCount).toBe(0);
+    expect(report.cleanTaskCount).toBe(report.taskCount);
+    expect(report.cleanHarnessPassed).toBe(0);
     expect(loadHarness(dir)?.manifest.verification.evals).toBe("pending");
   });
 });

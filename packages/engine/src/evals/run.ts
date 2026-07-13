@@ -121,8 +121,7 @@ export interface EvalsRunParams {
 // produced but didn't apply onto harnessDir — see engine.orchestrate.apply)
 // and "error" (engine.orchestrate itself threw — an infra hiccup on ONE task
 // must not abort the whole report card; see runHarnessTask below). BOTH are
-// MEASUREMENT failures, never quality evidence — see this module's header
-// comment and the verdict computation in runEvals.
+// MEASUREMENT failures, never quality evidence — see the verdict computation in runEvals.
 export type HarnessTaskOutcome = OrchestrateResult["outcome"] | "apply-failed" | "error";
 
 // The baseline side's per-task outcome — symmetric with HarnessTaskOutcome
@@ -579,20 +578,12 @@ async function runBaselineTask(
 // loop below) so that bundle stays untracked in this commit either way —
 // nothing downstream needs it committed (see this module's header comment).
 //
-// M2 (final review — cheap footgun): the "already a repo" probe checks for
-// `dir`'s OWN `.git` entry (a directory for a plain repo, or the "gitdir:
-// <path>" file `git worktree add`/task.setup()'s own history-strip mechanism
-// can leave behind) rather than shelling out to `git -C dir rev-parse
-// --is-inside-work-tree`. That command answers "is ANY ancestor of dir a git
-// repo", not "is dir ITSELF a repo root" — a false positive if the eval
-// scratch tmp root (`os.tmpdir()`, mkdtemp'd by the caller) ever happened to
-// be nested inside a git repo (e.g. a CI runner whose $TMPDIR lives under a
-// checkout) would wrongly conclude `dir` is already a repo and skip `git
-// init` here, silently anchoring every subsequent git operation this
-// pipeline runs against `dir` (requireGitRepo, WorktreeManager's `git
-// worktree add ... HEAD`, `git apply --3way`) to that OUTER repo instead of
-// a fresh one rooted at `dir`. Checking for `dir`'s own `.git` path has no
-// such ambiguity: it is only ever true when `dir` itself is a repo root.
+// M2 (final review — cheap footgun): checks for `dir`'s OWN `.git` entry
+// rather than `git -C dir rev-parse --is-inside-work-tree`, which answers "is
+// any ANCESTOR of dir a git repo" -- a false positive if the eval scratch tmp
+// root were ever nested inside an outer repo would silently anchor every
+// subsequent git op here (requireGitRepo, `git worktree add`, `git apply
+// --3way`) to that OUTER repo instead of a fresh one rooted at `dir`.
 async function initEvalGitRepo(dir: string): Promise<void> {
   if (existsSync(path.join(dir, ".git"))) {
     // Already a git repo (task.setup() itself initialized one) — nothing
@@ -703,8 +694,7 @@ async function runHarnessTask(
     // going. See HarnessTaskOutcome's own doc comment: this is a MEASUREMENT
     // failure, not quality evidence — the verdict computation in runEvals
     // must not treat it the same as a genuinely-produced-but-worse fix.
-    // Host-private orchestration/candidate worktrees have their own cleanup;
-    // the scratch repository is removed separately in the outer finally.
+    // Host-private worktrees clean up on their own; the scratch repo is removed separately, in the outer finally.
     engine.log("evals.run: harness orchestration failed");
     return { passed: false, costUsd: null, outcome: "error" };
   }
@@ -732,8 +722,18 @@ async function runHarnessTask(
   }
 
   if (result.candidateRef === null) {
-    engine.log("evals.run: harness candidate verification was incomplete");
-    return { passed: false, costUsd: result.cost.totalUsd, outcome: "error", telemetry };
+    if (result.verificationIncomplete) {
+      engine.log("evals.run: harness candidate verification was incomplete");
+      return { passed: false, costUsd: result.cost.totalUsd, outcome: "error", telemetry };
+    }
+    // Reviewer rejected a real diff -- quality evidence (final review Fix 1).
+    const oracle = await runTaskOracle(engine, runtimeStore, harnessDir, task, opts.abortSignal);
+    return {
+      passed: oracle.passed,
+      costUsd: result.cost.totalUsd,
+      outcome: oracle.measurementFailure ? "error" : result.outcome,
+      telemetry: { ...telemetry, policyViolation: telemetry.policyViolation || oracle.policyViolation },
+    };
   }
 
   try {
