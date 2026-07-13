@@ -57,8 +57,10 @@ import fs from "node:fs";
 import path from "node:path";
 import { query } from "@anthropic-ai/claude-agent-sdk";
 import type { ModelUsage, Query, SDKAssistantMessageError } from "@anthropic-ai/claude-agent-sdk";
+import { frontierMcpAllowedTools } from "../tools/projections.js";
+import { runtimeCapabilities } from "../runtime/capabilities.js";
 import { canonicalizePath, isPathContained } from "./path-scope.js";
-import type { FrontierAdapter, FrontierEvent, FrontierPromptHandle, FrontierSession } from "./types.js";
+import type { FrontierAdapter, FrontierEvent, FrontierModel, FrontierPromptHandle, FrontierSession } from "./types.js";
 
 const CLAUDE_CODE_KIND = "claude-code";
 
@@ -67,7 +69,10 @@ const CLAUDE_CODE_KIND = "claude-code";
 // tool name doesn't scope its flags — that residual write capability
 // breaches the read-only v1 posture below just as surely as an unscoped
 // Bash entry would.
-const READ_ONLY_ALLOWED_TOOLS = ["Read", "Grep", "Glob", "mcp__wiki__wiki_query", "mcp__wiki__wiki_map"];
+// Built-in filesystem tools cannot yet be forced through OpenFusion's native
+// path policy. Until a certified sandbox wrapper owns the runtime process,
+// reviewers and generators receive only the committed-snapshot wiki tools.
+const READ_ONLY_ALLOWED_TOOLS = [...frontierMcpAllowedTools("wiki")];
 
 // The write-capable tools canUseTool may allow when writeScope is set.
 // MultiEdit has no interface of its own in this SDK version's sdk-tools.d.ts
@@ -179,8 +184,64 @@ export function createClaudeAdapter(options: CreateClaudeAdapterOptions = {}): F
 
   return {
     kind: CLAUDE_CODE_KIND,
+    capabilities: () => runtimeCapabilities({
+      runtimeId: CLAUDE_CODE_KIND,
+      runtimeVersion: "0.3.198",
+      protocolVersion: "claude-agent-sdk-v1",
+      structuredOutput: true,
+      toolCalls: true,
+      pathAwareApprovals: true,
+      mcp: true,
+      resume: true,
+      fork: false,
+      compaction: true,
+      sandboxCompatibility: "unsupported",
+    }),
 
-    async createSession({ projectDir, wikiMcpUrl, log, toolPolicy, resultLabel }): Promise<FrontierSession> {
+    async listModels(): Promise<FrontierModel[]> {
+      const abortController = new AbortController();
+      async function* idleInput(): AsyncGenerator<never, void, unknown> {
+        await new Promise<void>((resolve) => {
+          abortController.signal.addEventListener("abort", () => resolve(), { once: true });
+        });
+      }
+      const q = queryFn({
+        prompt: idleInput(),
+        options: {
+          cwd: process.cwd(),
+          abortController,
+          permissionMode: "dontAsk",
+          allowedTools: [],
+        },
+      });
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        const timeout = new Promise<never>((_resolve, reject) => {
+          timer = setTimeout(() => reject(new Error("Claude model discovery timed out")), 15_000);
+        });
+        const models = await Promise.race([q.supportedModels(), timeout]);
+        return models.map((model) => ({
+          id: model.value,
+          displayName: model.displayName,
+          description: model.description,
+          isDefault: model.value === "default",
+        }));
+      } finally {
+        clearTimeout(timer);
+        abortController.abort();
+        q.close();
+      }
+    },
+
+    async createSession({
+      projectDir,
+      wikiMcpUrl,
+      wikiMcpBearerToken,
+      log,
+      model,
+      toolPolicy,
+      resultLabel,
+    }): Promise<FrontierSession> {
       const id = randomUUID();
       let resumeSessionId: string | null = null;
       let activeQuery: Query | null = null;
@@ -281,8 +342,22 @@ export function createClaudeAdapter(options: CreateClaudeAdapterOptions = {}): F
             prompt: text,
             options: {
               cwd: projectDir,
+              ...(model !== undefined ? { model } : {}),
+              ...(opts?.outputSchema !== undefined
+                ? { outputFormat: { type: "json_schema" as const, schema: opts.outputSchema } }
+                : {}),
               resume: resumeSessionId ?? undefined,
-              mcpServers: wikiMcpUrl !== null ? { wiki: { type: "http", url: wikiMcpUrl } } : undefined,
+              mcpServers: wikiMcpUrl !== null
+                ? {
+                    wiki: {
+                      type: "http",
+                      url: wikiMcpUrl,
+                      ...(wikiMcpBearerToken === undefined
+                        ? {}
+                        : { headers: { Authorization: `Bearer ${wikiMcpBearerToken}` } }),
+                    },
+                  }
+                : undefined,
               allowedTools: READ_ONLY_ALLOWED_TOOLS,
               permissionMode: "default",
               abortController,
@@ -454,6 +529,9 @@ export function createClaudeAdapter(options: CreateClaudeAdapterOptions = {}): F
                     numTurns: message.num_turns,
                     durationMs: message.duration_ms,
                     engineSessionId: message.session_id,
+                    ...(message.subtype === "success" && message.structured_output !== undefined
+                      ? { structuredOutput: message.structured_output }
+                      : {}),
                   };
                   onResult?.(resultEvent, dominantModel(message.modelUsage), resultLabel);
                   yield resultEvent;

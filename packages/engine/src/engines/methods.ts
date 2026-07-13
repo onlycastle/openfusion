@@ -10,6 +10,7 @@ import { requireGitRepo } from "../rpc/guards.js";
 import { wikiDbPath } from "../wiki/store.js";
 import type { UsageSource } from "../models/meter.js";
 import { createClaudeAdapter } from "./claude.js";
+import { createCodexAdapter } from "./codex.js";
 import { isPathContained } from "./path-scope.js";
 import type {
   FrontierAdapter,
@@ -119,6 +120,7 @@ export class FrontierService {
   #sessions = new Map<string, SessionEntry>();
   #inFlight = new Set<string>();
   #activeHandles = new Map<string, FrontierPromptHandle>();
+  #closing = new WeakMap<FrontierSession, Promise<void>>();
   // M6 Task 1 (eval-batch safety gate): EVERY live frontier session this
   // service knows about, regardless of whether it's addressable via an
   // engine.frontier.start sessionId (#sessions above) or was created
@@ -144,6 +146,10 @@ export class FrontierService {
     return this.#adapters.get(kind);
   }
 
+  adapters(): FrontierAdapter[] {
+    return [...this.#adapters.values()];
+  }
+
   // Registers ANY live FrontierSession for close()-time reachability,
   // independent of whether it ever gets an RPC-addressable sessionId (see
   // #tracked's own doc comment above). Returns an untrack fn the caller MUST
@@ -158,6 +164,18 @@ export class FrontierService {
     return () => {
       this.#tracked.delete(session);
     };
+  }
+
+  /** Close a session at most once, including owner/shutdown races. */
+  closeSession(session: FrontierSession, options: { untrack?: boolean } = {}): Promise<void> {
+    if (options.untrack !== false) this.#tracked.delete(session);
+    const existing = this.#closing.get(session);
+    if (existing !== undefined) return existing;
+    const closing = Promise.resolve()
+      .then(() => session.close())
+      .catch(() => undefined);
+    this.#closing.set(session, closing);
+    return closing;
   }
 
   // Testability + operational visibility: how many sessions are currently
@@ -228,14 +246,7 @@ export class FrontierService {
     const activeHandle = this.#activeHandles.get(sessionId);
     this.#activeHandles.delete(sessionId);
     activeHandle?.abort();
-    try {
-      await entry.session.close();
-    } catch {
-      // Best-effort, mirrors close()'s per-session isolation below: the
-      // session entry is already deleted from our bookkeeping above, so a
-      // throwing adapter close() must not turn engine.frontier.stop into an
-      // RPC error — the caller only cares that the session is gone.
-    }
+    await this.closeSession(entry.session);
     return true;
   }
 
@@ -270,9 +281,7 @@ export class FrontierService {
     const addressableSessions = new Set([...this.#sessions.values()].map((entry) => entry.session));
     for (const session of this.#tracked) {
       if (addressableSessions.has(session)) continue;
-      session.close().catch(() => {
-        // Best-effort, same per-session isolation as close()'s own sweep.
-      });
+      void this.closeSession(session, { untrack: false });
     }
   }
 
@@ -284,15 +293,7 @@ export class FrontierService {
       const activeHandle = this.#activeHandles.get(sessionId);
       this.#activeHandles.delete(sessionId);
       activeHandle?.abort();
-      try {
-        await entry.session.close();
-      } catch {
-        // Best-effort: one session failing to close must not abort
-        // shutdown of the rest, and — since Engine.close awaits
-        // frontier.close() before wiki.close() — must not skip wiki
-        // teardown either. Mirrors WikiService.close()'s per-resource
-        // isolation.
-      }
+      await this.closeSession(entry.session);
     }
     // M6 Task 1: sweep any sessions tracked directly via track() that were
     // NOT addressable through #sessions above — harness generation and
@@ -305,11 +306,7 @@ export class FrontierService {
     // in-process caller is still awaiting that session's current prompt().
     for (const session of [...this.#tracked]) {
       this.#tracked.delete(session);
-      try {
-        await session.close();
-      } catch {
-        // Best-effort, same per-session isolation as the sweep above.
-      }
+      await this.closeSession(session);
     }
   }
 }
@@ -327,7 +324,7 @@ export function registerFrontierMethods(engine: Engine): void {
   engine.frontier.registerAdapter(
     createClaudeAdapter({
       onResult: (result, model, resultLabel) => {
-        engine.models.meter.record({
+        engine.providerGateway.recordUsage({
           providerId: "claude-code",
           kind: "frontier-claude",
           model,
@@ -360,6 +357,58 @@ export function registerFrontierMethods(engine: Engine): void {
       },
     }),
   );
+
+  engine.frontier.registerAdapter(
+    createCodexAdapter({
+      onResult: (result, model, resultLabel) => {
+        engine.providerGateway.recordUsage({
+          providerId: "codex",
+          kind: "frontier-openai",
+          model,
+          usage: result.usage,
+          costUsd: result.costUsd,
+          at: Date.now(),
+          source: mapResultLabelToSource(resultLabel),
+          // Codex app-server currently reports token usage but not a billed
+          // dollar amount for ChatGPT subscription turns.
+          pricingConfidence: result.costUsd !== null ? "provider-reported" : "unpriced",
+        });
+      },
+    }),
+  );
+
+  registerMethod(engine.dispatcher, "engine.frontier.models", EmptyParamsSchema, async () => {
+    const models: Array<{
+      engine: string;
+      id: string;
+      displayName: string;
+      description: string;
+      isDefault: boolean;
+    }> = [];
+    const unavailable: Array<{ engine: string; message: string }> = [];
+    await Promise.all(
+      engine.frontier.adapters().map(async (adapter) => {
+        if (adapter.listModels === undefined) return;
+        try {
+          const listed = await adapter.listModels();
+          models.push(...listed.map((model) => ({ engine: adapter.kind, ...model })));
+        } catch (err) {
+          unavailable.push({
+            engine: adapter.kind,
+            message: err instanceof Error ? err.message : String(err),
+          });
+        }
+      }),
+    );
+    models.sort((a, b) => {
+      const engineOrder = a.engine.localeCompare(b.engine);
+      if (engineOrder !== 0) return engineOrder;
+      if (a.isDefault !== b.isDefault) return a.isDefault ? -1 : 1;
+      return a.displayName.localeCompare(b.displayName);
+    });
+    unavailable.sort((a, b) => a.engine.localeCompare(b.engine));
+    return { models, unavailable };
+  });
 
   registerMethod(engine.dispatcher, "engine.frontier.start", StartParamsSchema, async (params) => {
     const { projectDir } = params;
@@ -399,19 +448,31 @@ export function registerFrontierMethods(engine: Engine): void {
       }
       return resolved;
     });
+    // Interactive frontier sessions are read-only. All authoring must enter
+    // through orchestration so it receives a snapshot, host-private
+    // worktree, capability checks, verification, review, and CandidateRef.
+    if ((writeScope?.length ?? 0) > 0) {
+      throw new RpcMethodError(
+        RpcErrorCodes.INVALID_PARAMS,
+        "write-capable frontier sessions are disabled; use engine.orchestrate",
+      );
+    }
 
     const attachWiki = params.attachWiki ?? true;
     let wikiMcpUrl: string | null = null;
+    let wikiMcpBearerToken: string | undefined;
     let wikiAttached = false;
     if (attachWiki && isWikiBuilt(engine, projectDir)) {
       const server = await engine.wiki.startMcpServer(engine, projectDir);
       wikiMcpUrl = server.url;
+      wikiMcpBearerToken = server.bearerToken;
       wikiAttached = true;
     }
 
-    const session = await adapter.createSession({
+    const session = await engine.providerGateway.createFrontierSession(adapter, {
       projectDir,
       wikiMcpUrl,
+      wikiMcpBearerToken,
       log: engine.log,
       toolPolicy: writeScope !== undefined ? { writeScope } : undefined,
       // Final review Fix 2: this is the raw, interactive engine.frontier.*
