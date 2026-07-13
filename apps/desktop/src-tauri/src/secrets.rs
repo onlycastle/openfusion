@@ -95,8 +95,11 @@
 //! `value`/`password` local into a log line.
 
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+use sha2::{Digest, Sha256};
 use tauri::State;
 
 /// Keychain (or other backend) service name every entry is stored under.
@@ -110,6 +113,7 @@ pub const SERVICE_NAME: &str = "net.originlayer.openfusion";
 /// would pass to `set_secret` (leading/trailing dunder), so it can never
 /// collide with a legitimate id.
 const PERSISTED_INDEX_ID: &str = "__persisted_ids__";
+const RUNTIME_KEY_PREFIX: &str = "__runtime_key__:";
 
 /// Abstraction over a Keychain-shaped key/value secret backend: set, get,
 /// delete, by id. [`KeyringImpl`] is the real macOS Keychain (via the
@@ -188,6 +192,7 @@ impl KeyringBackend for KeyringImpl {
 pub struct SecretStore {
     memory: Mutex<HashMap<String, String>>,
     persisted_ids: Mutex<HashSet<String>>,
+    runtime_key_lock: Mutex<()>,
     backend: Arc<dyn KeyringBackend>,
 }
 
@@ -198,7 +203,12 @@ impl SecretStore {
     /// construct a second `SecretStore` against it (simulating an app
     /// restart against the same Keychain).
     pub fn new(backend: Arc<dyn KeyringBackend>) -> Self {
-        Self { memory: Mutex::new(HashMap::new()), persisted_ids: Mutex::new(HashSet::new()), backend }
+        Self {
+            memory: Mutex::new(HashMap::new()),
+            persisted_ids: Mutex::new(HashSet::new()),
+            runtime_key_lock: Mutex::new(()),
+            backend,
+        }
     }
 
     fn memory_lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, String>> {
@@ -317,6 +327,38 @@ impl SecretStore {
         ids
     }
 
+    /// Return the stable Keychain-backed AES-256 key for one project,
+    /// creating it with the OS CSPRNG on first use. The account name is an
+    /// opaque digest of the canonical path, so Keychain metadata and the
+    /// provider-key UI never expose the project path itself.
+    pub fn ensure_runtime_key(&self, project_dir: &Path) -> Result<String, String> {
+        let _guard = self.runtime_key_lock.lock().map_err(|_| "runtime key mutex poisoned".to_string())?;
+        let canonical = project_dir
+            .canonicalize()
+            .map_err(|err| format!("failed to canonicalize project directory: {err}"))?;
+        let digest = Sha256::digest(canonical.to_string_lossy().as_bytes());
+        let id = format!("{RUNTIME_KEY_PREFIX}{}", BASE64.encode(digest));
+
+        if let Some(existing) = self.get(&id) {
+            if BASE64.decode(existing.as_bytes()).map(|bytes| bytes.len() == 32).unwrap_or(false) {
+                return Ok(existing);
+            }
+        }
+
+        let mut key = [0_u8; 32];
+        getrandom::fill(&mut key).map_err(|err| format!("failed to generate runtime key: {err}"))?;
+        let encoded = BASE64.encode(key);
+        self.set(&id, &encoded, true)?;
+        Ok(encoded)
+    }
+
+    fn list_user_ids(&self) -> Vec<String> {
+        self.list_ids()
+            .into_iter()
+            .filter(|id| !id.starts_with(RUNTIME_KEY_PREFIX))
+            .collect()
+    }
+
     /// On startup (or whenever invoked): read the opted-in-persisted-ids
     /// index from the backend, then read each listed id's entry and
     /// populate the memory map. Best-effort — a missing index, a missing
@@ -404,7 +446,18 @@ pub fn delete_secret(state: State<'_, Arc<SecretStore>>, id: String) -> Result<(
 /// only — never values — for populating a "your saved keys" UI list.
 #[tauri::command]
 pub fn list_secret_ids(state: State<'_, Arc<SecretStore>>) -> Vec<String> {
-    state.inner().list_ids()
+    state.inner().list_user_ids()
+}
+
+/// Create or retrieve the host-owned per-project runtime trace key. The
+/// plaintext is returned to the webview only so it can immediately configure
+/// the engine sidecar; neither layer persists it outside Keychain.
+#[tauri::command]
+pub fn ensure_runtime_key(
+    state: State<'_, Arc<SecretStore>>,
+    project_dir: String,
+) -> Result<String, String> {
+    state.inner().ensure_runtime_key(Path::new(&project_dir))
 }
 
 /// `invoke('load_persisted_secrets')`. See [`SecretStore::load_persisted`].
@@ -608,6 +661,24 @@ mod tests {
         for id in &ids {
             assert!(!id.starts_with("sk-"), "list_ids must never return a value, got {id:?}");
         }
+    }
+
+    #[test]
+    fn runtime_key_is_stable_persisted_and_hidden_from_user_ids() {
+        let (backend, store) = fake_store();
+        let project = std::env::temp_dir();
+        let first = store.ensure_runtime_key(&project).expect("runtime key");
+        let second = store.ensure_runtime_key(&project).expect("same runtime key");
+
+        assert_eq!(first, second);
+        assert_eq!(BASE64.decode(first.as_bytes()).expect("base64").len(), 32);
+        assert!(store.list_user_ids().is_empty());
+        assert!(backend
+            .set_call_ids
+            .lock()
+            .expect("mutex")
+            .iter()
+            .any(|id| id.starts_with(RUNTIME_KEY_PREFIX)));
     }
 
     #[test]

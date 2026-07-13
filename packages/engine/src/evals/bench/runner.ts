@@ -1,11 +1,15 @@
 // bench run: paired baseline + harness arms → predictions JSON + metered rows.
 
-import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import type { Engine } from "../../engine.js";
+import {
+  resolveFrontierSelection,
+  type EvalsFrontierSelections,
+  type FrontierSelection,
+} from "../../engines/selection.js";
 import type { FrontierSession } from "../../engines/types.js";
 import type { PricingConfidence } from "../../models/meter.js";
 import { loadHarness, writeHarness } from "../../harness/store.js";
@@ -24,7 +28,6 @@ import {
 import { exportModelPatch } from "./patchExport.js";
 import { clonePath, defaultBenchRoot, harnessBundlePath, runDir } from "./paths.js";
 
-const FRONTIER_KIND = "claude-code";
 const DEFAULT_BASELINE_TIMEOUT_MS = 600_000;
 
 export interface BenchPrediction {
@@ -68,6 +71,7 @@ export interface BenchRunOptions {
   modelNameBaseline?: string;
   modelNameHarness?: string;
   log?: (msg: string) => void;
+  frontier?: EvalsFrontierSelections;
 }
 
 function addCost(total: number | null, next: number | null): number | null {
@@ -105,17 +109,19 @@ async function runBaselineArm(
   engine: Engine,
   dir: string,
   problemStatement: string,
+  frontier: FrontierSelection,
 ): Promise<{ costUsd: number | null; outcome: PerTaskResult["baselineOutcome"] }> {
   let costUsd: number | null = null;
   try {
-    const adapter = engine.frontier.getAdapter(FRONTIER_KIND);
+    const adapter = engine.frontier.getAdapter(frontier.engine);
     if (adapter === undefined) {
-      throw new RpcMethodError(RpcErrorCodes.SERVER_ERROR, `unknown frontier engine: ${FRONTIER_KIND}`);
+      throw new RpcMethodError(RpcErrorCodes.SERVER_ERROR, `unknown frontier engine: ${frontier.engine}`);
     }
-    const session = await adapter.createSession({
+    const session = await engine.providerGateway.createFrontierSession(adapter, {
       projectDir: dir,
       wikiMcpUrl: null,
       log: engine.log,
+      model: frontier.model,
       toolPolicy: { writeScope: [dir] },
       resultLabel: "eval-baseline",
     });
@@ -124,13 +130,12 @@ async function runBaselineArm(
       const turn = await drainFrontierTurn(session, problemStatement, DEFAULT_BASELINE_TIMEOUT_MS);
       costUsd = turn.costUsd;
     } finally {
-      await session.close().catch(() => {});
+      await engine.frontier.closeSession(session);
       untrack();
     }
     return { costUsd, outcome: "completed" };
   } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    engine.log(`bench: baseline failed: ${message}`);
+    engine.log("bench: baseline failed");
     return { costUsd: null, outcome: "error" };
   }
 }
@@ -139,6 +144,7 @@ async function runHarnessArm(
   engine: Engine,
   harnessDir: string,
   problemStatement: string,
+  frontier?: EvalsFrontierSelections,
 ): Promise<{
   costUsd: number | null;
   outcome: PerTaskResult["harnessOutcome"];
@@ -147,31 +153,26 @@ async function runHarnessArm(
     const result = await orchestrate(engine, {
       projectDir: harnessDir,
       task: problemStatement,
+      frontier: { review: frontier?.review, escalation: frontier?.escalation },
     });
     if (result.diff.trim().length === 0) {
       return { costUsd: result.cost.totalUsd, outcome: result.outcome };
     }
+    if (result.candidateRef === null) {
+      engine.log("bench: candidate verification incomplete");
+      return { costUsd: result.cost.totalUsd, outcome: "error" };
+    }
     try {
-      const response = await engine.dispatcher.dispatch({
-        jsonrpc: "2.0",
-        id: randomUUID(),
-        method: "engine.orchestrate.apply",
-        params: { projectDir: harnessDir, diff: result.diff },
-      });
-      if (response !== null && response.error !== undefined) {
-        engine.log(`bench: apply failed: ${response.error.message}`);
-        return { costUsd: result.cost.totalUsd, outcome: "apply-failed" };
-      }
+      const grant = await engine.candidates.prepareApply(result.candidateRef.candidateId, harnessDir);
+      await engine.candidates.apply(result.candidateRef.candidateId, grant, harnessDir);
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      engine.log(`bench: apply failed: ${message}`);
+      engine.log("bench: apply failed");
       return { costUsd: result.cost.totalUsd, outcome: "apply-failed" };
     }
     return { costUsd: result.cost.totalUsd, outcome: result.outcome };
   } catch (err) {
     if (err instanceof RunCancelledError) throw err;
-    const message = err instanceof Error ? err.message : String(err);
-    engine.log(`bench: orchestrate failed: ${message}`);
+    engine.log("bench: orchestrate failed");
     return { costUsd: null, outcome: "error" };
   }
 }
@@ -236,6 +237,7 @@ export async function runBench(engine: Engine, opts: BenchRunOptions = {}): Prom
 
   let escalations = 0;
   const meterStartIndex = engine.models.meter.recordCount();
+  const baselineFrontier = resolveFrontierSelection(opts.frontier?.baseline);
 
   for (const inst of selected) {
     if (doneIds.has(inst.instance_id)) {
@@ -264,13 +266,13 @@ export async function runBench(engine: Engine, opts: BenchRunOptions = {}): Prom
       const { baselineSha: hSha } = await materializeBaseCommit(clone, inst.base_commit, harnessDir);
 
       log(`  baseline arm…`);
-      const baseline = await runBaselineArm(engine, baselineDir, inst.problem_statement);
+      const baseline = await runBaselineArm(engine, baselineDir, inst.problem_statement, baselineFrontier);
       const baselinePatch =
         baseline.outcome === "error" ? "" : await exportModelPatch(baselineDir, { baselineSha: bSha });
 
       log(`  harness arm…`);
       await writeHarness(harnessDir, harnessBundle);
-      const harness = await runHarnessArm(engine, harnessDir, inst.problem_statement);
+      const harness = await runHarnessArm(engine, harnessDir, inst.problem_statement, opts.frontier);
       if (harness.outcome === "escalated") escalations += 1;
       const harnessPatch =
         harness.outcome === "error" || harness.outcome === "apply-failed"
@@ -334,6 +336,11 @@ export async function runBench(engine: Engine, opts: BenchRunOptions = {}): Prom
         escalations,
         datasetSnapshotHash: dataset.snapshotHash,
         instanceCount: rows.length,
+        frontier: {
+          baseline: baselineFrontier,
+          review: resolveFrontierSelection(opts.frontier?.review),
+          escalation: resolveFrontierSelection(opts.frontier?.escalation),
+        },
       },
       null,
       2,

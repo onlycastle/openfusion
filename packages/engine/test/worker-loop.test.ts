@@ -2,6 +2,8 @@ import { existsSync, mkdtempSync, readFileSync, realpathSync, rmSync } from "nod
 import os from "node:os";
 import path from "node:path";
 import { MockLanguageModelV4 } from "ai/test";
+import { tool } from "ai";
+import { z } from "zod";
 import { afterEach, describe, expect, it } from "vitest";
 import { runWorkerLoop } from "../src/worker/loop.js";
 import { createWorkerTools } from "../src/worker/tools.js";
@@ -142,6 +144,113 @@ describe("runWorkerLoop", () => {
     expect(onStepCalls).toHaveLength(2);
     expect(onStepCalls[0]).toEqual({ step: 0, toolCalls: 1, text: "" });
     expect(onStepCalls[1]).toEqual({ step: 1, toolCalls: 0, text: "Added greet()" });
+  });
+
+  it("awaits durable response-batch persistence before making the next model call", async () => {
+    dir = makeRoot();
+    const tools = createWorkerTools({ root: dir });
+    const order: string[] = [];
+    let call = 0;
+    const model = new MockLanguageModelV4({
+      doGenerate: async () => {
+        call += 1;
+        order.push(`model:${call}`);
+        if (call === 1) {
+          return {
+            content: [{
+              type: "tool-call",
+              toolCallId: "persist-1",
+              toolName: "read_file",
+              input: JSON.stringify({ path: "missing.txt" }),
+            }],
+            finishReason: { unified: "tool-calls", raw: "tool_calls" },
+            usage: USAGE_A,
+            warnings: [],
+          };
+        }
+        return {
+          content: [{ type: "text", text: "done" }],
+          finishReason: { unified: "stop", raw: "stop" },
+          usage: USAGE_B,
+          warnings: [],
+        };
+      },
+    });
+
+    await runWorkerLoop({
+      model,
+      task: "read",
+      tools,
+      onResponseBatch: async ({ step }) => {
+        await Promise.resolve();
+        order.push(`persist:${step + 1}`);
+      },
+    });
+
+    expect(order).toEqual(["model:1", "persist:1", "model:2", "persist:2"]);
+  });
+
+  it("stops on an AI SDK approval request and resumes from the exact message history", async () => {
+    dir = makeRoot();
+    let executions = 0;
+    const tools = {
+      dangerous: tool({
+        description: "A mutating test tool",
+        inputSchema: z.object({ value: z.string() }),
+        needsApproval: true,
+        execute: async ({ value }) => {
+          executions += 1;
+          return { value };
+        },
+      }),
+    };
+    let call = 0;
+    const model = new MockLanguageModelV4({
+      doGenerate: async () => {
+        call += 1;
+        if (call === 1) {
+          return {
+            content: [{
+              type: "tool-call",
+              toolCallId: "approval-call",
+              toolName: "dangerous",
+              input: JSON.stringify({ value: "run" }),
+            }],
+            finishReason: { unified: "tool-calls", raw: "tool_calls" },
+            usage: USAGE_A,
+            warnings: [],
+          };
+        }
+        return {
+          content: [{ type: "text", text: "approved and done" }],
+          finishReason: { unified: "stop", raw: "stop" },
+          usage: USAGE_B,
+          warnings: [],
+        };
+      },
+    });
+
+    const paused = await runWorkerLoop({ model, task: "mutate", tools, maxSteps: 5 });
+    expect(paused.pendingApproval).toMatchObject({
+      toolCallId: "approval-call",
+      toolName: "dangerous",
+      input: { value: "run" },
+    });
+    expect(executions).toBe(0);
+
+    const resumed = await runWorkerLoop({
+      model,
+      task: "ignored because history is supplied",
+      tools,
+      messages: paused.messages,
+      approvalResponse: {
+        approvalId: paused.pendingApproval!.approvalId,
+        approved: true,
+      },
+      maxSteps: 5,
+    });
+    expect(executions).toBe(1);
+    expect(resumed.summary).toBe("approved and done");
   });
 
   it("finishes in a single step when the model replies with final text immediately (no tool call)", async () => {

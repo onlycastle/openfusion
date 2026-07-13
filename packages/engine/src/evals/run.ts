@@ -1,222 +1,30 @@
-// engine.evals.run — the M6 EXIT CRITERION: the baseline-vs-harness report
-// card. This MEASURES whether the harness (cheap worker + review +
-// escalate-if-needed, engine.orchestrate) saves cost relative to a frontier
-// doing the task directly (the baseline), AT HELD QUALITY — and FLAGS the
-// ETH hazard (spec §12.1): a harness whose pass rate is materially below the
-// baseline's is a "fail" verdict, never quietly reported as a savings win.
+// Directional baseline-versus-harness evaluation.
 //
-// --- Baseline-vs-harness wiring (read this before changing the flow) ------
+// Each task is reconstructed twice from the same historical pre-fix source
+// state. The Git tree IDs must match before either arm starts. One wiki is
+// built from that committed source and one authenticated MCP endpoint is
+// shared by both arms so arm order cannot change repository knowledge.
 //
-// Per task, TWO fresh scratch directories are created (see the TMP-placement
-// note below) and independently seeded via the task's own `setup()`:
+// The baseline role performs the task directly in its scratch repository.
+// The harness arm installs only the validated harness generation and runs the
+// normal orchestration/candidate pipeline. Public verification commands may
+// run while compiling the candidate. Evaluator-only tests/fixtures are
+// materialized only after author and reviewer sessions close, then both final
+// trees are scored by the same protected command oracle under the native
+// evaluation sandbox. Policy violations and infrastructure failures are
+// measurement/safety outcomes, not task-quality failures.
 //
-//   BASELINE: a frontier session is opened DIRECTLY (bypassing
-//   engine.frontier.start entirely — mirrors orchestrate.ts's runEscalation
-//   "frontier does the task directly, write-scoped to one directory"
-//   primitive) with toolPolicy.writeScope = [baselineDir] and cwd =
-//   baselineDir. No wiki is attached and no harness routing is involved —
-//   that is the entire point of a baseline: what would a frontier do with
-//   NONE of the harness's help? Once the turn completes, runOracle scores
-//   baselineDir directly (no diff/apply step — the frontier edited files
-//   in place).
+// Scratch repositories live under OS temp, while nested author/verifier
+// worktrees live under the host-private WorktreeManager root. All are removed
+// in finally blocks. The selected repository is read only for task/harness
+// identity; evaluation never applies to it or mutates its harness.
 //
-//   HARNESS: engine.orchestrate (../orchestrate/orchestrate.ts) is invoked
-//   with `projectDir: harnessDir` — the SAME base-state scratch directory
-//   the oracle scores, NOT the real project being evaluated. This is the
-//   Task 4 fix for a CRITICAL measurement-validity flaw in the original v1
-//   wiring (kept here, in detail, so it is never reintroduced):
-//
-//     THE FLAW: the original wiring ran orchestrate against
-//     `projectDir: realProjectDir` (the actual project under evaluation, at
-//     its CURRENT HEAD), reasoning that orchestrate needs the real
-//     project's `.openfusion/` harness bundle for routing/wiki and that
-//     worker/escalation worktrees are naturally scoped to a real project's
-//     own WorktreeManager. That reasoning is correct about WHY
-//     realProjectDir seemed necessary, but wrong about what it costs: for a
-//     golden task mined from realProjectDir's OWN history
-//     (goldenTaskFromCommit), the eval scratch dirs are seeded at the
-//     target commit's PARENT state (the bug/gap present) — but
-//     realProjectDir's HEAD, by construction, is usually a DESCENDANT of
-//     that commit (the fix is already merged into history). Pointing
-//     orchestrate at realProjectDir therefore asks the harness to
-//     "implement a change" that is already implemented at the substrate it
-//     was handed — best case, the worker/frontier makes no edits at all
-//     (an empty diff, since the code already does what's asked), which then
-//     gets applied to (or, doing nothing, leaves untouched) a harnessDir
-//     that is STILL at the pre-fix parent state — a GUARANTEED oracle
-//     failure that has nothing to do with the harness's actual competence.
-//     Every real multi-task run (HEAD != every task's own commit parent)
-//     would structurally measure ~0% harness pass rate, misreported as a
-//     genuine ETH-hazard "fail" and flipping the manifest's evals verdict
-//     to "fail" on a measurement artifact, not a quality signal.
-//
-//     THE FIX: harnessDir itself becomes a fresh, disconnected, throwaway
-//     git project AT THE TASK'S OWN BASE STATE, with the harness bundle
-//     copied in — so orchestrate works the exact same task, from the exact
-//     same starting point, that the baseline and the oracle also work from.
-//     Concretely, per task (see the main loop below):
-//       1. `task.setup(harnessDir)` — identical to the baseline's own setup
-//          call; materializes the pre-change state.
-//       2. `initEvalGitRepo(harnessDir)` — ensures harnessDir is a git repo
-//          with (at least) one commit (a no-op for golden tasks, whose own
-//          setup() already does this as part of its history-strip
-//          mechanism; see tasks.ts). This is what makes harnessDir a valid
-//          `projectDir` for engine.orchestrate at all: requireGitRepo and
-//          WorktreeManager (`git worktree add ... HEAD`) both need a real
-//          commit to anchor to.
-//       3. `writeHarness(harnessDir, harnessBundle)` — writes the ALREADY
-//          LOADED-AND-VALIDATED harness bundle (routing.yaml, wiki/*.md,
-//          agents/*.yaml, manifest.json — read once, near the top of
-//          runEvals, off the REAL project) into harnessDir's own
-//          `.openfusion/`. Deliberately done AFTER step 2's commit (not
-//          folded into it), so the copied bundle stays UNTRACKED in
-//          harnessDir's git history — it doesn't need to be committed:
-//          orchestrate's own loadHarness/attachedWikiMcpUrl calls read
-//          `.openfusion/` straight off `params.projectDir`'s filesystem
-//          (harnessDir's top-level checkout), never through git, and the
-//          worker/escalation child worktrees engine.worker.getManager
-//          creates never need `.openfusion` present in THEIR OWN directory
-//          either (the worker context — the approved project card's digest,
-//          or the build-and-test page's digest as a fallback, or nothing at
-//          all — travels as a plain string param; buildWorkerContext in
-//          orchestrate.ts computes it once from the bundle object, not
-//          re-read from disk per attempt). Reusing
-//          writeHarness (the same tested primitive engine.harness.generate
-//          itself writes through) instead of a raw recursive directory copy
-//          also means this can never accidentally drag in
-//          `.openfusion/cache/` (the wiki symbol-index sqlite db, tied to
-//          the real project's own content/paths) or
-//          `.openfusion/worktrees/` (any OTHER live worker worktrees the
-//          real project happens to have lying around) into the isolated
-//          eval directory — only the four artifact kinds writeHarness ever
-//          writes (manifest/wiki/agents/routing) ever land there.
-//       4. `orchestrate(engine, { projectDir: harnessDir, task: task.prompt })`
-//          — now runs the FULL harness loop (route -> worker attempts ->
-//          review -> escalate) entirely inside harnessDir's own worktree
-//          hierarchy (`harnessDir/.openfusion/worktrees/<id>`), producing a
-//          diff relative to harnessDir's OWN base commit.
-//       5. The returned diff is applied back onto harnessDir itself (still
-//          `engine.orchestrate.apply`, `git apply --3way`) — and now
-//          applies TRIVIALLY: the diff's preimage context IS harnessDir's
-//          own tracked content (same repo, same base commit — no more
-//          disconnected-object-store apply risk described in the old KNOWN
-//          v1 LIMITATION note this comment used to carry). runOracle then
-//          scores harnessDir, exactly like the baseline.
-//     The APPROXIMATION this fix accepts (documented, not hidden): the
-//     copied bundle's worker context (buildWorkerContext's approved-card
-//     digest, or its build-and-test fallback — see that function's own doc
-//     comment; never "every page digest") was generated against the real
-//     project's CURRENT state, not the task's own (older, for a golden
-//     task) base state — it describes a past version of the same project
-//     approximately, not exactly. That is a much smaller and more honest
-//     approximation than the flaw it replaces (which wasn't "approximately
-//     right", it was structurally guaranteed wrong whenever HEAD had moved
-//     on).
-//     CONTAMINATION DIRECTION (review round 2 — read alongside the staleness
-//     approximation just above, and alongside the wiki-MCP-ABSENCE note near
-//     the bottom of this header): for a GOLDEN task (goldenTaskFromCommit),
-//     the copied bundle is generated by engine.harness.generate at the REAL
-//     project's CURRENT HEAD — which, by construction (the same "fix already
-//     merged into history" fact "THE FLAW" above exists to route around), is
-//     a commit AT OR AFTER the task's own fix. The bundle's wiki pages can
-//     therefore already describe the POST-fix world — the very thing the
-//     task asks the harness to (re)produce — handing the harness
-//     answer-adjacent context the baseline never sees at all (the baseline
-//     gets no wiki, ever; see "BASELINE:" above). This biases TOWARD the
-//     harness on golden tasks specifically — the OPPOSITE direction from the
-//     wiki-MCP-absence bias documented near the bottom of this header (which
-//     biases AGAINST the harness, on every task, golden or synthetic). Both
-//     are recorded here so a reader of this run's savings/quality numbers
-//     knows the residual biases point BOTH ways — neither is corrected in
-//     v1, and neither should be assumed to cancel the other out.
-//     SECURITY NOTE: harnessDir's `.git` history is its OWN (from
-//     task.setup(), per tasks.ts's own history-strip mechanism for golden
-//     tasks, or a from-scratch init for synthetic ones) — copying the
-//     harness bundle via writeHarness never touches git, adds no remote, no
-//     reflog entry, and no fetchable pointer back to the real project. See
-//     the TMP-placement note below for the rest of this pipeline's own
-//     isolation posture.
-//
-//   Because harnessDir now IS the substrate orchestrate works against,
-//   there is no separate "orchestrate's own scratch worktree, living in the
-//   REAL project, that must be cleaned up afterward" concern this pipeline
-//   used to carry: every worktree engine.worker.getManager creates for a
-//   harness-side run lives INSIDE harnessDir, which this loop's own
-//   `finally` already removes wholesale (`rm(harnessDir, {recursive:true,
-//   force:true})`) once the task is scored — success or failure. No
-//   dedicated cleanup call against a persistent, user-facing project
-//   directory is needed anymore.
-//
-// --- TMP placement (CRITICAL security constraint, inherited from Task 3) --
-//
-// Both scratch directories are created via `mkdtemp(os.tmpdir())` —
-// deliberately AWAY from both the real project's directory and (for a
-// golden task) the mined repo's directory. goldenTaskFromCommit's own
-// "unreachable by construction" guarantee is a GIT-GRAPH-only property (no
-// history/remote/reflog points back at the source repo); it does NOT
-// guarantee an adversarial worker process can't reach the real project by
-// another channel (a known filesystem path + `git fetch <path> <sha>`, or a
-// raw filesystem read). Placing the scratch dirs under the OS's shared tmp
-// directory, never nested inside the project being evaluated, is this
-// pipeline's own contribution to that guarantee. Eval integrity against a
-// worker that deliberately tries to reach outside its scratch directory
-// still ultimately rests on the worker/frontier tool sandbox (path-scoped
-// bash/read/write — worker/tools.ts, path-scope.ts): full process-level
-// isolation is deferred to M7. v1 assumes a NON-ADVERSARIAL worker. Both
-// scratch directories are pure eval machinery (never a user-facing
-// deliverable the way orchestrate's own worktrees are) and are always
-// removed after scoring, success or failure.
-//
-// --- Measurement failures vs. quality failures (the second Task 4 fix) ---
-//
-// A harness-side outcome of "apply-failed" or "error" (HarnessTaskOutcome's
-// own doc comment below) means the PIPELINE failed to produce or apply a
-// scoreable result — NOT that the harness produced and was scored on a bad
-// fix. Before this fix, both were folded into `harnessPassed: false`
-// indistinguishably from a genuine bad fix, so an infra hiccup (a transient
-// adapter error) or an apply mismatch could flip the manifest's evals
-// verdict to "fail" — a FALSE ETH hazard. The verdict computation at the
-// bottom of runEvals now separates the two: it only reports "fail" when the
-// harness GENUINELY produced a tested fix that scored worse than the
-// baseline; a quality gap that is fully or partially explained by
-// measurement failures (on EITHER side — a baseline infra failure is
-// exactly as much of a measurement failure as a harness one) is reported as
-// "inconclusive" instead, with a note naming the outcome counts. See the
-// verdict computation's own comments for the exact rule.
-//
-// --- Wiki MCP absence during eval harness runs (review round 2) ----------
-//
-// engine.orchestrate's own attachedWikiMcpUrl (orchestrate.ts) gates the
-// wiki MCP server strictly on whether `<projectDir>/.openfusion/cache/
-// wiki.db` exists (isWikiBuilt, via wiki/store.ts's own wikiDbPath) — a real
-// engine.harness.generate run calls engine.wiki.build (which creates that
-// db) BEFORE ever starting the MCP server, so a genuinely deployed harness
-// always has one available. writeHarness (harness/store.ts) — the ONLY
-// thing this pipeline ever copies into harnessDir (see "THE FIX", step 3,
-// above) — deliberately never touches `.openfusion/cache/` at all. So every
-// eval harness run's review AND escalation frontier sessions
-// (engine.orchestrate's own reviewDiff/runEscalation call sites) are always
-// created with wikiMcpUrl: null, and get NO wiki MCP tool server attached,
-// full stop. (This is specific to review/escalation: the plain-string
-// worker context that WORKER attempts receive — buildWorkerContext's
-// approved-card digest, or its build-and-test fallback, computed directly
-// off the already-loaded bundle's own wiki pages, never re-read from
-// `.openfusion/cache/` — is unaffected by this and reaches worker attempts
-// in an eval run exactly as it would in production.)
-//
-// CONSEQUENCE FOR READING THIS PIPELINE'S NUMBERS: the harness measured by
-// this module is therefore a CONSERVATIVELY DEGRADED variant of the harness
-// a real deployment runs — every review/escalation session here is missing
-// a tool a deployed harness's own review/escalation sessions would have.
-// This biases AGAINST the harness (never toward it, and on every task,
-// golden or synthetic — contrast the golden-task wiki CONTAMINATION
-// direction noted above, which biases TOWARD the harness and only for
-// golden tasks). Read this run's savings/quality "pass" as, if anything, an
-// understatement of what a real deployment (wiki MCP present throughout)
-// would measure — not an inflated one.
+// runEvals preserves the one-trial directional API. Repeated seeded trials,
+// durable resume, intervals, pass@k/pass^k, and promotion evidence are composed
+// by experiment.ts.
 import { randomUUID } from "node:crypto";
 import { execFile } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, realpathSync } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -224,19 +32,37 @@ import { promisify } from "node:util";
 import { RpcErrorCodes } from "@openfusion/shared";
 import type { Engine } from "../engine.js";
 import type { FrontierSession } from "../engines/types.js";
+import {
+  resolveFrontierSelection,
+  type EvalsFrontierSelections,
+  type FrontierSelection,
+} from "../engines/selection.js";
 import type { PricingConfidence } from "../models/meter.js";
 import {
   DIALECT_PACK_CATALOG_VERSION,
   FAMILY_CATALOG_VERSION,
 } from "../models/catalog.js";
+import { fingerprintHarness } from "../harness/fingerprint.js";
 import { validateHarness } from "../harness/schema.js";
-import { HarnessValidationError, loadHarness, setEvalsVerdict, writeHarness } from "../harness/store.js";
+import { HarnessValidationError, loadHarness, writeHarness } from "../harness/store.js";
 import { orchestrate, type OrchestrateResult } from "../orchestrate/orchestrate.js";
+import { reviewDiff } from "../orchestrate/review.js";
+import { routeTask } from "../orchestrate/routing.js";
 import { RunCancelledError } from "../rpc/cancel-registry.js";
 import { RpcMethodError } from "../rpc/errors.js";
 import { requireGitRepo } from "../rpc/guards.js";
-import type { EvalTask } from "./tasks.js";
-import { runOracle } from "./tasks.js";
+import type { RunSupervisor } from "../runtime/supervisor.js";
+import { captureTaskSnapshot } from "../runtime/snapshot.js";
+import { runtimeFingerprint } from "../runtime/context.js";
+import type {
+  ExperimentTrial,
+  HarnessExperimentVariant,
+  TrialFeatures,
+  TrialMetrics,
+} from "../runtime/evidence.js";
+import { TOOL_OUTPUT_MAX_BYTES } from "../runtime/sandbox.js";
+import type { RuntimeStore } from "../runtime/store.js";
+import type { EvalTask, OracleResult } from "./tasks.js";
 import { computeEvalsVerdict } from "./verdict.js";
 
 // Local addCost for baseline/harness arm cost accumulation — same null-skip
@@ -248,15 +74,17 @@ function addCost(total: number | null, next: number | null): number | null {
 
 const execFileAsync = promisify(execFile);
 
-// The only frontier engine kind this pipeline (or engine.orchestrate) drives
-// today — mirrors orchestrate.ts's own FRONTIER_KIND constant.
-const FRONTIER_KIND = "claude-code";
-
 // A full editing turn, comparable in scope to orchestrate.ts's own
 // escalation attempt — mirrors its DEFAULT_ESCALATE_TIMEOUT_MS exactly,
 // since the baseline primitive IS "a frontier does the task directly",
 // structurally identical to escalation.
 const DEFAULT_BASELINE_TIMEOUT_MS = 600_000;
+export const EVAL_POLICY_VERSION = "eval-v1";
+export const EVALUATOR_ORACLE_IDENTITY = runtimeFingerprint({
+  evaluator: "repository-test-exit-code",
+  contractVersion: 1,
+  promptOwner: "openfusion-evaluator",
+});
 
 export interface EvalsRunParams {
   projectDir: string;
@@ -268,12 +96,23 @@ export interface EvalsRunParams {
   // cross a real wire.
   tasks: EvalTask[];
   sampleNote?: string;
+  frontier?: EvalsFrontierSelections;
   // M7b Task 2: READ-ONLY lookup only -- runEvals never register()s or
   // deregister()s this runId's controller; that is engine.evals.run's own
   // RPC handler's job (methods.ts). See cancel-registry.ts's header comment
   // for the full ownership split, and OrchestrateParams.runId's identical
   // doc comment in orchestrate.ts for the sibling convention this mirrors.
   runId?: string;
+  supervisor?: RunSupervisor;
+  /** Seeded experiment scheduler control; v1 callers default baseline-first. */
+  armOrder?: "baseline-first" | "harness-first";
+  /** Optional protected repeated-trial ledger. Completed arms resume without another model call. */
+  experiment?: {
+    id: string;
+    variant: HarnessExperimentVariant;
+    repeatIndex: number;
+    seed: number;
+  };
 }
 
 // The harness side's per-task result, one step wider than
@@ -282,8 +121,7 @@ export interface EvalsRunParams {
 // produced but didn't apply onto harnessDir — see engine.orchestrate.apply)
 // and "error" (engine.orchestrate itself threw — an infra hiccup on ONE task
 // must not abort the whole report card; see runHarnessTask below). BOTH are
-// MEASUREMENT failures, never quality evidence — see this module's header
-// comment and the verdict computation in runEvals.
+// MEASUREMENT failures, never quality evidence — see the verdict computation in runEvals.
 export type HarnessTaskOutcome = OrchestrateResult["outcome"] | "apply-failed" | "error";
 
 // The baseline side's per-task outcome — symmetric with HarnessTaskOutcome
@@ -304,6 +142,8 @@ export interface PerTaskResult {
   harnessOutcome: HarnessTaskOutcome;
   baselineUsd: number | null;
   harnessUsd: number | null;
+  baselinePolicyViolation?: boolean;
+  harnessPolicyViolation?: boolean;
 }
 
 /** Phase 1: published harness configuration for eval reproducibility. */
@@ -313,8 +153,16 @@ export interface EvalsHarnessConfig {
   familyCatalogVersion: string;
   dialectPackVersion: string;
   routePolicyVersion: string;
+  evalPolicyVersion: typeof EVAL_POLICY_VERSION;
+  evaluatorOracleIdentity: string;
   // Honest pin: generate/review/escalate still use this frontier engine only.
   frontierEngine: string;
+  frontierRoles: {
+    planning?: FrontierSelection;
+    review: FrontierSelection;
+    escalation: FrontierSelection;
+    baseline: FrontierSelection;
+  };
 }
 
 export interface EvalsReportCard {
@@ -346,7 +194,7 @@ export interface EvalsReportCard {
   // M7c Task 1: the CLEAN-SUBSET numbers the verdict computation above was
   // ACTUALLY computed from (see the "clean subset" comments in runEvals'
   // own body) — surfaced as structured fields, additively, so a caller (the
-  // eval cockpit screen) can show WHY a verdict is what it is (e.g.
+  // benchmark consumer can show WHY a verdict is what it is (e.g.
   // "inconclusive: 3/8 tasks had measurement failures; clean subset harness
   // 4/5 vs baseline 4/5") without re-deriving them from `perTask` itself.
   // Purely additive: no verdict-logic change — these are the exact same
@@ -356,6 +204,8 @@ export interface EvalsReportCard {
   cleanHarnessPassed: number;
   cleanSavingsPct: number | null;
   measurementFailureCount: number;
+  /** Tasks with a baseline or harness policy violation; never folded into quality. */
+  policyViolationCount: number;
   // True when the clean-subset quality gap is within the single-run noise
   // band (research 2026-07-07 §3.3) — i.e. any harness<baseline gap present
   // was too small to ground an ETH-hazard "fail". Purely informational.
@@ -380,33 +230,10 @@ function progress(engine: Engine, stage: string, taskId?: string, runId?: string
   engine.notify("evals.progress", params);
 }
 
-// Invokes an already-registered engine.* RPC method through the engine's own
-// in-process dispatcher — mirrors orchestrate.ts's own private
-// callEngineMethod helper exactly (duplicated locally since that one isn't
-// exported; same "reuse the handler that already owns worktree/apply
-// correctness" rationale it documents applies here for
-// engine.orchestrate.apply).
-async function callEngineMethod<T>(engine: Engine, method: string, params: unknown): Promise<T> {
-  const response = await engine.dispatcher.dispatch({
-    jsonrpc: "2.0",
-    id: randomUUID(),
-    method,
-    params,
-  });
-  if (response === null) {
-    throw new RpcMethodError(RpcErrorCodes.SERVER_ERROR, `${method} produced no response`);
-  }
-  if (response.error !== undefined) {
-    throw new RpcMethodError(response.error.code, response.error.message, response.error.data);
-  }
-  return response.result as T;
-}
-
 // Drains a frontier turn WITHOUT any JSON-schema expectation — used for the
 // baseline primitive below, whose whole point is to make tool calls (write
 // scoped to the baseline dir) and finish with a short prose summary, not a
-// structured verdict. Mirrors orchestrate.ts's own private runFrontierTurn
-// (duplicated locally for the same reason as callEngineMethod above),
+// structured verdict. Mirrors orchestrate.ts's private runFrontierTurn,
 // including its M7b Task 2 abort-threading pattern (see that function's own
 // doc comment for why THREE separate `.aborted` checks are needed rather
 // than one): `abortSignal`, when provided, is this eval run's own
@@ -450,78 +277,288 @@ async function drainFrontierTurn(
   return { text, costUsd };
 }
 
-// BASELINE primitive: "a frontier does the task directly", write-scoped to
-// one throwaway directory, no wiki, no harness routing — see this module's
-// header comment. Scored by the SAME oracle the harness side uses, so the
-// two are genuinely comparable.
+interface ProtectedOracleResult extends OracleResult {
+  measurementFailure: boolean;
+  policyViolation: boolean;
+}
+
+function resolveOracleExecutable(program: string): string {
+  if (path.isAbsolute(program)) {
+    if (!existsSync(program)) throw new Error(`runOracle: test command not found: ${JSON.stringify(program)}`);
+    return realpathSync(program);
+  }
+  if (program === "node" || program === path.basename(process.execPath)) return realpathSync(process.execPath);
+  for (const directory of (process.env.PATH ?? "").split(path.delimiter).filter(Boolean)) {
+    const candidate = path.join(directory, program);
+    if (existsSync(candidate)) return realpathSync(candidate);
+  }
+  throw new Error(
+    `runOracle: test command not found: ${JSON.stringify(program)}. ` +
+      "This is a setup error, not a failed evaluation.",
+  );
+}
+
+async function runProtectedOracle(
+  engine: Engine,
+  store: RuntimeStore,
+  dir: string,
+  testCommand: string[],
+  abortSignal?: AbortSignal,
+): Promise<ProtectedOracleResult> {
+  const [program, ...args] = testCommand;
+  if (program === undefined) throw new Error("runOracle: testCommand must contain a program");
+  const executable = resolveOracleExecutable(program);
+  const status = await engine.runtime.sandbox.status();
+  if (!status.available) {
+    throw new RpcMethodError(
+      RpcErrorCodes.SERVER_ERROR,
+      `evaluation sandbox is unavailable: ${status.reason ?? "startup probe failed"}`,
+      { reasonCode: "eval-sandbox-unavailable", policyVersion: EVAL_POLICY_VERSION },
+    );
+  }
+
+  let session = store.createSession({
+    runId: randomUUID(),
+    kind: "review",
+    modelFingerprint: EVALUATOR_ORACLE_IDENTITY,
+    configurationFingerprint: runtimeFingerprint({ policy: EVAL_POLICY_VERSION }),
+  });
+  session = store.updateSession(session.id, session.version, { status: "running" });
+  const privateTempDir = await mkdtemp(path.join(os.tmpdir(), "of-eval-oracle-"));
+  const writer = store.beginArtifact(session.id, "eval-oracle-output", { maxBytes: TOOL_OUTPUT_MAX_BYTES });
+  const startedAt = Date.now();
+  try {
+    const executableDir = path.dirname(executable);
+    const result = await engine.runtime.sandbox.run({
+      executable,
+      args,
+      cwd: dir,
+      privateTempDir,
+      readablePaths: [
+        executableDir,
+        path.dirname(executableDir),
+        path.dirname(process.execPath),
+      ],
+      executablePaths: [executable, process.execPath],
+      networkGranted: false,
+      profile: "eval",
+      timeoutMs: 300_000,
+      abortSignal,
+      output: writer,
+    });
+    if (result.failure === "cancelled" || abortSignal?.aborted === true) throw new RunCancelledError();
+    const policyViolation = /(?:sandbox-exec[^\n]*(?:deny|violation)|operation not permitted)/i
+      .test(result.preview);
+    const measurementFailure = result.failure === "spawn" || result.failure === "output-limit";
+    const passed = result.failure === undefined && result.exitCode === 0 && !policyViolation;
+    const latest = store.requireSession(session.id);
+    store.updateSession(latest.id, latest.version, {
+      status: "completed",
+      outcome: policyViolation
+        ? "policy-violation"
+        : measurementFailure
+          ? "measurement-failure"
+          : passed
+            ? "oracle-passed"
+            : "oracle-failed",
+    });
+    return {
+      passed,
+      exitCode: result.exitCode ?? -1,
+      durationMs: result.failure === "timeout" ? 300_000 : Date.now() - startedAt,
+      measurementFailure,
+      policyViolation,
+    };
+  } catch (error) {
+    writer.abort();
+    const latest = store.requireSession(session.id);
+    if (latest.status === "running") {
+      store.updateSession(latest.id, latest.version, {
+        status: abortSignal?.aborted === true ? "cancelled" : "failed",
+        outcome: abortSignal?.aborted === true ? "cancelled" : "oracle-execution-error",
+      });
+    }
+    throw error;
+  } finally {
+    await rm(privateTempDir, { recursive: true, force: true });
+  }
+}
+
+async function runTaskOracle(
+  engine: Engine,
+  store: RuntimeStore,
+  dir: string,
+  task: EvalTask,
+  abortSignal?: AbortSignal,
+): Promise<ProtectedOracleResult> {
+  if (abortSignal?.aborted) throw new RunCancelledError();
+  await task.prepareOracle?.(dir);
+  if (abortSignal?.aborted) throw new RunCancelledError();
+  return runProtectedOracle(engine, store, dir, task.testCommand, abortSignal);
+}
+
+// BASELINE primitive: a frontier does the task directly in one throwaway
+// repository. It receives the same committed-source wiki MCP as the harness
+// arm, but no generated harness routing or injected harness prose. The same
+// protected oracle scores both arms.
 async function runBaselineTask(
   engine: Engine,
   dir: string,
   task: EvalTask,
+  frontier: FrontierSelection,
+  reviewFrontier: FrontierSelection,
+  wikiMcp: { url: string; bearerToken: string },
+  runtimeStore: RuntimeStore,
   abortSignal?: AbortSignal,
-): Promise<{ passed: boolean; costUsd: number | null; outcome: BaselineTaskOutcome }> {
+  supervisor?: RunSupervisor,
+): Promise<{
+  passed: boolean;
+  costUsd: number | null;
+  outcome: BaselineTaskOutcome;
+  policyViolation: boolean;
+}> {
   let costUsd: number | null = null;
+  let hasUnpricedCall = false;
+  const recordBaselineCall = (next: number | null): void => {
+    if (next === null) hasUnpricedCall = true;
+    costUsd = addCost(costUsd, next);
+    supervisor?.recordCost(next, next === null ? "unpriced" : "verified");
+  };
+  const baselineCost = (): number | null => hasUnpricedCall ? null : costUsd;
+  const snapshot = await captureTaskSnapshot(engine, dir, EVAL_POLICY_VERSION);
+  const manager = await engine.worker.getManager(dir);
+  let authorWorktree: Awaited<ReturnType<typeof manager.create>> | undefined;
   try {
-    const adapter = engine.frontier.getAdapter(FRONTIER_KIND);
+    authorWorktree = await manager.create(`eval-baseline-${randomUUID()}`, snapshot.baseSha);
+    const adapter = engine.frontier.getAdapter(frontier.engine);
     if (adapter === undefined) {
-      throw new RpcMethodError(RpcErrorCodes.SERVER_ERROR, `unknown frontier engine: ${FRONTIER_KIND}`);
+      throw new RpcMethodError(RpcErrorCodes.SERVER_ERROR, `unknown frontier engine: ${frontier.engine}`);
     }
-    const session = await adapter.createSession({
-      projectDir: dir,
-      wikiMcpUrl: null,
+    const capabilities = await adapter.capabilities?.();
+    if (capabilities?.sandboxCompatibility !== "certified") {
+      throw new RpcMethodError(
+        RpcErrorCodes.SERVER_ERROR,
+        "evaluation baseline is disabled because the selected runtime has no certified sandbox",
+        { reasonCode: "eval-runtime-unsupported", policyVersion: EVAL_POLICY_VERSION },
+      );
+    }
+    const session = await engine.providerGateway.createFrontierSession(adapter, {
+      projectDir: authorWorktree.path,
+      wikiMcpUrl: wikiMcp.url,
+      wikiMcpBearerToken: wikiMcp.bearerToken,
       log: engine.log,
-      toolPolicy: { writeScope: [dir] },
-      // Distinct purpose tag (types.ts's own `resultLabel` mechanism) so a
-      // caller driving BOTH this baseline call and orchestrate's own
-      // review/escalate calls through the same registered adapter can tell
-      // them apart. NOTE (v1 scope): the REAL adapter's onResult -> meter
-      // mapping (engines/methods.ts's mapResultLabelToSource) does not know
-      // this label and falls back to "frontier-review" for accounting
-      // purposes — this pipeline never reads that bucket for its own cost
-      // math (baseline.costUsd comes directly off this turn's own events,
-      // below), only engine.models.meter.totals().pricingConfidence (which
-      // aggregates every record regardless of source) for the report card's
-      // pricingConfidence field.
+      model: frontier.model,
+      toolPolicy: { writeScope: [authorWorktree.path] },
       resultLabel: "eval-baseline",
     });
-    // engine.close() must be able to reach this session even though it was
-    // opened directly off the adapter (bypassing engine.frontier.start) —
-    // mirrors orchestrate.ts's identical track()/untrack() use for its own
-    // review/escalation sessions (M6 Task 1's eval-batch safety gate).
     const untrack = engine.frontier.track(session);
+    let summary = "";
     try {
+      supervisor?.reserveModelCall();
       const turn = await drainFrontierTurn(session, task.prompt, DEFAULT_BASELINE_TIMEOUT_MS, abortSignal);
-      costUsd = turn.costUsd;
+      recordBaselineCall(turn.costUsd);
+      summary = turn.text;
     } finally {
-      await session.close().catch(() => {
-        // Best-effort — mirrors orchestrate.ts's identical close() posture.
-      });
+      await engine.frontier.closeSession(session);
       untrack();
     }
+
+    const contract = {
+      schemaVersion: 1 as const,
+      requirements: [task.prompt],
+      constraints: [],
+      verificationCommands: task.verificationCommands ?? [],
+    };
+    const prepared = await engine.candidates.prepare(engine, {
+      projectDir: dir,
+      worktree: authorWorktree,
+      snapshot,
+      contract,
+      signal: abortSignal,
+    });
+    const reviewAdapter = engine.frontier.getAdapter(reviewFrontier.engine);
+    const reviewCapabilities = await reviewAdapter?.capabilities?.();
+    if (reviewAdapter === undefined || reviewCapabilities?.sandboxCompatibility !== "certified") {
+      throw new RpcMethodError(
+        RpcErrorCodes.SERVER_ERROR,
+        "evaluation baseline has no compliant independent reviewer",
+        { reasonCode: "eval-reviewer-unavailable", policyVersion: EVAL_POLICY_VERSION },
+      );
+    }
+    const reviewSession = await engine.providerGateway.createFrontierSession(reviewAdapter, {
+      projectDir: authorWorktree.path,
+      wikiMcpUrl: wikiMcp.url,
+      wikiMcpBearerToken: wikiMcp.bearerToken,
+      log: engine.log,
+      model: reviewFrontier.model,
+      resultLabel: "frontier-review",
+    });
+    const untrackReview = engine.frontier.track(reviewSession);
+    let reviewResult: Awaited<ReturnType<typeof reviewDiff>>;
+    try {
+      reviewResult = await reviewDiff(
+        reviewSession,
+        {
+          task: JSON.stringify({ request: task.prompt, contract }),
+          diff: "",
+          summary,
+          verifierEvidence: JSON.stringify(prepared.reports.map((report) => ({
+            stageId: report.stageId,
+            verdict: report.verdict,
+            outputRef: report.outputRef,
+          }))),
+        },
+        {
+          timeoutMs: DEFAULT_BASELINE_TIMEOUT_MS,
+          abortSignal,
+          beforePrompt: () => supervisor?.reserveModelCall(),
+          onAttemptCost: recordBaselineCall,
+        },
+      );
+    } finally {
+      await engine.frontier.closeSession(reviewSession);
+      untrackReview();
+    }
+    if (reviewResult.verdict.decision !== "approve") {
+      await manager.remove(authorWorktree).catch(() => {});
+      authorWorktree = undefined;
+      await runTaskOracle(engine, runtimeStore, dir, task, abortSignal);
+      return { passed: false, costUsd: baselineCost(), outcome: "completed", policyViolation: false };
+    }
+    const candidate = engine.candidates.mint({
+      projectDir: dir,
+      worktree: authorWorktree,
+      snapshot,
+      prepared,
+      authorAttemptId: "baseline-attempt-1",
+      authorSessionId: session.id,
+      reviewerSessionId: reviewSession.id,
+      verdict: reviewResult.verdict,
+    });
+    const grant = await engine.candidates.prepareApply(candidate.candidateId, dir);
+    await engine.candidates.apply(candidate.candidateId, grant, dir);
+    authorWorktree = undefined;
   } catch (err) {
-    // M7b Task 2: a cancellation must propagate out of runBaselineTask, NOT
-    // be soft-scored as an infra failure the way the rest of this catch
-    // treats every other throw -- checked FIRST, ahead of the existing
-    // message/log/runOracle-fallback code below.
     if (abortSignal?.aborted) throw err;
-    // A per-task baseline infra failure (missing adapter, a session/turn
-    // that throws) must not abort the WHOLE report card — mirrors
-    // runHarnessTask's identical posture for engine.orchestrate below. This
-    // is a MEASUREMENT failure (Fix 3, BaselineTaskOutcome's own doc
-    // comment) — the verdict computation must not fold it into the quality
-    // comparison the same way a genuine baseline attempt that ran to
-    // completion and simply got the task wrong would be. runOracle is
-    // deliberately NOT inside this catch: a runOracle failure is a SETUP
-    // error (see tasks.ts's own doc comment — a bad testCommand, not a
-    // failed eval) and should propagate out of runEvals entirely, not be
-    // silently folded into "baseline failed".
-    const message = err instanceof Error ? err.message : String(err);
-    engine.log(`evals.run: baseline run failed for task ${task.id}: ${message}`);
-    const oracle = await runOracle(dir, task.testCommand);
-    return { passed: oracle.passed, costUsd: null, outcome: "error" };
+    if (authorWorktree !== undefined) await manager.remove(authorWorktree).catch(() => {});
+    const reasonCode = err instanceof RpcMethodError && typeof err.data === "object" && err.data !== null
+      ? (err.data as { reasonCode?: unknown }).reasonCode
+      : undefined;
+    if (reasonCode === "command-failed" || (err instanceof Error && /candidate diff is empty/.test(err.message))) {
+      await runTaskOracle(engine, runtimeStore, dir, task, abortSignal);
+      return { passed: false, costUsd: baselineCost(), outcome: "completed", policyViolation: false };
+    }
+    engine.log("evals.run: baseline attempt failed");
+    const oracle = await runTaskOracle(engine, runtimeStore, dir, task, abortSignal);
+    return { passed: oracle.passed, costUsd: null, outcome: "error", policyViolation: oracle.policyViolation };
   }
-  const oracle = await runOracle(dir, task.testCommand);
-  return { passed: oracle.passed, costUsd, outcome: "completed" };
+  const oracle = await runTaskOracle(engine, runtimeStore, dir, task, abortSignal);
+  return {
+    passed: oracle.passed,
+    costUsd: baselineCost(),
+    outcome: oracle.measurementFailure ? "error" : "completed",
+    policyViolation: oracle.policyViolation,
+  };
 }
 
 // Turns `dir` into a plain git repo containing whatever task.setup() put
@@ -541,20 +578,12 @@ async function runBaselineTask(
 // loop below) so that bundle stays untracked in this commit either way —
 // nothing downstream needs it committed (see this module's header comment).
 //
-// M2 (final review — cheap footgun): the "already a repo" probe checks for
-// `dir`'s OWN `.git` entry (a directory for a plain repo, or the "gitdir:
-// <path>" file `git worktree add`/task.setup()'s own history-strip mechanism
-// can leave behind) rather than shelling out to `git -C dir rev-parse
-// --is-inside-work-tree`. That command answers "is ANY ancestor of dir a git
-// repo", not "is dir ITSELF a repo root" — a false positive if the eval
-// scratch tmp root (`os.tmpdir()`, mkdtemp'd by the caller) ever happened to
-// be nested inside a git repo (e.g. a CI runner whose $TMPDIR lives under a
-// checkout) would wrongly conclude `dir` is already a repo and skip `git
-// init` here, silently anchoring every subsequent git operation this
-// pipeline runs against `dir` (requireGitRepo, WorktreeManager's `git
-// worktree add ... HEAD`, `git apply --3way`) to that OUTER repo instead of
-// a fresh one rooted at `dir`. Checking for `dir`'s own `.git` path has no
-// such ambiguity: it is only ever true when `dir` itself is a repo root.
+// M2 (final review — cheap footgun): checks for `dir`'s OWN `.git` entry
+// rather than `git -C dir rev-parse --is-inside-work-tree`, which answers "is
+// any ANCESTOR of dir a git repo" -- a false positive if the eval scratch tmp
+// root were ever nested inside an outer repo would silently anchor every
+// subsequent git op here (requireGitRepo, `git worktree add`, `git apply
+// --3way`) to that OUTER repo instead of a fresh one rooted at `dir`.
 async function initEvalGitRepo(dir: string): Promise<void> {
   if (existsSync(path.join(dir, ".git"))) {
     // Already a git repo (task.setup() itself initialized one) — nothing
@@ -568,10 +597,52 @@ async function initEvalGitRepo(dir: string): Promise<void> {
   await execFileAsync("git", ["-C", dir, "commit", "-q", "-m", "eval baseline"]);
 }
 
-// HARNESS primitive: the full orchestrate loop, run against harnessDir
-// ITSELF (the same base-state scratch directory runOracle scores) — see
-// this module's header comment for the full base-identity rationale and
-// Fix 1's history. `harnessDir` must already be a valid engine.orchestrate
+async function evalTreeSha(dir: string): Promise<string> {
+  const { stdout } = await execFileAsync("git", ["-C", dir, "rev-parse", "HEAD^{tree}"], {
+    encoding: "utf8",
+  });
+  return stdout.trim();
+}
+
+interface HarnessTaskTelemetry {
+  taskClass: string;
+  routeId: string;
+  family: string;
+  dialectPack: string;
+  retryCount: number;
+  escalationCount: number;
+  interventionCount: number;
+  toolErrorCount: number;
+  policyViolation: boolean;
+  fullyPriced: boolean;
+}
+
+interface HarnessTaskResult {
+  passed: boolean;
+  costUsd: number | null;
+  outcome: HarnessTaskOutcome;
+  telemetry?: HarnessTaskTelemetry;
+}
+
+function harnessTelemetry(result: OrchestrateResult): HarnessTaskTelemetry {
+  const toolErrors = Object.entries(result.toolErrorCounts ?? {});
+  return {
+    taskClass: result.taskClass,
+    routeId: result.routeId,
+    family: result.family ?? "frontier",
+    dialectPack: result.dialectPack ?? "none",
+    retryCount: Math.max(0, result.attempts.length - 1),
+    escalationCount: result.outcome === "escalated" ? 1 : 0,
+    interventionCount: 0,
+    toolErrorCount: toolErrors.reduce((total, [, count]) => total + count, 0),
+    policyViolation: toolErrors.some(([key, count]) => count > 0 && key.endsWith(":policy_denied")),
+    fullyPriced: result.costEstimate.completeness === "complete" && result.cost.totalUsd !== null,
+  };
+}
+
+// HARNESS primitive: the full orchestrate loop, anchored to harnessDir (the
+// same base-state scratch repository the protected oracle scores).
+// `harnessDir` must already be a valid engine.orchestrate
 // `projectDir` by the time this is called: a committed git repo (
 // initEvalGitRepo) with the harness bundle written into it (writeHarness) —
 // both are the caller's (runEvals's) responsibility, done once per task
@@ -580,8 +651,16 @@ async function runHarnessTask(
   engine: Engine,
   harnessDir: string,
   task: EvalTask,
-  opts: { runId?: string; abortSignal?: AbortSignal } = {},
-): Promise<{ passed: boolean; costUsd: number | null; outcome: HarnessTaskOutcome }> {
+  runtimeStore: RuntimeStore,
+  opts: {
+    runId?: string;
+    abortSignal?: AbortSignal;
+    frontier?: EvalsFrontierSelections;
+    wikiMcp?: { url: string; bearerToken: string };
+    experimentVariant?: HarnessExperimentVariant;
+    supervisor?: RunSupervisor;
+  } = {},
+): Promise<HarnessTaskResult> {
   let result: OrchestrateResult;
   try {
     // M7b Task 2: `runId` forwarded VERBATIM -- this is the SAME batch-level
@@ -590,7 +669,21 @@ async function runHarnessTask(
     // cancelSignal resolves this identical runId to the SAME
     // AbortController via its own get()-only read, so a cancel reaches this
     // per-task harness run exactly as it reaches the baseline turn above.
-    result = await orchestrate(engine, { projectDir: harnessDir, task: task.prompt, runId: opts.runId });
+    result = await orchestrate(engine, {
+      projectDir: harnessDir,
+      task: task.prompt,
+      taskContract: {
+        schemaVersion: 1,
+        requirements: [task.prompt],
+        constraints: [],
+        verificationCommands: task.verificationCommands ?? [],
+      },
+      runId: opts.runId,
+      frontier: { review: opts.frontier?.review, escalation: opts.frontier?.escalation },
+      wikiMcp: opts.wikiMcp,
+      experimentVariant: opts.experimentVariant,
+      supervisor: opts.supervisor,
+    });
   } catch (err) {
     // M7b Task 2: a cancellation must propagate, never be soft-scored as an
     // infra failure -- checked FIRST, ahead of the existing per-task-failure
@@ -601,15 +694,12 @@ async function runHarnessTask(
     // going. See HarnessTaskOutcome's own doc comment: this is a MEASUREMENT
     // failure, not quality evidence — the verdict computation in runEvals
     // must not treat it the same as a genuinely-produced-but-worse fix.
-    // Unlike the pre-Fix-1 pipeline, there is no separate "orchestrate's own
-    // worktree, living in the real project" to lift a path for and clean up
-    // here: any worktree engine.orchestrate created lives INSIDE harnessDir,
-    // which runEvals's own per-task `finally` already removes wholesale
-    // regardless of how this task scored.
-    const message = err instanceof Error ? err.message : String(err);
-    engine.log(`evals.run: engine.orchestrate failed for task ${task.id}: ${message}`);
+    // Host-private worktrees clean up on their own; the scratch repo is removed separately, in the outer finally.
+    engine.log("evals.run: harness orchestration failed");
     return { passed: false, costUsd: null, outcome: "error" };
   }
+
+  const telemetry = harnessTelemetry(result);
 
   if (result.diff.trim().length === 0) {
     // Nothing to apply — harnessDir stays at task.setup()'s pre-change
@@ -619,12 +709,36 @@ async function runHarnessTask(
     // orchestrate.ts) — genuine quality evidence, not a measurement
     // failure: the harness had every opportunity (worker attempts + review
     // + escalation) and still produced nothing.
-    const oracle = await runOracle(harnessDir, task.testCommand);
-    return { passed: oracle.passed, costUsd: result.cost.totalUsd, outcome: result.outcome };
+    const oracle = await runTaskOracle(engine, runtimeStore, harnessDir, task, opts.abortSignal);
+    return {
+      passed: oracle.passed,
+      costUsd: result.cost.totalUsd,
+      outcome: oracle.measurementFailure ? "error" : result.outcome,
+      telemetry: {
+        ...telemetry,
+        policyViolation: telemetry.policyViolation || oracle.policyViolation,
+      },
+    };
+  }
+
+  if (result.candidateRef === null) {
+    if (result.verificationIncomplete) {
+      engine.log("evals.run: harness candidate verification was incomplete");
+      return { passed: false, costUsd: result.cost.totalUsd, outcome: "error", telemetry };
+    }
+    // Reviewer rejected a real diff -- quality evidence (final review Fix 1).
+    const oracle = await runTaskOracle(engine, runtimeStore, harnessDir, task, opts.abortSignal);
+    return {
+      passed: oracle.passed,
+      costUsd: result.cost.totalUsd,
+      outcome: oracle.measurementFailure ? "error" : result.outcome,
+      telemetry: { ...telemetry, policyViolation: telemetry.policyViolation || oracle.policyViolation },
+    };
   }
 
   try {
-    await callEngineMethod(engine, "engine.orchestrate.apply", { projectDir: harnessDir, diff: result.diff });
+    const grant = await engine.candidates.prepareApply(result.candidateRef.candidateId, harnessDir);
+    await engine.candidates.apply(result.candidateRef.candidateId, grant, harnessDir);
   } catch (err) {
     // A failed apply is a MEASUREMENT failure (HarnessTaskOutcome's own doc
     // comment) — see the verdict computation in runEvals for how this is
@@ -634,20 +748,180 @@ async function runHarnessTask(
     // can still, in principle, produce a diff that doesn't apply cleanly
     // (e.g. conflicting concurrent edits within one attempt's own worktree
     // lifecycle) — scored as a measurement failure, not a crashed run.
-    const message = err instanceof Error ? err.message : String(err);
-    engine.log(`evals.run: applying the harness diff failed for task ${task.id}: ${message}`);
-    return { passed: false, costUsd: result.cost.totalUsd, outcome: "apply-failed" };
+    engine.log("evals.run: candidate Apply failed");
+    return { passed: false, costUsd: result.cost.totalUsd, outcome: "apply-failed", telemetry };
   }
 
-  const oracle = await runOracle(harnessDir, task.testCommand);
-  return { passed: oracle.passed, costUsd: result.cost.totalUsd, outcome: result.outcome };
+  const oracle = await runTaskOracle(engine, runtimeStore, harnessDir, task, opts.abortSignal);
+  return {
+    passed: oracle.passed,
+    costUsd: result.cost.totalUsd,
+    outcome: oracle.measurementFailure ? "error" : result.outcome,
+    telemetry: {
+      ...telemetry,
+      policyViolation: telemetry.policyViolation || oracle.policyViolation,
+    },
+  };
+}
+
+interface ExperimentTrialPair {
+  matchId: string;
+  baseline: ExperimentTrial;
+  harness: ExperimentTrial;
+}
+
+function trialSeed(seed: number, index: number, arm: 0 | 1): number {
+  const value = seed + index * 2 + arm;
+  if (!Number.isSafeInteger(value)) throw new Error("experiment trial seed exceeds the safe integer range");
+  return value;
+}
+
+async function planExperimentTrials(
+  engine: Engine,
+  params: EvalsRunParams & { experiment: NonNullable<EvalsRunParams["experiment"]> },
+  harnessBundle: NonNullable<ReturnType<typeof loadHarness>>,
+): Promise<ExperimentTrialPair[]> {
+  const snapshot = await captureTaskSnapshot(engine, params.projectDir, EVAL_POLICY_VERSION);
+  const harnessFingerprint = fingerprintHarness(harnessBundle).digest;
+  const planned = params.tasks.flatMap((task, index) => {
+    const routed = routeTask(task.prompt, harnessBundle, engine.models.registry);
+    const resolution = routed.resolution;
+    const common: Pick<TrialFeatures, "taskClass" | "difficulty" | "harnessFingerprint" | "projectFingerprint"> = {
+      taskClass: routed.taskClass,
+      difficulty: routed.difficulty,
+      harnessFingerprint,
+      projectFingerprint: snapshot.projectDigest,
+    };
+    const matchId = `sample-${String(index + 1).padStart(6, "0")}`;
+    const contextPolicy: TrialFeatures["contextPolicy"] = params.experiment.variant === "full-history"
+      ? "full-history"
+      : "compaction";
+    return [
+      {
+        experimentId: params.experiment.id,
+        matchId,
+        variant: "direct-lead" as const,
+        repeatIndex: params.experiment.repeatIndex,
+        seed: trialSeed(params.experiment.seed, index, 0),
+        features: {
+          ...common,
+          routeId: "route:direct-lead",
+          family: "frontier",
+          dialectPack: "none",
+          contextPolicy: "full-history" as const,
+        },
+      },
+      {
+        experimentId: params.experiment.id,
+        matchId,
+        variant: params.experiment.variant,
+        repeatIndex: params.experiment.repeatIndex,
+        seed: trialSeed(params.experiment.seed, index, 1),
+        features: {
+          ...common,
+          routeId: routed.routeId,
+          family: resolution === "frontier" ? "frontier" : resolution.family,
+          dialectPack: resolution === "frontier"
+            ? "none"
+            : params.experiment.variant === "generic-worker"
+              ? "string-edit-default"
+              : resolution.dialectPack,
+          contextPolicy,
+        },
+      },
+    ];
+  });
+  const trials = engine.runtime.evidence.planTrials(engine.runtime.getStore(params.projectDir), planned);
+  const byKey = new Map(trials.map((trial) => [
+    `${trial.repeatIndex}:${trial.matchId}:${trial.variant}`,
+    trial,
+  ]));
+  return params.tasks.map((_, index) => {
+    const matchId = `sample-${String(index + 1).padStart(6, "0")}`;
+    const baseline = byKey.get(`${params.experiment.repeatIndex}:${matchId}:direct-lead`);
+    const harness = byKey.get(
+      `${params.experiment.repeatIndex}:${matchId}:${params.experiment.variant}`,
+    );
+    if (baseline === undefined || harness === undefined) throw new Error("experiment trial plan is incomplete");
+    return { matchId, baseline, harness };
+  });
+}
+
+type BaselineTaskResult = Awaited<ReturnType<typeof runBaselineTask>>;
+
+function resumedBaseline(trial: ExperimentTrial): BaselineTaskResult | null {
+  if (trial.metrics === undefined) return null;
+  return {
+    passed: trial.metrics.qualityScore >= 0.5,
+    costUsd: trial.metrics.costUsd,
+    outcome: trial.metrics.measurementFailure ? "error" : "completed",
+    policyViolation: trial.metrics.safetyViolation,
+  };
+}
+
+function resumedHarness(trial: ExperimentTrial): HarnessTaskResult | null {
+  if (trial.metrics === undefined) return null;
+  return {
+    passed: trial.metrics.qualityScore >= 0.5,
+    costUsd: trial.metrics.costUsd,
+    outcome: trial.metrics.measurementFailure
+      ? "error"
+      : trial.metrics.escalationCount > 0
+        ? "escalated"
+        : trial.metrics.qualityScore >= 0.5
+          ? "worker-approved"
+          : "failed",
+    telemetry: {
+      taskClass: trial.features.taskClass,
+      routeId: trial.features.routeId,
+      family: trial.features.family,
+      dialectPack: trial.features.dialectPack,
+      retryCount: trial.metrics.retryCount,
+      escalationCount: trial.metrics.escalationCount,
+      interventionCount: trial.metrics.interventionCount,
+      toolErrorCount: trial.metrics.toolErrorCount,
+      policyViolation: trial.metrics.safetyViolation,
+      fullyPriced: trial.metrics.fullyPriced,
+    },
+  };
+}
+
+function baselineTrialMetrics(result: BaselineTaskResult, latencyMs: number): TrialMetrics {
+  return {
+    qualityScore: result.passed ? 1 : 0,
+    costUsd: result.costUsd,
+    latencyMs,
+    retryCount: 0,
+    escalationCount: 0,
+    interventionCount: 0,
+    toolErrorCount: 0,
+    safetyViolation: result.policyViolation,
+    measurementFailure: result.outcome === "error",
+    fullyPriced: result.costUsd !== null,
+  };
+}
+
+function harnessTrialMetrics(result: HarnessTaskResult, latencyMs: number): TrialMetrics {
+  return {
+    qualityScore: result.passed ? 1 : 0,
+    costUsd: result.costUsd,
+    latencyMs,
+    retryCount: result.telemetry?.retryCount ?? 0,
+    escalationCount: result.telemetry?.escalationCount ?? 0,
+    interventionCount: result.telemetry?.interventionCount ?? 0,
+    toolErrorCount: result.telemetry?.toolErrorCount ?? 0,
+    safetyViolation: result.telemetry?.policyViolation ?? false,
+    measurementFailure: result.outcome === "error" || result.outcome === "apply-failed",
+    fullyPriced: result.telemetry?.fullyPriced ?? result.costUsd !== null,
+  };
 }
 
 // The pipeline itself: guard -> per-task (baseline + harness, both scored by
-// the same oracle) -> aggregate -> verdict -> manifest flip. See this
+// the same oracle) -> aggregate -> system benchmark verdict. See this
 // module's header comment for the full baseline-vs-harness wiring rationale.
 export async function runEvals(engine: Engine, params: EvalsRunParams): Promise<EvalsReportCard> {
   requireGitRepo(params.projectDir);
+  const baselineFrontier = resolveFrontierSelection(params.frontier?.baseline);
 
   let harnessBundle;
   try {
@@ -668,6 +942,25 @@ export async function runEvals(engine: Engine, params: EvalsRunParams): Promise<
   if (params.tasks.length === 0) {
     throw new RpcMethodError(RpcErrorCodes.SERVER_ERROR, "engine.evals.run requires at least one task");
   }
+  const runtimeStore = engine.runtime.getStore(params.projectDir);
+  const evalSandboxStatus = await engine.runtime.sandbox.status();
+  if (!evalSandboxStatus.available) {
+    throw new RpcMethodError(
+      RpcErrorCodes.SERVER_ERROR,
+      `evaluation sandbox is unavailable: ${evalSandboxStatus.reason ?? "startup probe failed"}`,
+      { reasonCode: "eval-sandbox-unavailable", policyVersion: EVAL_POLICY_VERSION },
+    );
+  }
+  const experimentTrials = params.experiment === undefined
+    ? undefined
+    : await planExperimentTrials(
+        engine,
+        { ...params, experiment: params.experiment },
+        harnessBundle,
+      );
+  const evidenceStore = experimentTrials === undefined
+    ? undefined
+    : runtimeStore;
 
   progress(engine, "start", undefined, params.runId);
 
@@ -691,35 +984,145 @@ export async function runEvals(engine: Engine, params: EvalsRunParams): Promise<
   const perTask: PerTaskResult[] = [];
 
   try {
-    for (const task of params.tasks) {
+    for (const [taskIndex, task] of params.tasks.entries()) {
       // Checked at the very top of each iteration, BEFORE this task's own
       // mkdtemp calls -- this is the "check the cancel signal between
       // tasks" requirement, and it also guarantees a cancelled run never
       // even starts a new task's scratch dirs.
       if (cancelSignal?.aborted) throw new RunCancelledError();
 
+      const experimentPair = experimentTrials?.[taskIndex];
+      let baseline: BaselineTaskResult | null = experimentPair === undefined
+        ? null
+        : resumedBaseline(experimentPair.baseline);
+      let harnessResult: HarnessTaskResult | null = experimentPair === undefined
+        ? null
+        : resumedHarness(experimentPair.harness);
+      if (baseline !== null && harnessResult !== null) {
+        progress(engine, "scored", task.id, params.runId);
+        if (harnessResult.outcome === "escalated") escalations += 1;
+        perTask.push({
+          id: task.id,
+          baselinePassed: baseline.passed,
+          baselineOutcome: baseline.outcome,
+          harnessPassed: harnessResult.passed,
+          harnessOutcome: harnessResult.outcome,
+          baselineUsd: baseline.costUsd,
+          harnessUsd: harnessResult.costUsd,
+          ...(baseline.policyViolation ? { baselinePolicyViolation: true } : {}),
+          ...(harnessResult.telemetry?.policyViolation === true ? { harnessPolicyViolation: true } : {}),
+        });
+        continue;
+      }
+
       // TMP placement — see this module's header comment. Never nested inside
       // params.projectDir.
       const baselineDir = await mkdtemp(path.join(os.tmpdir(), "of-eval-baseline-"));
       const harnessDir = await mkdtemp(path.join(os.tmpdir(), "of-eval-harness-"));
+      let baselineClaimed = false;
+      let harnessClaimed = false;
       try {
-        progress(engine, "baseline", task.id, params.runId);
         await task.setup(baselineDir);
-        const baseline = await runBaselineTask(engine, baselineDir, task, cancelSignal);
-
-        progress(engine, "harness", task.id, params.runId);
-        // Fix 1 (base identity — see this module's header comment): harnessDir
-        // gets the SAME task.setup() base state the baseline used, THEN a
-        // committed git repo, THEN the real project's harness bundle copied
-        // in (untracked) — only after all three is it a valid substrate for
-        // engine.orchestrate to work the task against.
         await task.setup(harnessDir);
+        await initEvalGitRepo(baselineDir);
         await initEvalGitRepo(harnessDir);
+        const [baselineTree, harnessTree] = await Promise.all([
+          evalTreeSha(baselineDir),
+          evalTreeSha(harnessDir),
+        ]);
+        if (baselineTree !== harnessTree) {
+          throw new Error(`evaluation arm snapshots differ for task ${task.id}`);
+        }
+        // Build and pin both identical committed-source indexes, then expose
+        // one authenticated server to both arms. The identity comparison
+        // prevents a transport optimization from hiding index drift.
+        await Promise.all([
+          engine.wiki.build(baselineDir),
+          engine.wiki.build(harnessDir),
+        ]);
+        const baselineWiki = engine.wiki.getStore(baselineDir);
+        const harnessWiki = engine.wiki.getStore(harnessDir);
+        if (baselineWiki.getMeta("source_fingerprint") !== harnessWiki.getMeta("source_fingerprint")) {
+          throw new Error(`evaluation arm wiki snapshots differ for task ${task.id}`);
+        }
+        const wikiServer = await engine.wiki.startMcpServer(engine, baselineDir);
+        const taskWikiMcp = { url: wikiServer.url, bearerToken: wikiServer.bearerToken };
         await writeHarness(harnessDir, harnessBundle);
-        const harnessResult = await runHarnessTask(engine, harnessDir, task, {
-          runId: params.runId,
-          abortSignal: cancelSignal,
-        });
+
+        const runBaselineArm = async (): Promise<void> => {
+          if (baseline !== null) return;
+          if (experimentPair !== undefined && evidenceStore !== undefined) {
+            const claimed = engine.runtime.evidence.claimTrialById(evidenceStore, experimentPair.baseline.id);
+            const resumed = resumedBaseline(claimed);
+            if (resumed !== null) {
+              baseline = resumed;
+              return;
+            }
+            baselineClaimed = true;
+          }
+          progress(engine, "baseline", task.id, params.runId);
+          const startedAt = Date.now();
+          baseline = await runBaselineTask(
+            engine,
+            baselineDir,
+            task,
+            baselineFrontier,
+            resolveFrontierSelection(params.frontier?.review),
+            taskWikiMcp,
+            runtimeStore,
+            cancelSignal,
+            params.supervisor,
+          );
+          if (experimentPair !== undefined && evidenceStore !== undefined) {
+            engine.runtime.evidence.completeTrial(
+              evidenceStore,
+              experimentPair.baseline.id,
+              baselineTrialMetrics(baseline, Date.now() - startedAt),
+            );
+            baselineClaimed = false;
+          }
+        };
+        const runHarnessArm = async (): Promise<void> => {
+          if (harnessResult !== null) return;
+          if (experimentPair !== undefined && evidenceStore !== undefined) {
+            const claimed = engine.runtime.evidence.claimTrialById(evidenceStore, experimentPair.harness.id);
+            const resumed = resumedHarness(claimed);
+            if (resumed !== null) {
+              harnessResult = resumed;
+              return;
+            }
+            harnessClaimed = true;
+          }
+          progress(engine, "harness", task.id, params.runId);
+          const startedAt = Date.now();
+          harnessResult = await runHarnessTask(engine, harnessDir, task, runtimeStore, {
+            runId: params.runId,
+            abortSignal: cancelSignal,
+            frontier: params.frontier,
+            wikiMcp: taskWikiMcp,
+            experimentVariant: params.experiment?.variant,
+            supervisor: params.supervisor,
+          });
+          if (experimentPair !== undefined && evidenceStore !== undefined) {
+            engine.runtime.evidence.completeTrial(
+              evidenceStore,
+              experimentPair.harness.id,
+              harnessTrialMetrics(harnessResult, Date.now() - startedAt),
+            );
+            harnessClaimed = false;
+          }
+        };
+        if (params.armOrder === "harness-first") {
+          await runHarnessArm();
+          await runBaselineArm();
+        } else {
+          await runBaselineArm();
+          await runHarnessArm();
+        }
+
+        if (baseline === null || harnessResult === null) {
+          throw new Error("evaluation arm did not produce a result");
+        }
 
         progress(engine, "scored", task.id, params.runId);
 
@@ -733,14 +1136,22 @@ export async function runEvals(engine: Engine, params: EvalsRunParams): Promise<
           harnessOutcome: harnessResult.outcome,
           baselineUsd: baseline.costUsd,
           harnessUsd: harnessResult.costUsd,
+          ...(baseline.policyViolation ? { baselinePolicyViolation: true } : {}),
+          ...(harnessResult.telemetry?.policyViolation === true ? { harnessPolicyViolation: true } : {}),
         });
       } finally {
-        // Eval scratch is transient (unlike orchestrate's own user-facing
-        // worktrees) — always auto-remove, success or failure (including a
-        // cancellation re-thrown from inside this try — a JS `finally`
-        // runs on any exit path). This also removes any worktree
-        // engine.orchestrate created for the harness side, since (post Fix
-        // 1) those always live INSIDE harnessDir.
+        // Eval scratch repositories are transient and always removed on
+        // success, failure, or cancellation. CandidateService removes an
+        // applied candidate worktree immediately; engine shutdown removes
+        // any remaining in-memory candidate authority and worktrees.
+        if (baselineClaimed && evidenceStore !== undefined && experimentPair !== undefined) {
+          engine.runtime.evidence.releaseTrial(evidenceStore, experimentPair.baseline.id);
+        }
+        if (harnessClaimed && evidenceStore !== undefined && experimentPair !== undefined) {
+          engine.runtime.evidence.releaseTrial(evidenceStore, experimentPair.harness.id);
+        }
+        await engine.wiki.releaseProject(baselineDir);
+        await engine.wiki.releaseProject(harnessDir);
         await rm(baselineDir, { recursive: true, force: true });
         await rm(harnessDir, { recursive: true, force: true });
       }
@@ -776,20 +1187,23 @@ export async function runEvals(engine: Engine, params: EvalsRunParams): Promise<
       familyCatalogVersion: m.familyCatalogVersion ?? FAMILY_CATALOG_VERSION,
       dialectPackVersion: m.dialectPackVersion ?? DIALECT_PACK_CATALOG_VERSION,
       routePolicyVersion: m.routePolicyVersion ?? String(harnessBundle.routing.version),
-      frontierEngine: FRONTIER_KIND,
+      evalPolicyVersion: EVAL_POLICY_VERSION,
+      evaluatorOracleIdentity: EVALUATOR_ORACLE_IDENTITY,
+      frontierEngine: [
+        `review=${resolveFrontierSelection(params.frontier?.review).engine}`,
+        `escalation=${resolveFrontierSelection(params.frontier?.escalation).engine}`,
+        `baseline=${baselineFrontier.engine}`,
+      ].join(","),
+      frontierRoles: {
+        ...(m.planningFrontier !== undefined ? { planning: m.planningFrontier } : {}),
+        review: resolveFrontierSelection(params.frontier?.review),
+        escalation: resolveFrontierSelection(params.frontier?.escalation),
+        baseline: baselineFrontier,
+      },
     },
   });
 
-  // engine.evals.run flips the manifest on a definitive verdict only — an
-  // "inconclusive" run leaves manifest.verification.evals exactly as it was
-  // (typically "pending" from generation). The pure computeEvalsVerdict
-  // never touches disk — this side effect stays here so the bench path
-  // cannot flip a throwaway django/sphinx manifest.
-  if (report.verdict === "pass") {
-    await setEvalsVerdict(params.projectDir, "pass");
-  } else if (report.verdict === "fail") {
-    await setEvalsVerdict(params.projectDir, "fail");
-  }
-
+  // Benchmark results describe this pinned system configuration. They never
+  // certify or mutate the individual project harness used to run the sample.
   return report;
 }

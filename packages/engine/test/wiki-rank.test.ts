@@ -27,6 +27,15 @@ describe("rankFiles", () => {
     const ranked = rankFiles(symbols, []);
     expect(ranked[0]?.definedSymbols).toEqual(["one", "two"]);
   });
+
+  it("personalizes ranking toward files matched by a task query", () => {
+    const symbols = [sym("wiki.ts", "rebuildWiki"), sym("payments.ts", "checkout")];
+    const ranked = rankFiles(symbols, [], {
+      personalization: new Map([["payments.ts", 1]]),
+    });
+    expect(ranked[0]?.file).toBe("payments.ts");
+    expect(ranked[0]?.taskRelevance).toBe(1);
+  });
 });
 
 describe("renderRepoMap", () => {
@@ -50,5 +59,22 @@ describe("renderRepoMap", () => {
     const map = renderRepoMap(ranked, 1000);
     expect(map).toContain("b.ts");
     expect(map).not.toContain("a.ts");
+  });
+
+  it("renders task-match reasons and one-based symbol line anchors", () => {
+    const map = renderRepoMap(
+      [
+        {
+          file: "src/wiki.ts",
+          score: 1,
+          definedSymbols: ["rebuildWiki"],
+          symbolAnchors: [{ name: "rebuildWiki", kind: "function", row: 41 }],
+          taskRelevance: 1,
+        },
+      ],
+      100,
+    );
+    expect(map).toContain("why: matches the task query");
+    expect(map).toContain("rebuildWiki@L42");
   });
 });

@@ -59,6 +59,11 @@ const RESULT_MSG = {
   uuid: "11111111-1111-1111-1111-111111111111",
 } as unknown as SDKMessage;
 
+const STRUCTURED_RESULT_MSG = {
+  ...(RESULT_MSG as unknown as Record<string, unknown>),
+  structured_output: { answer: 42 },
+} as unknown as SDKMessage;
+
 // Minimal `Query` fake: an async generator over a fixed script, plus a
 // `close()` spy. `Query` extends AsyncGenerator and adds ~20 CLI-control
 // methods (rewindFiles, setMcpServers, streamInput, ...) our adapter never
@@ -150,6 +155,21 @@ describe("createClaudeAdapter", () => {
     expect(createClaudeAdapter({ queryFn }).kind).toBe("claude-code");
   });
 
+  it("passes an explicit role model to the Claude Agent SDK", async () => {
+    const { queryFn, captured } = makeQueryFn([[RESULT_MSG]]);
+    const adapter = createClaudeAdapter({ queryFn });
+    const session = await adapter.createSession({
+      projectDir: "/repo",
+      wikiMcpUrl: null,
+      log: noopLog,
+      model: "opus[1m]",
+    });
+
+    await drain(session.prompt("hi"));
+
+    expect(captured[0]?.model).toBe("opus[1m]");
+  });
+
   it("maps SDK messages to text, tool_use, then result FrontierEvents", async () => {
     const { queryFn } = makeQueryFn([[SYSTEM_MSG, ASSISTANT_MSG, RESULT_MSG]]);
     const adapter = createClaudeAdapter({ queryFn });
@@ -175,6 +195,32 @@ describe("createClaudeAdapter", () => {
     });
   });
 
+  it("passes JSON schema output format and maps successful structured output", async () => {
+    const { queryFn, captured } = makeQueryFn([[STRUCTURED_RESULT_MSG]]);
+    const adapter = createClaudeAdapter({ queryFn });
+    const session = await adapter.createSession({ projectDir: "/repo", wikiMcpUrl: null, log: noopLog });
+    const schema = {
+      type: "object",
+      properties: { answer: { type: "number" } },
+      required: ["answer"],
+    };
+
+    const events = await drain(session.prompt("hi", { outputSchema: schema }));
+
+    expect(captured[0]?.outputFormat).toEqual({ type: "json_schema", schema });
+    expect(events.at(-1)).toMatchObject({ type: "result", structuredOutput: { answer: 42 } });
+  });
+
+  it("leaves Claude prompts without a schema unchanged", async () => {
+    const { queryFn, captured } = makeQueryFn([[RESULT_MSG]]);
+    const adapter = createClaudeAdapter({ queryFn });
+    const session = await adapter.createSession({ projectDir: "/repo", wikiMcpUrl: null, log: noopLog });
+
+    await drain(session.prompt("hi"));
+
+    expect(captured[0]?.outputFormat).toBeUndefined();
+  });
+
   it("captures engineSessionId from the result and passes it as resume on the next prompt", async () => {
     const { queryFn, captured } = makeQueryFn([[RESULT_MSG], [RESULT_MSG]]);
     const adapter = createClaudeAdapter({ queryFn });
@@ -193,11 +239,16 @@ describe("createClaudeAdapter", () => {
     const sessionWithWiki = await adapterWithWiki.createSession({
       projectDir: "/repo",
       wikiMcpUrl: "http://127.0.0.1:9999/mcp",
+      wikiMcpBearerToken: "ephemeral-token",
       log: noopLog,
     });
     await drain(sessionWithWiki.prompt("hi"));
     expect(withWiki.captured[0]?.mcpServers).toEqual({
-      wiki: { type: "http", url: "http://127.0.0.1:9999/mcp" },
+      wiki: {
+        type: "http",
+        url: "http://127.0.0.1:9999/mcp",
+        headers: { Authorization: "Bearer ephemeral-token" },
+      },
     });
 
     const noWiki = makeQueryFn([[RESULT_MSG]]);
@@ -221,9 +272,6 @@ describe("createClaudeAdapter", () => {
     // v1 allowlist — `git log --output=/path` writes a file, which breaches
     // the read-only posture this list exists to enforce.
     expect(captured[0]?.allowedTools).toEqual([
-      "Read",
-      "Grep",
-      "Glob",
       "mcp__wiki__wiki_query",
       "mcp__wiki__wiki_map",
     ]);
@@ -635,9 +683,6 @@ describe("canUseTool write-scope policy (toolPolicy.writeScope)", () => {
   it("never adds write tools to allowedTools even when writeScope is set", async () => {
     const { captured } = await getCanUseTool({ writeScope: ["/repo/scratch"] }, "/repo");
     expect(captured[0]?.allowedTools).toEqual([
-      "Read",
-      "Grep",
-      "Glob",
       "mcp__wiki__wiki_query",
       "mcp__wiki__wiki_map",
     ]);

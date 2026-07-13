@@ -1,8 +1,9 @@
 import { randomBytes } from "node:crypto";
-import { existsSync, readdirSync, readFileSync, rmSync } from "node:fs";
+import { closeSync, existsSync, fsyncSync, openSync, readdirSync, readFileSync } from "node:fs";
 import { mkdir, rename, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
+import { z } from "zod";
 import { ensureGitignoreGuard } from "../util/gitignore-guard.js";
 import {
   AgentDefSchema,
@@ -10,6 +11,7 @@ import {
   ManifestSchema,
   RoutingSchema,
   WikiPageSchema,
+  validateHarness,
   type AgentDef,
   type HarnessBundle,
   type Manifest,
@@ -17,6 +19,7 @@ import {
   type WikiPage,
 } from "./schema.js";
 import { upgradeHarnessV1ToV2 } from "./upgrade.js";
+import { fingerprintHarness, type HarnessFingerprint } from "./fingerprint.js";
 
 // Thrown by loadHarness/harnessStatus when on-disk content under
 // `.openfusion/` fails to parse (bad JSON/YAML, missing frontmatter fence,
@@ -38,20 +41,67 @@ export function harnessDir(projectDir: string): string {
   return path.join(projectDir, ".openfusion");
 }
 
-function manifestPath(projectDir: string): string {
-  return path.join(harnessDir(projectDir), "manifest.json");
+const CurrentPointerSchema = z.object({
+  schemaVersion: z.literal(1),
+  generationId: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]*$/),
+  fingerprint: z.string().regex(/^sha256:[a-f0-9]{64}$/),
+  createdAt: z.iso.datetime(),
+}).strict();
+export type HarnessGenerationPointer = z.infer<typeof CurrentPointerSchema>;
+
+function currentPointerPath(projectDir: string): string {
+  return path.join(harnessDir(projectDir), "current.json");
 }
 
-function wikiDir(projectDir: string): string {
-  return path.join(harnessDir(projectDir), "wiki");
+function generationsDir(projectDir: string): string {
+  return path.join(harnessDir(projectDir), "generations");
 }
 
-function agentsDir(projectDir: string): string {
-  return path.join(harnessDir(projectDir), "agents");
+function legacyHarnessRoot(projectDir: string): string {
+  return harnessDir(projectDir);
 }
 
-function routingPath(projectDir: string): string {
-  return path.join(harnessDir(projectDir), "routing.yaml");
+function manifestPath(rootDir: string): string {
+  return path.join(rootDir, "manifest.json");
+}
+
+function wikiDir(rootDir: string): string {
+  return path.join(rootDir, "wiki");
+}
+
+function agentsDir(rootDir: string): string {
+  return path.join(rootDir, "agents");
+}
+
+function routingPath(rootDir: string): string {
+  return path.join(rootDir, "routing.yaml");
+}
+
+function parseCurrentPointer(projectDir: string): HarnessGenerationPointer | null {
+  const pointerPath = currentPointerPath(projectDir);
+  if (!existsSync(pointerPath)) return null;
+  let value: unknown;
+  try {
+    value = JSON.parse(readFileSync(pointerPath, "utf8"));
+  } catch {
+    throw new HarnessValidationError("current.json is not valid JSON");
+  }
+  const result = CurrentPointerSchema.safeParse(value);
+  if (!result.success) {
+    throw new HarnessValidationError("current.json failed schema validation", result.error.issues);
+  }
+  return result.data;
+}
+
+export function activeHarnessDir(projectDir: string): string | null {
+  const pointer = parseCurrentPointer(projectDir);
+  if (pointer !== null) return path.join(generationsDir(projectDir), pointer.generationId);
+  const legacyRoot = legacyHarnessRoot(projectDir);
+  return existsSync(manifestPath(legacyRoot)) ? legacyRoot : null;
+}
+
+export function loadHarnessGenerationId(projectDir: string): string | null {
+  return parseCurrentPointer(projectDir)?.generationId ?? null;
 }
 
 // Atomic per-file write: the full content is built as a string BEFORE any
@@ -71,10 +121,27 @@ async function atomicWriteFile(filePath: string, content: string): Promise<void>
   );
   try {
     await writeFile(tmpPath, content, "utf8");
+    const fd = openSync(tmpPath, "r");
+    try {
+      fsyncSync(fd);
+    } finally {
+      closeSync(fd);
+    }
     await rename(tmpPath, filePath);
+    fsyncDirectory(path.dirname(filePath));
   } catch (err) {
     await rm(tmpPath, { force: true });
     throw err;
+  }
+}
+
+function fsyncDirectory(dirPath: string): void {
+  let fd: number | undefined;
+  try {
+    fd = openSync(dirPath, "r");
+    fsyncSync(fd);
+  } finally {
+    if (fd !== undefined) closeSync(fd);
   }
 }
 
@@ -84,93 +151,15 @@ const WIKI_SUBDIR = "wiki";
 const AGENTS_SUBDIR = "agents";
 const ROUTING_RELPATH = "routing.yaml";
 
-// Relative-POSIX-path artifact list this bundle will write, in the same
-// order as writeHarness's content writes (routing, then pages, then
-// agents). This is the exact list recorded into manifest.artifacts, and is
-// also diffed against the PRIOR manifest's artifacts to determine what's
-// safe to prune (see pruneRemovedArtifacts).
+// Relative POSIX paths owned by one immutable generation. The manifest
+// records this list so readers can validate the complete generation without
+// scanning unrelated `.openfusion` state.
 function computeArtifactPaths(bundle: { pages: WikiPage[]; agents: AgentDef[] }): string[] {
   return [
     ROUTING_RELPATH,
     ...bundle.pages.map((page) => `${WIKI_SUBDIR}/${page.slug}${WIKI_PAGE_EXT}`),
     ...bundle.agents.map((agent) => `${AGENTS_SUBDIR}/${agent.name}${AGENT_DEF_EXT}`),
   ];
-}
-
-// Reads the artifacts list off the manifest ALREADY on disk (if any),
-// before writeHarness writes anything new — this is "what the PRIOR
-// generation is on record as having written", the only set of files a
-// regeneration is ever allowed to prune. Never throws: a missing manifest,
-// unparseable JSON, or a manifest that fails schema validation all
-// conservatively resolve to `[]` (nothing known, so nothing pruned) rather
-// than blocking a new write over a problem with the OLD manifest.
-function readOldManifestArtifacts(projectDir: string): string[] {
-  const mPath = manifestPath(projectDir);
-  if (!existsSync(mPath)) return [];
-  try {
-    const json: unknown = JSON.parse(readFileSync(mPath, "utf8"));
-    const result = ManifestSchema.safeParse(json);
-    return result.success ? result.data.artifacts : [];
-  } catch {
-    return [];
-  }
-}
-
-// Resolves a manifest-recorded relative artifact path to an absolute path,
-// but ONLY if it lands inside wiki/ (as a .md file), agents/ (as a .yaml
-// file), or is exactly routing.yaml — the sole three locations writeHarness
-// itself ever writes content into. Returns null for anything else
-// (".." traversal, cache/, .gitignore, manifest.json, or anything outside
-// .openfusion entirely), which pruneRemovedArtifacts treats as "skip,
-// don't delete". This is an allowlist, not a denylist, specifically so a
-// malformed or hand-edited manifest.artifacts entry can never cause
-// deletion of something outside the three directories writeHarness owns.
-function resolvePrunablePath(projectDir: string, relPath: string): string | null {
-  const segments = relPath.split("/").filter((s) => s.length > 0 && s !== ".");
-  if (segments.length === 0 || segments.some((s) => s === "..")) return null;
-
-  const dir = harnessDir(projectDir);
-  const abs = path.resolve(dir, ...segments);
-
-  if (abs === routingPath(projectDir)) return abs;
-
-  const wDir = wikiDir(projectDir);
-  if ((abs === wDir || abs.startsWith(wDir + path.sep)) && abs.endsWith(WIKI_PAGE_EXT)) return abs;
-
-  const aDir = agentsDir(projectDir);
-  if ((abs === aDir || abs.startsWith(aDir + path.sep)) && abs.endsWith(AGENT_DEF_EXT)) return abs;
-
-  return null;
-}
-
-// Deletes every path in `oldArtifacts` that isn't in `newArtifacts` — i.e.
-// files the PRIOR manifest declared it wrote that THIS generation didn't
-// rewrite (an agent dropped from the bundle, a wiki page renamed to a new
-// slug). Only ever called AFTER the new manifest.json has been written
-// successfully: at that point this generation's own content is fully and
-// durably on disk, so pruning can only remove genuinely-stale prior-
-// generation files, never anything belonging to the generation that just
-// committed. A file never recorded in any manifest (hand-authored via the
-// Harness editor, spec §7.4) can never appear in `oldArtifacts` and is
-// therefore never a candidate for deletion here.
-//
-// Deliberately swallows all per-file errors (including a permission
-// failure or the file already being gone): a prune failure must never
-// throw out of writeHarness once the new manifest is committed — the new
-// generation already succeeded, and undoing that success (or leaving
-// writeHarness's caller thinking it failed) over a best-effort cleanup step
-// would be strictly worse than leaving one stale file behind.
-function pruneRemovedArtifacts(projectDir: string, oldArtifacts: string[], newArtifacts: ReadonlySet<string>): void {
-  for (const relPath of oldArtifacts) {
-    if (newArtifacts.has(relPath)) continue;
-    const absPath = resolvePrunablePath(projectDir, relPath);
-    if (absPath === null) continue;
-    try {
-      rmSync(absPath, { force: true });
-    } catch {
-      // Best-effort — see function header comment.
-    }
-  }
 }
 
 // `---\ntitle: ...\ndigest: ...\n---\n\n<body>` — YAML frontmatter (title +
@@ -256,96 +245,85 @@ function readRequiredDir(dirPath: string, describe: string): string[] {
   }
 }
 
-// Writes every harness artifact for `bundle` under
-// `<projectDir>/.openfusion/`: wiki/<slug>.md, agents/<name>.yaml,
-// routing.yaml, and — LAST, once everything else has landed — manifest.json.
-// `bundle` is validated against HarnessBundleSchema BEFORE any filesystem
-// call — an invalid bundle throws synchronously (a rejected zod parse) with
-// nothing written. Each artifact file is written atomically (see
-// atomicWriteFile); this call does not itself make the whole multi-file
-// write transactional (a mid-sequence failure can leave earlier files
-// written and later ones absent), only that no individual file is ever left
-// partially written.
-//
-// manifest.json is deliberately written LAST, after every other artifact
-// has fully succeeded, because it is the completion marker both readers
-// rely on: harnessStatus() reads ONLY manifest.json (cheap, poll-friendly)
-// and reports it at face value, and loadHarness() treats manifest.json's
-// absence as the sole "nothing generated yet" signal. If manifest.json were
-// written first (or anywhere but last) and a later artifact write failed,
-// manifest.json would sit on disk claiming `verification.structural: "pass"`
-// over a wiki/agents/routing set that's missing or stale — harnessStatus
-// would report a broken harness as healthy, and on the next regeneration
-// attempt a Frankenstein bundle (new manifest + leftover stale artifact)
-// could load without error. With manifest-last, manifest.json's mere
-// presence reliably means this generation's other artifacts are fully on
-// disk; a failure anywhere before it leaves the previous generation's
-// manifest (and bundle) exactly as they were.
-//
-// manifest.artifacts (schema.ts) records the exact relative-path set this
-// call writes (routing.yaml, wiki/<slug>.md per page, agents/<name>.yaml
-// per agent — never manifest.json itself, never cache/). Stale-artifact
-// pruning is driven entirely off that field rather than a raw directory
-// scan: readOldManifestArtifacts reads the manifest ALREADY on disk (i.e.
-// the prior generation's declared file set) BEFORE this call writes
-// anything, and pruneRemovedArtifacts — invoked only AFTER the NEW
-// manifest.json has been written successfully — deletes whatever's in that
-// old set but not in this generation's new set. Two consequences of doing
-// it this way, both required by review: (1) a file a user hand-added under
-// wiki/ or agents/ via the Harness editor (spec §7.4) was never in any
-// manifest.artifacts and can therefore never be a prune candidate, however
-// many regenerations run after it's added; (2) if the manifest write itself
-// fails, pruning — ordered strictly after it — never runs at all, so a
-// manifest-write failure can never cost the last known-good generation's
-// content (only a failed regeneration attempt, with the old manifest and
-// old bundle both left exactly as they were).
-//
-// Never touches `.openfusion/cache/` (the wiki symbol-index store) — this
-// function neither reads nor writes anything under that path.
+// Build a complete immutable generation in a temporary sibling directory,
+// validate it through the normal reader, then atomically publish current.json.
+// A failure before the pointer swap cannot change the active generation.
+// Legacy flat harnesses remain readable and are superseded on the first
+// successful generation write. `.openfusion/cache/` is never touched here.
 export async function writeHarness(
   projectDir: string,
   bundle: HarnessBundle,
-): Promise<{ files: string[] }> {
+): Promise<{ files: string[]; generationId: string; fingerprint: string }> {
   const parsed = HarnessBundleSchema.parse(bundle);
   const dir = harnessDir(projectDir);
-
-  // Must happen before any write below: this is the last chance to see what
-  // the PRIOR generation (if any) declared it wrote.
-  const oldArtifacts = readOldManifestArtifacts(projectDir);
   const newArtifacts = computeArtifactPaths(parsed);
-
   ensureGitignoreGuard(dir, ["cache/"]);
+  const manifestWithArtifacts: Manifest = { ...parsed.manifest, artifacts: newArtifacts };
+  const candidate: HarnessBundle = { ...parsed, manifest: manifestWithArtifacts };
+  const issues = validateHarness(candidate);
+  if (issues.length > 0) {
+    throw new HarnessValidationError("harness failed cross-artifact validation", issues);
+  }
+  const fingerprint = fingerprintHarness(candidate).digest;
+  const generationId = `${Date.now().toString(36)}-${randomBytes(8).toString("hex")}`;
+  const generationRoot = path.join(generationsDir(projectDir), generationId);
+  const temporaryRoot = path.join(
+    generationsDir(projectDir),
+    `.tmp-${generationId}-${process.pid}-${randomBytes(4).toString("hex")}`,
+  );
 
+  await mkdir(temporaryRoot, { recursive: true });
   const contentWrites: Array<[absPath: string, content: string]> = [
-    [routingPath(projectDir), stringifyYaml(parsed.routing)],
+    [routingPath(temporaryRoot), stringifyYaml(parsed.routing)],
     ...parsed.pages.map(
-      (page): [string, string] => [path.join(wikiDir(projectDir), `${page.slug}${WIKI_PAGE_EXT}`), renderWikiPage(page)],
+      (page): [string, string] => [path.join(wikiDir(temporaryRoot), `${page.slug}${WIKI_PAGE_EXT}`), renderWikiPage(page)],
     ),
     ...parsed.agents.map(
       (agent): [string, string] => [
-        path.join(agentsDir(projectDir), `${agent.name}${AGENT_DEF_EXT}`),
+        path.join(agentsDir(temporaryRoot), `${agent.name}${AGENT_DEF_EXT}`),
         stringifyYaml(agent),
       ],
     ),
+    [manifestPath(temporaryRoot), `${JSON.stringify(manifestWithArtifacts, null, 2)}\n`],
   ];
+  try {
+    for (const [absPath, content] of contentWrites) await atomicWriteFile(absPath, content);
 
-  for (const [absPath, content] of contentWrites) {
-    await atomicWriteFile(absPath, content);
+    // Read the completed candidate through the same parser used by normal
+    // readers before publishing it. A failed parse leaves current.json
+    // untouched, so the previous generation remains authoritative.
+    const reloaded = loadHarnessAtRoot(temporaryRoot);
+    const reloadFingerprint = fingerprintHarness(reloaded).digest;
+    if (reloadFingerprint !== fingerprint) {
+      throw new HarnessValidationError("harness generation reload fingerprint mismatch");
+    }
+
+    await mkdir(generationsDir(projectDir), { recursive: true });
+    await rename(temporaryRoot, generationRoot);
+    fsyncDirectory(generationsDir(projectDir));
+    const pointer = CurrentPointerSchema.parse({
+      schemaVersion: 1,
+      generationId,
+      fingerprint,
+      createdAt: new Date().toISOString(),
+    });
+    await atomicWriteFile(currentPointerPath(projectDir), `${JSON.stringify(pointer, null, 2)}\n`);
+    fsyncDirectory(dir);
+
+    return {
+      files: [
+        ...contentWrites.map(([absPath]) =>
+          path.relative(projectDir, path.join(generationRoot, path.relative(temporaryRoot, absPath))),
+        ),
+        path.relative(projectDir, currentPointerPath(projectDir)),
+      ],
+      generationId,
+      fingerprint,
+    };
+  } catch (error) {
+    await rm(temporaryRoot, { recursive: true, force: true });
+    throw error;
   }
-
-  const manifestWithArtifacts: Manifest = { ...parsed.manifest, artifacts: newArtifacts };
-  const manifestWrite: [absPath: string, content: string] = [
-    manifestPath(projectDir),
-    `${JSON.stringify(manifestWithArtifacts, null, 2)}\n`,
-  ];
-  await atomicWriteFile(...manifestWrite);
-
-  // Only now — new manifest safely committed — is it safe to prune what the
-  // OLD manifest declared but this generation didn't rewrite.
-  pruneRemovedArtifacts(projectDir, oldArtifacts, new Set(newArtifacts));
-
-  const writes = [...contentWrites, manifestWrite];
-  return { files: writes.map(([absPath]) => path.relative(projectDir, absPath)) };
 }
 
 // Loads the harness bundle back off disk. Returns `null` when no harness has
@@ -354,36 +332,72 @@ export async function writeHarness(
 // fails its schema, an agent file/name mismatch) throws
 // HarnessValidationError. Synchronous, matching the store's other read-path
 // (openWikiStore) — loading a harness is not expected to be a hot path.
-export function loadHarness(projectDir: string): HarnessBundle | null {
-  const mPath = manifestPath(projectDir);
-  if (!existsSync(mPath)) return null;
+function loadHarnessAtRoot(rootDir: string): HarnessBundle {
+  const manifest = parseManifestFile(manifestPath(rootDir));
 
-  const manifest = parseManifestFile(mPath);
-
-  const wikiFiles = readRequiredDir(wikiDir(projectDir), "wiki/ directory")
+  const wikiFiles = readRequiredDir(wikiDir(rootDir), "wiki/ directory")
     .filter((f) => f.endsWith(WIKI_PAGE_EXT))
     .sort();
   const pages: WikiPage[] = wikiFiles.map((file) => {
     const slug = file.slice(0, -WIKI_PAGE_EXT.length);
-    const raw = readRequiredFile(path.join(wikiDir(projectDir), file), `wiki page "${slug}"`);
+    const raw = readRequiredFile(path.join(wikiDir(rootDir), file), `wiki page "${slug}"`);
     return parseWikiPage(slug, raw);
   });
 
-  const agentFiles = readRequiredDir(agentsDir(projectDir), "agents/ directory")
+  const agentFiles = readRequiredDir(agentsDir(rootDir), "agents/ directory")
     .filter((f) => f.endsWith(AGENT_DEF_EXT))
     .sort();
   const agents: AgentDef[] = agentFiles.map((file) => {
     const baseName = file.slice(0, -AGENT_DEF_EXT.length);
-    const raw = readRequiredFile(path.join(agentsDir(projectDir), file), `agent "${baseName}"`);
+    const raw = readRequiredFile(path.join(agentsDir(rootDir), file), `agent "${baseName}"`);
     return parseAgentDef(baseName, raw);
   });
 
-  const routing = parseRoutingFile(routingPath(projectDir));
+  const routing = parseRoutingFile(routingPath(rootDir));
 
   // Phase 1: normalize v1 / partially-v2 on-disk bundles to the v2 shape
   // (family, dialectPack, routeIds, manifest version pins). Pure in-memory
   // upgrade — does not rewrite disk until the next writeHarness/generate.
   return upgradeHarnessV1ToV2({ manifest, pages, agents, routing });
+}
+
+export interface LoadedHarnessSnapshot {
+  bundle: HarnessBundle;
+  generationId: string | null;
+  fingerprint: HarnessFingerprint;
+}
+
+/** Pins one pointer read so bundle, generation, and fingerprint cannot mix. */
+export function loadHarnessSnapshot(projectDir: string): LoadedHarnessSnapshot | null {
+  const pointer = parseCurrentPointer(projectDir);
+  const rootDir = pointer === null
+    ? (existsSync(manifestPath(harnessDir(projectDir))) ? harnessDir(projectDir) : null)
+    : path.join(generationsDir(projectDir), pointer.generationId);
+  if (rootDir === null) return null;
+  if (!existsSync(rootDir)) throw new HarnessValidationError("active harness generation is missing");
+  const bundle = loadHarnessAtRoot(rootDir);
+  const fingerprint = fingerprintHarness(bundle);
+  if (pointer !== null) {
+    if (fingerprint.digest !== pointer.fingerprint) {
+      throw new HarnessValidationError(
+        "active immutable harness generation was modified outside an approved write",
+      );
+    }
+  }
+  return { bundle, generationId: pointer?.generationId ?? null, fingerprint };
+}
+
+export function loadHarness(projectDir: string): HarnessBundle | null {
+  return loadHarnessSnapshot(projectDir)?.bundle ?? null;
+}
+
+/**
+ * Load and fingerprint the effective on-disk harness. The same validation
+ * and v1-to-v2 normalization as loadHarness() applies; a missing harness is
+ * the only case that returns null.
+ */
+export function loadHarnessFingerprint(projectDir: string): HarnessFingerprint | null {
+  return loadHarnessSnapshot(projectDir)?.fingerprint ?? null;
 }
 
 function parseManifestFile(mPath: string): Manifest {
@@ -424,68 +438,32 @@ function parseRoutingFile(rPath: string): Routing {
 export function harnessStatus(projectDir: string): {
   present: boolean;
   structural: "pass" | "fail" | null;
-  evals: string | null;
   headSha: string | null;
   card: "draft" | "approved" | null;
 } {
-  const mPath = manifestPath(projectDir);
-  if (!existsSync(mPath)) {
-    return { present: false, structural: null, evals: null, headSha: null, card: null };
+  const rootDir = activeHarnessDir(projectDir);
+  if (rootDir === null) {
+    return { present: false, structural: null, headSha: null, card: null };
   }
-  const manifest = parseManifestFile(mPath);
+  const manifest = parseManifestFile(manifestPath(rootDir));
+  const pointer = parseCurrentPointer(projectDir);
+  if (pointer !== null) {
+    // The cheap status path still validates the pointer and manifest. Full
+    // generation fingerprint validation remains in loadHarness().
+    if (!existsSync(rootDir)) throw new HarnessValidationError("active harness generation is missing");
+  }
   return {
     present: true,
     structural: manifest.verification.structural,
-    evals: manifest.verification.evals,
     headSha: manifest.headSha,
     card: manifest.verification.card ?? null,
   };
 }
 
-// M6 Task 4 (the ETH-hazard gate manifest flip): updates ONLY
-// manifest.verification.evals, in place — every other manifest field
-// (schemaVersion, generatorVersion, engine, headSha, generatedAt,
-// verification.structural, and — load-bearing — `artifacts`, the pruning
-// bookkeeping writeHarness relies on) is preserved verbatim. Deliberately
-// does NOT go through writeHarness/HarnessBundleSchema (which would require
-// re-reading and re-validating wiki/agents/routing just to flip one boolean-
-// ish field, and would rewrite every artifact file on disk for no content
-// change): this reads manifest.json directly and rewrites ONLY that one
-// file, reusing atomicWriteFile for the same tmp-then-rename atomicity
-// writeHarness itself relies on. Since manifest.json is the ONLY file this
-// function touches, "manifest-last atomicity" is trivially satisfied — there
-// is nothing else to sequence before it.
-//
-// Throws HarnessValidationError (not a silent no-op) when no harness has
-// been generated yet, or the on-disk manifest is corrupt/invalid — flipping
-// an evals verdict for a harness that doesn't exist (or can't be trusted) is
-// a caller error, not a case to swallow quietly. engine.evals.run
-// (evals/run.ts) calls this only on "pass"/"fail" verdicts; an
-// "inconclusive" run deliberately never calls this at all, leaving whatever
-// value was already on disk (typically "pending" from generation, but also
-// possibly a prior real run's "pass"/"fail" — this function does not force
-// it back to "pending").
-export async function setEvalsVerdict(
-  projectDir: string,
-  verdict: Manifest["verification"]["evals"],
-): Promise<void> {
-  const mPath = manifestPath(projectDir);
-  if (!existsSync(mPath)) {
-    throw new HarnessValidationError("no harness; run engine.harness.generate first");
-  }
-  const manifest = parseManifestFile(mPath);
-  const updated: Manifest = {
-    ...manifest,
-    verification: { ...manifest.verification, evals: verdict },
-  };
-  await atomicWriteFile(mPath, `${JSON.stringify(updated, null, 2)}\n`);
-}
-
 // The project-card human-approval gate (spec §3.4, a later task's UI flow):
 // updates ONLY manifest.verification.card, in place — every other manifest
 // field (schemaVersion, generatorVersion, engine, headSha, generatedAt,
-// verification.structural, verification.evals, and artifacts) is preserved
-// verbatim. Mirrors setEvalsVerdict exactly, for the same reasons: this
+// verification.structural and artifacts) is preserved verbatim. This
 // reads manifest.json directly and rewrites ONLY that one file via
 // atomicWriteFile, rather than going through writeHarness/HarnessBundleSchema
 // (which would require re-reading and re-validating wiki/agents/routing —
@@ -499,14 +477,15 @@ export async function setCardState(
   projectDir: string,
   state: NonNullable<Manifest["verification"]["card"]>,
 ): Promise<void> {
-  const mPath = manifestPath(projectDir);
-  if (!existsSync(mPath)) {
+  const bundle = loadHarness(projectDir);
+  if (bundle === null) {
     throw new HarnessValidationError("no harness; run engine.harness.generate first");
   }
-  const manifest = parseManifestFile(mPath);
-  const updated: Manifest = {
-    ...manifest,
-    verification: { ...manifest.verification, card: state },
-  };
-  await atomicWriteFile(mPath, `${JSON.stringify(updated, null, 2)}\n`);
+  await writeHarness(projectDir, {
+    ...bundle,
+    manifest: {
+      ...bundle.manifest,
+      verification: { ...bundle.manifest.verification, card: state },
+    },
+  });
 }

@@ -4,6 +4,7 @@
 // (methods.ts) and per-engine adapters (Task 3's Claude adapter is the
 // first implementation): transcribed verbatim from the M3 task-2 brief so
 // downstream tasks can depend on these exact names.
+import type { RuntimeCapabilities } from "@openfusion/shared";
 export type FrontierEvent =
   | { type: "text"; text: string }
   | { type: "tool_use"; name: string; summary: string }
@@ -15,6 +16,7 @@ export type FrontierEvent =
       numTurns: number;
       durationMs: number;
       engineSessionId: string | null;
+      structuredOutput?: unknown;
     }
   | { type: "error"; message: string }
   | { type: "notice"; kind: "rate_limit" | "overloaded" | "api_error"; message: string };
@@ -24,19 +26,42 @@ export interface FrontierPromptHandle {
   abort(): void;
 }
 
+export interface FrontierPromptOptions {
+  timeoutMs?: number;
+  outputSchema?: Record<string, unknown>;
+}
+
 export interface FrontierSession {
   readonly id: string; // OUR session id (uuid)
   readonly projectDir: string;
-  prompt(text: string, opts?: { timeoutMs?: number }): FrontierPromptHandle;
+  prompt(text: string, opts?: FrontierPromptOptions): FrontierPromptHandle;
   close(): Promise<void>; // must kill any subprocess
+}
+
+/** One model exposed by an authenticated frontier runtime. Model catalogs are
+ * runtime-owned because subscription entitlements and rollouts can differ by
+ * account; callers must not infer availability from the pricing table. */
+export interface FrontierModel {
+  id: string;
+  displayName: string;
+  description: string;
+  isDefault: boolean;
 }
 
 export interface FrontierAdapter {
   readonly kind: string; // "claude-code" | future: "codex" | "acp:*"
+  /** Versioned capability probe. Security-relevant gaps are never emulated. */
+  capabilities?(): RuntimeCapabilities | Promise<RuntimeCapabilities>;
+  /** Discover models available to the currently authenticated account. */
+  listModels?(): Promise<FrontierModel[]>;
   createSession(opts: {
     projectDir: string;
     wikiMcpUrl: string | null;
+    /** Ephemeral loopback authorization; never persisted or logged. */
+    wikiMcpBearerToken?: string;
     log: (line: string) => void;
+    /** Omit to let the official runtime resolve its account/config default. */
+    model?: string;
     // Absent (or writeScope absent/empty) => today's read-only posture:
     // canUseTool denies every write tool, unconditionally. When writeScope
     // is a non-empty list, the adapter's canUseTool allows Write / Edit /

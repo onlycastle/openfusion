@@ -4,9 +4,14 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "no
 import os from "node:os";
 import path from "node:path";
 import { MockLanguageModelV4 } from "ai/test";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { RpcErrorCodes } from "@openfusion/shared";
-import { createEngine, type Engine } from "../src/engine.js";
+import {
+  createEngine,
+  type Engine,
+  type EngineOptions,
+  type VerificationRunner,
+} from "../src/engine.js";
 import type {
   FrontierAdapter,
   FrontierEvent,
@@ -17,6 +22,8 @@ import type { AgentDef, HarnessBundle, Routing, WikiPage } from "../src/harness/
 import { CARD_SLUG } from "../src/harness/schema.js";
 import { writeHarness } from "../src/harness/store.js";
 import type { CostMeter } from "../src/models/meter.js";
+import { readRuns } from "../src/runs/ledger.js";
+import { runtimeCapabilities } from "../src/runtime/capabilities.js";
 
 // Fixture literal only — must never appear outside test files.
 const TEST_API_KEY = "sk-test-fixture-never-real-1234567890";
@@ -24,8 +31,22 @@ const TEST_API_KEY = "sk-test-fixture-never-real-1234567890";
 let dir: string;
 let engine: Engine;
 
+const TEST_VERIFICATION_RUNNER: VerificationRunner = {
+  async status() {
+    return { available: true };
+  },
+  async run() {
+    return { exitCode: 0 };
+  },
+};
+
+function createTestEngine(options: EngineOptions = {}): Engine {
+  return createEngine({ ...options, verificationRunner: TEST_VERIFICATION_RUNNER });
+}
+
 afterEach(async () => {
   await engine.close();
+  vi.unstubAllEnvs();
   if (dir !== undefined) rmSync(dir, { recursive: true, force: true });
 });
 
@@ -265,6 +286,7 @@ interface FakeVerdict {
 }
 
 interface FakeFrontierOptions {
+  kind?: string;
   // Consumed in order, one per REVIEW session created (a review session is
   // any createSession call with no non-empty writeScope). Clamped to the
   // last entry if more review sessions are created than scripted.
@@ -274,7 +296,12 @@ interface FakeFrontierOptions {
   // simulating a frontier escalation that produces an empty diff.
   escalationWritesFile?: boolean;
   escalationCostUsd?: number;
-  createSessionCalls?: Array<{ projectDir: string; toolPolicy?: { writeScope?: string[] }; resultLabel?: string }>;
+  createSessionCalls?: Array<{
+    projectDir: string;
+    model?: string;
+    toolPolicy?: { writeScope?: string[] };
+    resultLabel?: string;
+  }>;
   // Captures the raw prompt text sent to the ESCALATION session only (one
   // entry per escalation prompt() call) — lets a test assert the routed
   // agent's specialist framing (agent.prompt) and the "current working
@@ -315,6 +342,19 @@ interface FakeFrontierOptions {
 function makeFakeFrontierAdapter(opts: FakeFrontierOptions = {}): FrontierAdapter {
   const verdicts = opts.reviewVerdicts ?? [];
   let reviewIdx = 0;
+  const capabilities = runtimeCapabilities({
+    runtimeId: opts.kind ?? "claude-code",
+    runtimeVersion: "test",
+    protocolVersion: "test-v1",
+    structuredOutput: true,
+    toolCalls: true,
+    pathAwareApprovals: true,
+    mcp: false,
+    resume: false,
+    fork: false,
+    compaction: false,
+    sandboxCompatibility: "certified",
+  });
 
   function recordResult(resultLabel: string | undefined, event: Extract<FrontierEvent, { type: "result" }>): void {
     opts.meter?.record({
@@ -332,9 +372,12 @@ function makeFakeFrontierAdapter(opts: FakeFrontierOptions = {}): FrontierAdapte
   }
 
   return {
-    kind: "claude-code",
-    async createSession({ projectDir, toolPolicy, resultLabel }): Promise<FrontierSession> {
-      opts.createSessionCalls?.push({ projectDir, toolPolicy, resultLabel });
+    kind: opts.kind ?? "claude-code",
+    async capabilities() {
+      return capabilities;
+    },
+    async createSession({ projectDir, model, toolPolicy, resultLabel }): Promise<FrontierSession> {
+      opts.createSessionCalls?.push({ projectDir, model, toolPolicy, resultLabel });
       const writeScope = toolPolicy?.writeScope ?? [];
       const isEscalation = writeScope.length > 0;
       if (!isEscalation && opts.reviewSessionStarts !== undefined) {
@@ -427,7 +470,7 @@ describe("engine.orchestrate — happy path", () => {
   it("worker writes a file, frontier approves -> worker-approved; apply lands the file in the base repo", async () => {
     dir = makeRepo();
     await writeTestHarness(dir);
-    engine = createEngine();
+    engine = createTestEngine();
     engine.models.registry.configure({ id: "p1", kind: "deepseek", apiKey: TEST_API_KEY });
     engine.models.registry.setTestModel("p1", makeWorkerMock("hello.txt", "HELLO FROM WORKER", "Created hello.txt"));
     const createSessionCalls: Array<{ projectDir: string; toolPolicy?: { writeScope?: string[] }; resultLabel?: string }> =
@@ -466,6 +509,7 @@ describe("engine.orchestrate — happy path", () => {
     expect(result.diff).toContain("+HELLO FROM WORKER");
     expect(result.diffStat).toContain("hello.txt");
     expect(result.worktree).not.toBeNull();
+    expect(result.candidateRef).toMatchObject({ lifecycle: "approved" });
     expect(existsSync(result.worktree.path)).toBe(true);
 
     expect(result.cost.workerUsd).toBeGreaterThan(0);
@@ -483,11 +527,66 @@ describe("engine.orchestrate — happy path", () => {
     expect(usage.result.bySource["frontier-review"].calls).toBe(1);
     expect(usage.result.bySource["frontier-escalate"]).toBeUndefined();
 
-    const applyRes = await call(engine, "engine.orchestrate.apply", { projectDir: dir, diff: result.diff });
+    const prepared = await call(engine, "engine.candidates.prepareApply", {
+      projectDir: dir,
+      candidateId: result.candidateRef.candidateId,
+    });
+    expect(prepared.error).toBeUndefined();
+    const applyRes = await call(engine, "engine.orchestrate.apply", {
+      projectDir: dir,
+      candidateId: result.candidateRef.candidateId,
+      approvalGrant: prepared.result.approvalGrant,
+    });
     expect(applyRes.error).toBeUndefined();
-    expect(applyRes.result).toEqual({ applied: true });
+    expect(applyRes.result).toEqual({ applied: true, candidateId: result.candidateRef.candidateId });
     expect(existsSync(path.join(dir, "hello.txt"))).toBe(true);
     expect(readFileSync(path.join(dir, "hello.txt"), "utf8")).toContain("HELLO FROM WORKER");
+  });
+});
+
+describe("engine.orchestrate — frontier role selections", () => {
+  it("uses the selected runtime and model independently for review and escalation", async () => {
+    dir = makeRepo();
+    await writeTestHarness(dir, { failuresBeforeFrontier: 1 });
+    engine = createTestEngine();
+    engine.models.registry.configure({ id: "p1", kind: "deepseek", apiKey: TEST_API_KEY });
+    engine.models.registry.setTestModel("p1", makeWorkerMock("attempt.txt", "TRY", "Attempted change"));
+    const reviewCalls: NonNullable<FakeFrontierOptions["createSessionCalls"]> = [];
+    const escalationCalls: NonNullable<FakeFrontierOptions["createSessionCalls"]> = [];
+    engine.frontier.registerAdapter(makeFakeFrontierAdapter({
+      kind: "review-runtime",
+      reviewVerdicts: [
+        { decision: "request-changes", reasons: ["not enough"], severity: "major" },
+        { decision: "approve", reasons: [], severity: "none" },
+      ],
+      createSessionCalls: reviewCalls,
+    }));
+    engine.frontier.registerAdapter(makeFakeFrontierAdapter({
+      kind: "escalation-runtime",
+      escalationWritesFile: true,
+      createSessionCalls: escalationCalls,
+    }));
+
+    const res = await call(engine, "engine.orchestrate", {
+      projectDir: dir,
+      task: "add a robust implementation",
+      frontier: {
+        review: { engine: "review-runtime", model: "review-model" },
+        escalation: { engine: "escalation-runtime", model: "escalation-model" },
+      },
+    });
+
+    expect(res.error).toBeUndefined();
+    expect(res.result.outcome).toBe("escalated");
+    expect(reviewCalls).toHaveLength(2);
+    expect(reviewCalls[0]?.model).toBe("review-model");
+    expect(reviewCalls[1]?.model).toBe("review-model");
+    expect(escalationCalls).toHaveLength(1);
+    expect(escalationCalls[0]?.model).toBe("escalation-model");
+    expect(res.result.frontier).toEqual({
+      review: { engine: "review-runtime", model: "review-model" },
+      escalation: { engine: "escalation-runtime", model: "escalation-model" },
+    });
   });
 });
 
@@ -495,7 +594,7 @@ describe("engine.orchestrate — retry then approve", () => {
   it("attempt 1 rejected (worktree cleaned), attempt 2 approved (worktree survives)", async () => {
     dir = makeRepo();
     await writeTestHarness(dir, { failuresBeforeFrontier: 2 });
-    engine = createEngine();
+    engine = createTestEngine();
     engine.models.registry.configure({ id: "p1", kind: "deepseek", apiKey: TEST_API_KEY });
     engine.models.registry.setTestModel("p1", makeMultiAttemptWorkerMock());
     engine.frontier.registerAdapter(
@@ -535,41 +634,31 @@ describe("engine.orchestrate — retry then approve", () => {
 // M6 metric). The fix threads the prior attempt's outcome into
 // buildWorkerTask so attempt n+1's task text names what went wrong.
 //
-// Captures the `task` param of every engine.worker.run dispatch by
-// monkeypatching engine.dispatcher.dispatch — the same monkeypatch style
-// already used elsewhere in this suite for manager.create/diff — since
-// orchestrate.ts drives engine.worker.run through the dispatcher
-// (callEngineMethod), not a direct function call.
+// Captures the `task` param of every typed WorkerRunner call. JSON-RPC is an
+// external adapter and orchestration must not route internal work through it.
 function captureWorkerTasks(e: Engine): string[] {
   const tasks: string[] = [];
-  const originalDispatch = e.dispatcher.dispatch.bind(e.dispatcher);
-  e.dispatcher.dispatch = (async (message: unknown) => {
-    const req = message as { method?: string; params?: { task?: string } };
-    if (req.method === "engine.worker.run" && typeof req.params?.task === "string") {
-      tasks.push(req.params.task);
-    }
-    return originalDispatch(message);
-  }) as typeof e.dispatcher.dispatch;
+  const originalRun = e.worker.run.bind(e.worker);
+  vi.spyOn(e.worker, "run").mockImplementation(async (engine, params) => {
+    tasks.push(params.task);
+    return originalRun(engine, params);
+  });
   return tasks;
 }
 
-// M6 Task 2: same monkeypatch style as captureWorkerTasks above, but
-// captures the FULL engine.worker.run params (task AND wikiDigest) for each
-// dispatch — lets a test assert the harness's wiki page digests reach
+// M6 Task 2: captures the typed worker params (task AND wikiDigest) for each
+// call — lets a test assert the harness's wiki page digests reach
 // engine.worker.run via its own `wikiDigest` param, distinctly from the
 // `task` string (which orchestrate.ts's buildWorkerTask still composes from
 // only agent.prompt + task + retry feedback — the digest travels alongside
 // it, not folded into it; see orchestrate.ts's own doc comment on why).
 function captureWorkerRunCalls(e: Engine): Array<{ task: string; wikiDigest?: string }> {
   const calls: Array<{ task: string; wikiDigest?: string }> = [];
-  const originalDispatch = e.dispatcher.dispatch.bind(e.dispatcher);
-  e.dispatcher.dispatch = (async (message: unknown) => {
-    const req = message as { method?: string; params?: { task?: string; wikiDigest?: string } };
-    if (req.method === "engine.worker.run" && typeof req.params?.task === "string") {
-      calls.push({ task: req.params.task, wikiDigest: req.params.wikiDigest });
-    }
-    return originalDispatch(message);
-  }) as typeof e.dispatcher.dispatch;
+  const originalRun = e.worker.run.bind(e.worker);
+  vi.spyOn(e.worker, "run").mockImplementation(async (engine, params) => {
+    calls.push({ task: params.task, wikiDigest: params.wikiDigest });
+    return originalRun(engine, params);
+  });
   return calls;
 }
 
@@ -577,7 +666,7 @@ describe("engine.orchestrate — retry feedback", () => {
   it("attempt 1's task is unchanged; attempt 2's task appends the prior verdict's rejection reasons", async () => {
     dir = makeRepo();
     await writeTestHarness(dir, { failuresBeforeFrontier: 2 });
-    engine = createEngine();
+    engine = createTestEngine();
     engine.models.registry.configure({ id: "p1", kind: "deepseek", apiKey: TEST_API_KEY });
     engine.models.registry.setTestModel("p1", makeMultiAttemptWorkerMock());
     engine.frontier.registerAdapter(
@@ -606,7 +695,7 @@ describe("engine.orchestrate — retry feedback", () => {
   it("attempt 2's task notes a prior empty diff when attempt 1 made no changes", async () => {
     dir = makeRepo();
     await writeTestHarness(dir, { failuresBeforeFrontier: 2 });
-    engine = createEngine();
+    engine = createTestEngine();
     engine.models.registry.configure({ id: "p1", kind: "deepseek", apiKey: TEST_API_KEY });
     // Attempt 1: no tool calls at all (empty diff). Attempt 2: writes a file
     // and is approved.
@@ -640,7 +729,7 @@ describe("engine.orchestrate — escalation", () => {
   it("both worker attempts rejected -> frontier escalation (with writeScope) edits a file -> escalated", async () => {
     dir = makeRepo();
     await writeTestHarness(dir, { failuresBeforeFrontier: 2 });
-    engine = createEngine();
+    engine = createTestEngine();
     engine.models.registry.configure({ id: "p1", kind: "deepseek", apiKey: TEST_API_KEY });
     engine.models.registry.setTestModel("p1", makeMultiAttemptWorkerMock());
     const createSessionCalls: Array<{ projectDir: string; toolPolicy?: { writeScope?: string[] }; resultLabel?: string }> =
@@ -651,6 +740,7 @@ describe("engine.orchestrate — escalation", () => {
         reviewVerdicts: [
           { decision: "request-changes", reasons: ["nope"], severity: "minor" },
           { decision: "request-changes", reasons: ["still nope"], severity: "major" },
+          { decision: "approve", reasons: [], severity: "none" },
         ],
         createSessionCalls,
         escalationPrompts,
@@ -692,17 +782,17 @@ describe("engine.orchestrate — escalation", () => {
     expect(escalationPrompts[0]).toContain("You are a codegen specialist. Follow instructions exactly.");
     expect(escalationPrompts[0]).toContain("current working directory");
 
-    // Only 2 review sessions (no writeScope) + 1 escalation session (with
-    // writeScope) were ever created.
+    // Two worker reviews plus one independent escalation review (all
+    // read-only) and one escalation author session were created.
     const reviewCalls = createSessionCalls.filter((c) => (c.toolPolicy?.writeScope?.length ?? 0) === 0);
-    expect(reviewCalls).toHaveLength(2);
+    expect(reviewCalls).toHaveLength(3);
 
     expect(result.cost.frontierUsd).toBeGreaterThan(0);
 
     // Meter tagging: escalate's result is tagged "frontier-escalate",
     // distinct from the two reviews' "frontier-review".
     const usage = await call(engine, "engine.models.usage", {});
-    expect(usage.result.bySource["frontier-review"].calls).toBe(2);
+    expect(usage.result.bySource["frontier-review"].calls).toBe(3);
     expect(usage.result.bySource["frontier-escalate"].calls).toBe(1);
 
     // Both REJECTED worker worktrees were cleaned — only the escalation's
@@ -750,7 +840,7 @@ describe("engine.orchestrate — escalation", () => {
     };
     await writeHarness(dir, bundle);
 
-    engine = createEngine();
+    engine = createTestEngine();
     engine.frontier.registerAdapter(makeFakeFrontierAdapter({}));
 
     const res = await call(engine, "engine.orchestrate", { projectDir: dir, task: "do everything" });
@@ -759,13 +849,18 @@ describe("engine.orchestrate — escalation", () => {
 
     expect(result.outcome).toBe("escalated");
     expect(result.resolution).toBe("frontier");
-    expect(result.attempts).toEqual([{ n: 1, kind: "frontier", summary: "Escalation complete" }]);
+    expect(result.attempts).toEqual([{
+      n: 1,
+      kind: "frontier",
+      summary: "Escalation complete",
+      verdict: { decision: "approve", reasons: [], severity: "none" },
+    }]);
   });
 
   it("an empty escalation diff (frontier makes no edits) results in outcome 'failed'", async () => {
     dir = makeRepo();
     await writeTestHarness(dir, { failuresBeforeFrontier: 1 });
-    engine = createEngine();
+    engine = createTestEngine();
     engine.models.registry.configure({ id: "p1", kind: "deepseek", apiKey: TEST_API_KEY });
     engine.models.registry.setTestModel("p1", makeEmptyWorkerMock("nothing to change"));
     engine.frontier.registerAdapter(makeFakeFrontierAdapter({ escalationWritesFile: false }));
@@ -786,10 +881,10 @@ describe("engine.orchestrate — escalation", () => {
 });
 
 describe("engine.orchestrate — empty worker diff", () => {
-  it("counts as a failed attempt with no review call", async () => {
+  it("skips worker review and independently reviews the escalation candidate", async () => {
     dir = makeRepo();
     await writeTestHarness(dir, { failuresBeforeFrontier: 2 });
-    engine = createEngine();
+    engine = createTestEngine();
     engine.models.registry.configure({ id: "p1", kind: "deepseek", apiKey: TEST_API_KEY });
     engine.models.registry.setTestModel("p1", makeEmptyWorkerMock("nothing to change"));
     const reviewSessionStarts = { count: 0 };
@@ -805,7 +900,7 @@ describe("engine.orchestrate — empty worker diff", () => {
 
     expect(result.attempts[0]).toMatchObject({ n: 1, kind: "worker", empty: true });
     expect(result.attempts[0].verdict).toBeUndefined();
-    expect(reviewSessionStarts.count).toBe(0);
+    expect(reviewSessionStarts.count).toBe(1);
 
     // maxWorkerAttempts:1 -> the empty attempt's worktree was cleaned, then
     // escalation ran next and its own (surviving) worktree remains.
@@ -853,7 +948,7 @@ describe("engine.orchestrate — worker context injection swap (Task 6, ETH anti
     dir = makeRepo();
     await writeTestHarness(dir, { pages, card });
     const notifications: Array<{ method: string; params: unknown }> = [];
-    engine = createEngine({ notify: (method, params) => notifications.push({ method, params }) });
+    engine = createTestEngine({ notify: (method, params) => notifications.push({ method, params }) });
     engine.models.registry.configure({ id: "p1", kind: "deepseek", apiKey: TEST_API_KEY });
     engine.models.registry.setTestModel("p1", makeWorkerMock("hello.txt", "hi", "done"));
     engine.frontier.registerAdapter(
@@ -917,7 +1012,7 @@ describe("engine.orchestrate — worker context injection swap (Task 6, ETH anti
   it("engine.harness.card.approve, then engine.orchestrate: the worker receives the card digest via the real approve RPC + manifest round-trip", async () => {
     dir = makeRepo();
     await writeTestHarness(dir, { pages: [CARD_PAGE, ARCH_PAGE], card: "draft" });
-    engine = createEngine();
+    engine = createTestEngine();
     engine.models.registry.configure({ id: "p1", kind: "deepseek", apiKey: TEST_API_KEY });
     engine.models.registry.setTestModel("p1", makeWorkerMock("hello.txt", "hi", "done"));
     engine.frontier.registerAdapter(
@@ -945,7 +1040,7 @@ describe("engine.orchestrate — taskClass + review/escalate cost split (M6 Task
   it("result.taskClass matches the class routeTask actually picked", async () => {
     dir = makeRepo();
     await writeTestHarness(dir);
-    engine = createEngine();
+    engine = createTestEngine();
     engine.models.registry.configure({ id: "p1", kind: "deepseek", apiKey: TEST_API_KEY });
     engine.models.registry.setTestModel("p1", makeWorkerMock("hello.txt", "hi", "done"));
     engine.frontier.registerAdapter(
@@ -966,16 +1061,18 @@ describe("engine.orchestrate — taskClass + review/escalate cost split (M6 Task
   it("cost.reviewUsd and cost.escalateUsd are populated separately and sum to frontierUsd", async () => {
     dir = makeRepo();
     // failuresBeforeFrontier: 1 -> exactly one worker attempt before
-    // escalation, so this run exercises BOTH a review call (rejecting that
-    // one attempt) and an escalation call, letting reviewUsd and
-    // escalateUsd each land a single, distinctly-priced cost.
+    // escalation, so this run exercises a worker review, an independent
+    // escalation review, and the escalation author call.
     await writeTestHarness(dir, { failuresBeforeFrontier: 1 });
-    engine = createEngine();
+    engine = createTestEngine();
     engine.models.registry.configure({ id: "p1", kind: "deepseek", apiKey: TEST_API_KEY });
     engine.models.registry.setTestModel("p1", makeWorkerMock("attempt1.txt", "first try", "Attempt 1 summary"));
     engine.frontier.registerAdapter(
       makeFakeFrontierAdapter({
-        reviewVerdicts: [{ decision: "request-changes", reasons: ["nope"], severity: "minor" }],
+        reviewVerdicts: [
+          { decision: "request-changes", reasons: ["nope"], severity: "minor" },
+          { decision: "approve", reasons: [], severity: "none" },
+        ],
         reviewCostUsd: 0.05,
         escalationCostUsd: 0.5,
       }),
@@ -986,7 +1083,7 @@ describe("engine.orchestrate — taskClass + review/escalate cost split (M6 Task
     const result = res.result;
 
     expect(result.outcome).toBe("escalated");
-    expect(result.cost.reviewUsd).toBeCloseTo(0.05, 10);
+    expect(result.cost.reviewUsd).toBeCloseTo(0.1, 10);
     expect(result.cost.escalateUsd).toBeCloseTo(0.5, 10);
     expect(result.cost.frontierUsd).toBeCloseTo(result.cost.reviewUsd + result.cost.escalateUsd, 10);
     expect(result.cost.totalUsd).toBeCloseTo(result.cost.workerUsd + result.cost.frontierUsd, 10);
@@ -1017,7 +1114,7 @@ describe("engine.orchestrate — default deadlines (Fix 1, review round 1)", () 
   it("omitted reviewTimeoutMs still passes a bounded timeoutMs to the review session's prompt", async () => {
     dir = makeRepo();
     await writeTestHarness(dir);
-    engine = createEngine();
+    engine = createTestEngine();
     engine.models.registry.configure({ id: "p1", kind: "deepseek", apiKey: TEST_API_KEY });
     engine.models.registry.setTestModel("p1", makeWorkerMock("hello.txt", "HELLO FROM WORKER", "Created hello.txt"));
     const reviewPromptOpts: Array<{ timeoutMs?: number }> = [];
@@ -1073,7 +1170,7 @@ describe("engine.orchestrate — default deadlines (Fix 1, review round 1)", () 
     };
     await writeHarness(dir, bundle);
 
-    engine = createEngine();
+    engine = createTestEngine();
     const escalationPromptOpts: Array<{ timeoutMs?: number }> = [];
     engine.frontier.registerAdapter(makeFakeFrontierAdapter({ escalationPromptOpts }));
 
@@ -1091,7 +1188,7 @@ describe("engine.orchestrate — default deadlines (Fix 1, review round 1)", () 
   it("an explicit reviewTimeoutMs is still honored verbatim for both review and escalation", async () => {
     dir = makeRepo();
     await writeTestHarness(dir, { failuresBeforeFrontier: 1 });
-    engine = createEngine();
+    engine = createTestEngine();
     engine.models.registry.configure({ id: "p1", kind: "deepseek", apiKey: TEST_API_KEY });
     engine.models.registry.setTestModel("p1", makeEmptyWorkerMock("nothing to change"));
     const reviewPromptOpts: Array<{ timeoutMs?: number }> = [];
@@ -1116,7 +1213,7 @@ describe("engine.orchestrate — default deadlines (Fix 1, review round 1)", () 
 describe("engine.orchestrate — guard failures", () => {
   it("no harness -> SERVER_ERROR", async () => {
     dir = makeRepo();
-    engine = createEngine();
+    engine = createTestEngine();
 
     const res = await call(engine, "engine.orchestrate", { projectDir: dir, task: "do something" });
     expect(res.result).toBeUndefined();
@@ -1126,7 +1223,7 @@ describe("engine.orchestrate — guard failures", () => {
 
   it("non-git projectDir -> SERVER_ERROR", async () => {
     dir = mkdtempSync(path.join(os.tmpdir(), "of-orchestrate-nogit-"));
-    engine = createEngine();
+    engine = createTestEngine();
 
     const res = await call(engine, "engine.orchestrate", { projectDir: dir, task: "do something" });
     expect(res.result).toBeUndefined();
@@ -1135,11 +1232,11 @@ describe("engine.orchestrate — guard failures", () => {
 });
 
 describe("engine.orchestrate — progress notifications", () => {
-  it("happy path emits load, route, load (worker context), worker:1, review:1, done in order", async () => {
+  it("happy path emits snapshot, routing, worker, verification, review, and done in order", async () => {
     dir = makeRepo();
     await writeTestHarness(dir);
     const notifications: Array<{ method: string; params: unknown }> = [];
-    engine = createEngine({ notify: (method, params) => notifications.push({ method, params }) });
+    engine = createTestEngine({ notify: (method, params) => notifications.push({ method, params }) });
     engine.models.registry.configure({ id: "p1", kind: "deepseek", apiKey: TEST_API_KEY });
     engine.models.registry.setTestModel("p1", makeWorkerMock("hello.txt", "hi", "done"));
     engine.frontier.registerAdapter(
@@ -1156,14 +1253,23 @@ describe("engine.orchestrate — progress notifications", () => {
     // the worker-context branch name (`worker context: <branch>`) — see
     // orchestrate.ts's own call site comment for why it's stage "load" and
     // not a new stage of its own.
-    expect(deduped).toEqual(["load", "route", "load", "worker:1", "review:1", "done"]);
+    expect(deduped).toEqual([
+      "load",
+      "snapshot",
+      "route",
+      "load",
+      "worker:1",
+      "verify:1",
+      "review:1",
+      "done",
+    ]);
   });
 
   it("escalation path emits worker:1, review:1, worker:2, review:2, escalate, done", async () => {
     dir = makeRepo();
     await writeTestHarness(dir, { failuresBeforeFrontier: 2 });
     const notifications: Array<{ method: string; params: unknown }> = [];
-    engine = createEngine({ notify: (method, params) => notifications.push({ method, params }) });
+    engine = createTestEngine({ notify: (method, params) => notifications.push({ method, params }) });
     engine.models.registry.configure({ id: "p1", kind: "deepseek", apiKey: TEST_API_KEY });
     engine.models.registry.setTestModel("p1", makeMultiAttemptWorkerMock());
     engine.frontier.registerAdapter(
@@ -1171,6 +1277,7 @@ describe("engine.orchestrate — progress notifications", () => {
         reviewVerdicts: [
           { decision: "request-changes", reasons: ["a"], severity: "minor" },
           { decision: "request-changes", reasons: ["b"], severity: "minor" },
+          { decision: "approve", reasons: [], severity: "none" },
         ],
       }),
     );
@@ -1185,11 +1292,14 @@ describe("engine.orchestrate — progress notifications", () => {
     // test above.
     expect(deduped).toEqual([
       "load",
+      "snapshot",
       "route",
       "load",
       "worker:1",
+      "verify:1",
       "review:1",
       "worker:2",
+      "verify:2",
       "review:2",
       "escalate",
       "done",
@@ -1208,7 +1318,7 @@ describe("engine.orchestrate — progress notifications", () => {
     dir = makeRepo();
     await writeTestHarness(dir);
     const notifications: Array<{ method: string; params: unknown }> = [];
-    engine = createEngine({ notify: (method, params) => notifications.push({ method, params }) });
+    engine = createTestEngine({ notify: (method, params) => notifications.push({ method, params }) });
     engine.models.registry.configure({ id: "p1", kind: "deepseek", apiKey: TEST_API_KEY });
     engine.models.registry.setTestModel("p1", makeWorkerMock("hello.txt", "hi", "done"));
     engine.frontier.registerAdapter(
@@ -1230,11 +1340,11 @@ describe("engine.orchestrate — progress notifications", () => {
     }
   });
 
-  it("omits runId entirely when none was supplied (backward compatible shape)", async () => {
+  it("assigns one stable runId when the caller omits it", async () => {
     dir = makeRepo();
     await writeTestHarness(dir);
     const notifications: Array<{ method: string; params: unknown }> = [];
-    engine = createEngine({ notify: (method, params) => notifications.push({ method, params }) });
+    engine = createTestEngine({ notify: (method, params) => notifications.push({ method, params }) });
     engine.models.registry.configure({ id: "p1", kind: "deepseek", apiKey: TEST_API_KEY });
     engine.models.registry.setTestModel("p1", makeWorkerMock("hello.txt", "hi", "done"));
     engine.frontier.registerAdapter(
@@ -1247,9 +1357,9 @@ describe("engine.orchestrate — progress notifications", () => {
       .filter((n) => n.method === "orchestrate.progress")
       .map((n) => n.params as Record<string, unknown>);
     expect(events.length).toBeGreaterThan(0);
-    for (const e of events) {
-      expect("runId" in e).toBe(false);
-    }
+    const generatedRunIds = new Set(events.map((event) => event.runId));
+    expect(generatedRunIds.size).toBe(1);
+    expect([...generatedRunIds][0]).toEqual(expect.any(String));
   });
 });
 
@@ -1257,7 +1367,7 @@ describe("engine.orchestrate — failure semantics", () => {
   it("an unrecoverable throw mid-pipeline wraps as SERVER_ERROR carrying attempts so far", async () => {
     dir = makeRepo();
     await writeTestHarness(dir, { failuresBeforeFrontier: 2 });
-    engine = createEngine();
+    engine = createTestEngine();
     engine.models.registry.configure({ id: "p1", kind: "deepseek", apiKey: TEST_API_KEY });
     engine.models.registry.setTestModel("p1", makeWorkerMock("hello.txt", "hi", "done"));
     // No frontier adapter registered under "claude-code" at all — even
@@ -1280,7 +1390,7 @@ describe("engine.orchestrate — failure semantics", () => {
   it("attempt 1 rejected+cleaned, attempt 2's worker.run throws -> SERVER_ERROR's data.worktree is attempt 2's path, not stale null", async () => {
     dir = makeRepo();
     await writeTestHarness(dir, { failuresBeforeFrontier: 2 });
-    engine = createEngine();
+    engine = createTestEngine();
     engine.models.registry.configure({ id: "p1", kind: "deepseek", apiKey: TEST_API_KEY });
     engine.models.registry.setTestModel("p1", makeAttempt1ThenThrowWorkerMock());
     engine.frontier.registerAdapter(
@@ -1328,7 +1438,7 @@ describe("engine.orchestrate — in-flight review + engine.close() (Task 1 Chang
   it("engine.close() resolves within a bounded time and closes the in-flight review session", async () => {
     dir = makeRepo();
     await writeTestHarness(dir);
-    engine = createEngine();
+    engine = createTestEngine();
     engine.models.registry.configure({ id: "p1", kind: "deepseek", apiKey: TEST_API_KEY });
     engine.models.registry.setTestModel("p1", makeWorkerMock("hello.txt", "HELLO FROM WORKER", "Created hello.txt"));
     const reviewSessionStarts = { count: 0 };
@@ -1383,7 +1493,7 @@ describe("engine.orchestrate — cancellation via engine.cancel (M7b Task 2)", (
   it("cancel mid-run (hanging worker attempt): aborts promptly, reports the cancelled marker, preserves the worktree breadcrumb, and leaves the registry empty", async () => {
     dir = makeRepo();
     await writeTestHarness(dir);
-    engine = createEngine();
+    engine = createTestEngine();
     engine.models.registry.configure({ id: "p1", kind: "deepseek", apiKey: TEST_API_KEY });
     engine.models.registry.setTestModel("p1", makeHangingWorkerMock());
     engine.frontier.registerAdapter(makeFakeFrontierAdapter({}));
@@ -1435,9 +1545,63 @@ describe("engine.orchestrate — cancellation via engine.cancel (M7b Task 2)", (
     expect(engine.cancelRegistry.size()).toBe(0);
   }, 15_000);
 
+  it("cancel mid-run during candidates.prepare's verification step surfaces the cancelled marker, never a downgraded 'failed' result (final review Fix 2)", async () => {
+    dir = makeRepo();
+    await writeTestHarness(dir);
+    let verifyStarted: () => void = () => {};
+    const verifyStartedPromise = new Promise<void>((resolve) => { verifyStarted = resolve; });
+    let verifyCalls = 0;
+    // Two verification commands (the default git-diff-check plus this one
+    // extra) so cancelling mid-way through the FIRST leaves the loop's
+    // per-iteration abort check (candidates/service.ts) to catch it before a
+    // second command ever runs.
+    engine = createEngine({
+      verificationRunner: {
+        async status() {
+          return { available: true };
+        },
+        async run() {
+          verifyCalls += 1;
+          if (verifyCalls === 1) {
+            verifyStarted();
+            await new Promise((resolve) => setTimeout(resolve, 100));
+          }
+          return { exitCode: 0 };
+        },
+      },
+    });
+    engine.models.registry.configure({ id: "p1", kind: "deepseek", apiKey: TEST_API_KEY });
+    engine.models.registry.setTestModel("p1", makeWorkerMock("hello.txt", "HELLO", "Created hello.txt"));
+    engine.frontier.registerAdapter(makeFakeFrontierAdapter({}));
+
+    const orchestratePromise = call(engine, "engine.orchestrate", {
+      projectDir: dir,
+      task: "add hello.txt with a greeting",
+      taskContract: {
+        schemaVersion: 1,
+        requirements: ["add hello.txt"],
+        constraints: [],
+        verificationCommands: [["true"]],
+      },
+      runId: "r-cancel-verify",
+    });
+
+    await verifyStartedPromise;
+    const cancelRes = await call(engine, "engine.cancel", { runId: "r-cancel-verify" });
+    expect(cancelRes.result.cancelled).toBe(true);
+
+    const res = await orchestratePromise;
+    // THE FIX: this must be the cancelled marker, never a "verification
+    // incomplete -> failed" downgrade -- the old blanket catch swallowed the
+    // cancellation and returned a normal "failed" result instead.
+    expect(res.result).toBeUndefined();
+    expect(res.error).toBeDefined();
+    expect(res.error.data.cancelled).toBe(true);
+  }, 15_000);
+
   it("engine.cancel on an unknown runId resolves { cancelled: false } without erroring", async () => {
     dir = makeRepo();
-    engine = createEngine();
+    engine = createTestEngine();
 
     const res = await call(engine, "engine.cancel", { runId: "no-such-run" });
     expect(res.error).toBeUndefined();
@@ -1447,7 +1611,7 @@ describe("engine.orchestrate — cancellation via engine.cancel (M7b Task 2)", (
   it("an ordinary (uncancelled) run with a runId behaves exactly as before, and the registry empties on normal completion too", async () => {
     dir = makeRepo();
     await writeTestHarness(dir);
-    engine = createEngine();
+    engine = createTestEngine();
     engine.models.registry.configure({ id: "p1", kind: "deepseek", apiKey: TEST_API_KEY });
     engine.models.registry.setTestModel(
       "p1",
@@ -1470,18 +1634,38 @@ describe("engine.orchestrate — cancellation via engine.cancel (M7b Task 2)", (
 });
 
 describe("engine.orchestrate.apply", () => {
-  it("returns { applied: true } as a no-op for an empty diff", async () => {
+  it("rejects raw-diff Apply unless the explicit unsafe development flag is set", async () => {
     dir = makeRepo();
-    engine = createEngine();
+    engine = createTestEngine();
 
     const res = await call(engine, "engine.orchestrate.apply", { projectDir: dir, diff: "" });
-    expect(res.error).toBeUndefined();
-    expect(res.result).toEqual({ applied: true });
+    expect(res.result).toBeUndefined();
+    expect(res.error.code).toBe(RpcErrorCodes.INVALID_PARAMS);
+    expect(res.error.message).toContain("candidateId");
   });
 
-  it("returns SERVER_ERROR with the git error for a malformed diff", async () => {
+  it("keeps the unsafe development compatibility path as a no-op for an empty diff", async () => {
     dir = makeRepo();
-    engine = createEngine();
+    engine = createTestEngine();
+    vi.stubEnv("OPENFUSION_UNSAFE_RAW_DIFF_APPLY", "1");
+    vi.stubEnv("NODE_ENV", "test");
+
+    const res = await call(engine, "engine.orchestrate.apply", { projectDir: dir, diff: "", runId: "run-apply-1" });
+    expect(res.error).toBeUndefined();
+    expect(res.result).toEqual({ applied: true });
+    expect(readRuns(dir, { kind: "apply" }).records[0]).toMatchObject({
+      kind: "apply",
+      outcome: "succeeded",
+      errorCategory: "empty-diff",
+      runId: "run-apply-1",
+    });
+  });
+
+  it("returns SERVER_ERROR for malformed raw diffs in unsafe development mode", async () => {
+    dir = makeRepo();
+    engine = createTestEngine();
+    vi.stubEnv("OPENFUSION_UNSAFE_RAW_DIFF_APPLY", "1");
+    vi.stubEnv("NODE_ENV", "test");
 
     const res = await call(engine, "engine.orchestrate.apply", {
       projectDir: dir,
@@ -1490,11 +1674,16 @@ describe("engine.orchestrate.apply", () => {
     expect(res.result).toBeUndefined();
     expect(res.error.code).toBe(RpcErrorCodes.SERVER_ERROR);
     expect(res.error.message).toContain("git apply failed");
+    expect(readRuns(dir, { kind: "apply" }).records[0]).toMatchObject({
+      kind: "apply",
+      outcome: "failed",
+      errorCategory: "git-apply-failed",
+    });
   });
 
   it("rejects a non-git projectDir with SERVER_ERROR", async () => {
     dir = mkdtempSync(path.join(os.tmpdir(), "of-orchestrate-apply-nogit-"));
-    engine = createEngine();
+    engine = createTestEngine();
 
     const res = await call(engine, "engine.orchestrate.apply", { projectDir: dir, diff: "" });
     expect(res.result).toBeUndefined();

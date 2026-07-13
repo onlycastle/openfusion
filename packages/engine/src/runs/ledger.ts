@@ -1,5 +1,7 @@
-// Run ledger v1: durable per-project JSONL of orchestrate/evals/generate/card
-// outcomes. Observes only — never load-bearing. Spec:
+// Run ledger v1: durable per-project JSONL of metadata-only runtime outcomes.
+// Observes only — never load-bearing. Benchmark records remain readable for
+// compatibility, but project harness health is derived from orchestrate/apply
+// records rather than benchmark verdicts. Spec:
 // docs/superpowers/specs/2026-07-08-run-ledger-design.md
 import { appendFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
 import path from "node:path";
@@ -17,10 +19,18 @@ export const RunRecordSchema = z.discriminatedUnion("kind", [
     outcome: z.enum(["worker-approved", "escalated", "failed", "error"]),
     escalated: z.boolean(),
     reviews: z.array(
-      z.object({
-        decision: z.enum(["approve", "request-changes"]),
-        reasons: z.array(z.string()),
-      }),
+      z.union([
+        z.object({
+          decision: z.enum(["approve", "request-changes"]),
+          reasonCount: z.number().int().min(0),
+        }),
+        // Legacy reader only. New writes never persist model-authored review
+        // reasons; old ledgers remain readable during migration.
+        z.object({
+          decision: z.enum(["approve", "request-changes"]),
+          reasons: z.array(z.string()),
+        }),
+      ]),
     ),
     contextBranch: z.enum(["approved-card", "build-and-test-fallback", "none"]),
     toolCallCounts: z.record(z.string(), z.number().int()).optional(),
@@ -51,6 +61,7 @@ export const RunRecordSchema = z.discriminatedUnion("kind", [
     qualityGapWithinNoise: z.boolean(),
     pricingConfidence: z.string(),
     measurementFailureCount: z.number().int(),
+    policyViolationCount: z.number().int().optional(),
     perTask: z.array(
       z.object({
         id: z.string(),
@@ -63,6 +74,15 @@ export const RunRecordSchema = z.discriminatedUnion("kind", [
     note: z.string(),
     durationMs: z.number().int().min(0),
     runId: z.string().optional(),
+  }),
+  z.object({
+    v: z.literal(1),
+    kind: z.literal("apply"),
+    at: z.iso.datetime(),
+    outcome: z.enum(["succeeded", "failed"]),
+    durationMs: z.number().int().min(0),
+    runId: z.string().optional(),
+    errorCategory: z.enum(["empty-diff", "git-apply-failed", "unknown"]).optional(),
   }),
   z.object({
     v: z.literal(1),

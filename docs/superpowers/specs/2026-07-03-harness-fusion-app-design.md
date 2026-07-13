@@ -5,6 +5,14 @@
 **License:** Apache-2.0
 **Distribution:** macOS .dmg (signed + notarized), Homebrew cask secondary
 
+> **Historical notice (2026-07-12):** The
+> [evidence-driven harness PRD](2026-07-12-evidence-driven-harness-prd.md)
+> supersedes this document's product assumptions, success metrics, and
+> aggressive open-model routing default. This file is preserved as the
+> original approved design and implementation history; statements such as
+> 10–30× model economics, 50–70% token-cost savings, generated specialists as
+> the core asset, and “open models by default” are not current requirements.
+
 ## 1. Problem & Thesis
 
 Frontier-model coding agents are excellent but expensive; open-weight models

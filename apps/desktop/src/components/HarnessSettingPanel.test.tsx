@@ -1,15 +1,24 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, render, screen, fireEvent, waitFor, cleanup } from "@testing-library/react";
 
-const { harnessStatusMock, harnessReadMock, updateModelMock, updateEscMock, listConfigsMock, cardUpdateMock, cardApproveMock } = vi.hoisted(() => ({
+const {
+  harnessStatusMock, harnessReadMock, updateModelMock, updateEscMock, listConfigsMock,
+  cardUpdateMock, cardApproveMock, routingProposalsMock, routingStatusMock,
+  routingCreateMock, routingShadowMock, routingPromoteMock, routingRollbackMock,
+} = vi.hoisted(() => ({
   harnessStatusMock: vi.fn(), harnessReadMock: vi.fn(), updateModelMock: vi.fn(), updateEscMock: vi.fn(), listConfigsMock: vi.fn(),
   cardUpdateMock: vi.fn(), cardApproveMock: vi.fn(),
+  routingProposalsMock: vi.fn(), routingStatusMock: vi.fn(), routingCreateMock: vi.fn(),
+  routingShadowMock: vi.fn(), routingPromoteMock: vi.fn(), routingRollbackMock: vi.fn(),
 }));
 vi.mock("../engineClient", () => ({
   engineClient: {
     harnessStatus: harnessStatusMock, harnessRead: harnessReadMock,
     harnessUpdateAgentModel: updateModelMock, harnessUpdateEscalation: updateEscMock,
     harnessCardUpdate: cardUpdateMock, harnessCardApprove: cardApproveMock,
+    routingProposals: routingProposalsMock, routingStatus: routingStatusMock,
+    routingCreateProposal: routingCreateMock, routingCompleteShadow: routingShadowMock,
+    routingPromote: routingPromoteMock, routingRollback: routingRollbackMock,
   },
   listProviderConfigs: listConfigsMock,
 }));
@@ -24,7 +33,11 @@ import { HarnessSettingPanel } from "./HarnessSettingPanel";
 
 afterEach(cleanup);
 beforeEach(() => {
-  for (const m of [harnessStatusMock, harnessReadMock, updateModelMock, updateEscMock, listConfigsMock, cardUpdateMock, cardApproveMock]) m.mockReset();
+  for (const m of [
+    harnessStatusMock, harnessReadMock, updateModelMock, updateEscMock, listConfigsMock,
+    cardUpdateMock, cardApproveMock, routingProposalsMock, routingStatusMock,
+    routingCreateMock, routingShadowMock, routingPromoteMock, routingRollbackMock,
+  ]) m.mockReset();
   useProjectMock.mockReset();
   useProjectMock.mockReturnValue({ activeProjectDir: "/r/alpha" });
   harnessStatusMock.mockResolvedValue({ present: true, structural: "pass", headSha: "abc", card: null });
@@ -43,6 +56,12 @@ beforeEach(() => {
   updateEscMock.mockResolvedValue({ updated: true });
   cardUpdateMock.mockResolvedValue(undefined);
   cardApproveMock.mockResolvedValue(undefined);
+  routingProposalsMock.mockResolvedValue({ candidates: [] });
+  routingStatusMock.mockResolvedValue({ active: null, currentHarnessDigest: `sha256:${"a".repeat(64)}` });
+  routingCreateMock.mockResolvedValue({ candidate: {} });
+  routingShadowMock.mockResolvedValue({ candidate: {} });
+  routingPromoteMock.mockResolvedValue({ candidate: {} });
+  routingRollbackMock.mockResolvedValue({});
 });
 
 const draftCard = { digest: "This project is a CLI tool for X.", body: "# Project Card\n\nThis project is a CLI tool for X.\n\n## Stripped at generation\n\n- secrets.json", state: "draft" as const };
@@ -70,7 +89,7 @@ describe("HarnessSettingPanel", () => {
   it("updates escalation on change", async () => {
     render(<HarnessSettingPanel />);
     await waitFor(() => expect(screen.getByText("coder")).toBeTruthy());
-    fireEvent.change(screen.getByLabelText(/escalate to frontier/i), { target: { value: "3" } });
+    fireEvent.change(screen.getByLabelText(/escalate to a lead model/i), { target: { value: "3" } });
     await waitFor(() => expect(updateEscMock).toHaveBeenCalledWith("/r/alpha", 3));
   });
 
@@ -84,6 +103,37 @@ describe("HarnessSettingPanel", () => {
     render(<HarnessSettingPanel />);
     await waitFor(() => expect(screen.getByText("coder")).toBeTruthy());
     expect(screen.queryByText("Project card")).toBeNull();
+  });
+
+  it("runs a routing shadow check and requires explicit confirmation before promotion", async () => {
+    const candidate = {
+      id: "routing-test",
+      harnessDigest: `sha256:${"a".repeat(64)}`,
+      evidenceDigest: `sha256:${"b".repeat(64)}`,
+      status: "shadowed",
+      shadowCompleted: true,
+      gate: {
+        cleanMatchedTasks: 20,
+        noSafetyViolation: true,
+        fullyPriced: true,
+        eligible: true,
+        reasons: [],
+        qualityDelta: { mean: 0, lower95: 0, upper95: 0 },
+        pairedSavings: { mean: 0.5, lower95: 0.4, upper95: 0.6 },
+      },
+      table: { version: 3, evidenceDigest: `sha256:${"b".repeat(64)}`, fallback: "configured-route", overrides: [] },
+    };
+    routingProposalsMock.mockResolvedValue({ candidates: [candidate] });
+    render(<HarnessSettingPanel />);
+    await waitFor(() => expect(screen.getByText("routing-test")).toBeTruthy());
+    fireEvent.click(screen.getByRole("button", { name: "Review promotion…" }));
+    expect(routingPromoteMock).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Promote policy" }));
+    await waitFor(() => expect(routingPromoteMock).toHaveBeenCalledWith(
+      "/r/alpha",
+      "routing-test",
+      `sha256:${"a".repeat(64)}`,
+    ));
   });
 
   describe("project card", () => {
@@ -144,6 +194,7 @@ describe("HarnessSettingPanel", () => {
         defaultAgent: "fallback", escalation: 2, card: approvedCard,
       });
       fireEvent.click(screen.getByRole("button", { name: "Approve" }));
+      fireEvent.click(screen.getByRole("button", { name: "Approve Card" }));
       await waitFor(() => expect(cardApproveMock).toHaveBeenCalledWith("/r/alpha"));
       await waitFor(() => expect(screen.getByText("Approved")).toBeTruthy());
       const textarea = screen.getByLabelText("Project card digest") as HTMLTextAreaElement;
@@ -155,6 +206,7 @@ describe("HarnessSettingPanel", () => {
       render(<HarnessSettingPanel />);
       await waitFor(() => expect(screen.getByText("Project card")).toBeTruthy());
       fireEvent.click(screen.getByRole("button", { name: "Approve" }));
+      fireEvent.click(screen.getByRole("button", { name: "Approve Card" }));
       await waitFor(() => expect(screen.getByRole("alert").textContent).toBe("card not approvable"));
       expect(screen.getByText("Draft")).toBeTruthy();
     });

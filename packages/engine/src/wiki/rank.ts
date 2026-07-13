@@ -4,12 +4,29 @@ export interface RankedFile {
   file: string;
   score: number;
   definedSymbols: string[];
+  symbolAnchors?: Array<{ name: string; kind: string; row: number }>;
+  taskRelevance?: number;
+}
+
+function uniqueAnchors(
+  anchors: Array<{ name: string; kind: string; row: number }>,
+): Array<{ name: string; kind: string; row: number }> {
+  const seen = new Set<string>();
+  return anchors.filter((anchor) => {
+    if (seen.has(anchor.name)) return false;
+    seen.add(anchor.name);
+    return true;
+  });
 }
 
 export function rankFiles(
   symbols: SymbolHit[],
   refs: SymbolHit[],
-  options: { damping?: number; iterations?: number } = {},
+  options: {
+    damping?: number;
+    iterations?: number;
+    personalization?: ReadonlyMap<string, number>;
+  } = {},
 ): RankedFile[] {
   const damping = options.damping ?? 0.85;
   const iterations = options.iterations ?? 30;
@@ -17,11 +34,17 @@ export function rankFiles(
   const definers = new Map<string, string[]>();
   const files = new Set<string>();
   const symbolsByFile = new Map<string, string[]>();
+  const anchorsByFile = new Map<string, Array<{ name: string; kind: string; row: number }>>();
   for (const s of symbols) {
     files.add(s.file);
     (definers.get(s.name) ?? definers.set(s.name, []).get(s.name)!).push(s.file);
     (symbolsByFile.get(s.file) ?? symbolsByFile.set(s.file, []).get(s.file)!).push(s.name);
+    (
+      anchorsByFile.get(s.file) ??
+      anchorsByFile.set(s.file, []).get(s.file)!
+    ).push({ name: s.name, kind: s.kind, row: s.row });
   }
+  for (const file of options.personalization?.keys() ?? []) files.add(file);
 
   // edges: referencing file -> defining file, noise-filtered by defined names
   const outEdges = new Map<string, Map<string, number>>();
@@ -40,17 +63,42 @@ export function rankFiles(
 
   const n = files.size;
   if (n === 0) return [];
+  const positiveSeeds = [...(options.personalization?.entries() ?? [])].filter(
+    ([file, score]) => files.has(file) && Number.isFinite(score) && score > 0,
+  );
+  const seedTotal = positiveSeeds.reduce((total, [, score]) => total + score, 0);
+  const teleport = new Map<string, number>();
+  if (seedTotal > 0) {
+    for (const file of files) teleport.set(file, 0);
+    for (const [file, score] of positiveSeeds) teleport.set(file, score / seedTotal);
+  } else {
+    for (const file of files) teleport.set(file, 1 / n);
+  }
   let rank = new Map<string, number>();
-  for (const f of files) rank.set(f, 1 / n);
+  for (const f of files) rank.set(f, teleport.get(f) ?? 0);
   for (let i = 0; i < iterations; i += 1) {
     const next = new Map<string, number>();
-    for (const f of files) next.set(f, (1 - damping) / n);
-    for (const [src, out] of outEdges) {
+    for (const f of files) next.set(f, (1 - damping) * (teleport.get(f) ?? 0));
+    let danglingMass = 0;
+    for (const src of files) {
+      const out = outEdges.get(src);
+      if (out === undefined || out.size === 0) {
+        danglingMass += rank.get(src) ?? 0;
+        continue;
+      }
       const total = [...out.values()].reduce((a, b) => a + b, 0);
       if (total === 0) continue;
       const srcRank = rank.get(src) ?? 0;
       for (const [dst, w] of out) {
         next.set(dst, (next.get(dst) ?? 0) + damping * srcRank * (w / total));
+      }
+    }
+    if (danglingMass > 0) {
+      for (const dst of files) {
+        next.set(
+          dst,
+          (next.get(dst) ?? 0) + damping * danglingMass * (teleport.get(dst) ?? 0),
+        );
       }
     }
     rank = next;
@@ -61,6 +109,8 @@ export function rankFiles(
       file,
       score: rank.get(file) ?? 0,
       definedSymbols: [...new Set(symbolsByFile.get(file) ?? [])],
+      symbolAnchors: uniqueAnchors(anchorsByFile.get(file) ?? []),
+      taskRelevance: options.personalization?.get(file) ?? 0,
     }))
     .sort((a, b) => b.score - a.score || a.file.localeCompare(b.file));
 }
@@ -70,8 +120,14 @@ export function renderRepoMap(ranked: RankedFile[], budgetTokens: number): strin
   const lines: string[] = [];
   let used = 0;
   for (const r of ranked) {
-    if (r.definedSymbols.length === 0) continue;
-    const block = `${r.file}\n  ${r.definedSymbols.slice(0, 8).join(", ")}\n`;
+    if (r.definedSymbols.length === 0 && (r.taskRelevance ?? 0) <= 0) continue;
+    const anchored = (r.symbolAnchors ?? [])
+      .slice(0, 8)
+      .map((symbol) => `${symbol.name}@L${symbol.row + 1}`);
+    const symbols = anchored.length > 0 ? anchored : r.definedSymbols.slice(0, 8);
+    const reason = (r.taskRelevance ?? 0) > 0 ? "  why: matches the task query\n" : "";
+    const symbolLine = symbols.length > 0 ? `  symbols: ${symbols.join(", ")}\n` : "";
+    const block = `${r.file}\n${reason}${symbolLine}`;
     if (used + block.length > budgetChars) break;
     lines.push(block);
     used += block.length;

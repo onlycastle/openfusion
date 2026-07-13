@@ -40,6 +40,10 @@ describe("WikiStore", () => {
     ]);
     expect(store.refsByName("bar")).toHaveLength(1);
     expect(store.counts()).toEqual({ files: 1, symbols: 1, refs: 1 });
+    expect(store.listFileRecords()).toEqual([
+      { path: "src/a.ts", hash: "hash1", lang: "typescript" },
+    ]);
+    expect(store.integrityCheck()).toEqual({ ok: true, messages: ["ok"] });
     store.close();
   });
 
@@ -54,6 +58,31 @@ describe("WikiStore", () => {
     expect(store.symbolsByName("old")).toEqual([]);
     expect(store.symbolsByName("new")).toHaveLength(1);
     expect(store.getFileHash("a.ts")).toBe("h2");
+    store.close();
+  });
+
+  it("searches indexed paths and source text with FTS5", () => {
+    const store = makeStore();
+    store.upsertFile(
+      "src/wiki/rebuild.ts",
+      "h1",
+      "typescript",
+      [{ name: "refreshIndex", kind: "function", row: 2, col: 0 }],
+      [],
+      "export function refreshIndex() { return 'stale repository wiki'; }",
+    );
+    store.upsertFile(
+      "src/payments/checkout.ts",
+      "h2",
+      "typescript",
+      [{ name: "checkout", kind: "function", row: 0, col: 0 }],
+      [],
+      "export function checkout() { return 'payment'; }",
+    );
+
+    expect(store.searchFiles("stale wiki")[0]?.file).toBe("src/wiki/rebuild.ts");
+    expect(store.searchFiles("rebuild")[0]?.file).toBe("src/wiki/rebuild.ts");
+    expect(store.searchFiles("---")).toEqual([]);
     store.close();
   });
 
@@ -79,11 +108,59 @@ describe("WikiStore", () => {
     store.close();
   });
 
-  it("stamps schema version 1 in the database", () => {
+  it("keeps an immutable task snapshot when the live index is rebuilt", () => {
+    const store = makeStore();
+    store.applyBuild(
+      [{
+        path: "src/version.ts",
+        hash: "old-hash",
+        lang: "typescript",
+        symbols: [{ name: "oldVersion", kind: "function", row: 0, col: 0 }],
+        refs: [],
+        searchText: "old committed wiki content",
+      }],
+      [],
+      {
+        headSha: "a".repeat(40),
+        sourceFingerprint: `sha256:${"a".repeat(64)}`,
+      },
+    );
+    const snapshot = store.snapshot();
+
+    store.applyBuild(
+      [{
+        path: "src/version.ts",
+        hash: "new-hash",
+        lang: "typescript",
+        symbols: [{ name: "newVersion", kind: "function", row: 0, col: 0 }],
+        refs: [],
+        searchText: "new committed wiki content",
+      }],
+      [],
+      {
+        headSha: "b".repeat(40),
+        sourceFingerprint: `sha256:${"b".repeat(64)}`,
+      },
+    );
+
+    expect(snapshot.getSourceIdentity()).toEqual({
+      headSha: "a".repeat(40),
+      sourceFingerprint: `sha256:${"a".repeat(64)}`,
+    });
+    expect(snapshot.symbolsByName("oldVersion")).toHaveLength(1);
+    expect(snapshot.symbolsByName("newVersion")).toEqual([]);
+    expect(snapshot.searchFiles("old committed")[0]?.file).toBe("src/version.ts");
+    expect(store.getSourceIdentity().headSha).toBe("b".repeat(40));
+    expect(store.symbolsByName("newVersion")).toHaveLength(1);
+    snapshot.close();
+    store.close();
+  });
+
+  it("stamps schema version 2 in the database", () => {
     const store = makeStore();
     store.close();
     const db = new Database(path.join(dir, ".openfusion/cache/wiki.db"));
-    expect(db.pragma("user_version", { simple: true })).toBe(1);
+    expect(db.pragma("user_version", { simple: true })).toBe(2);
     db.close();
   });
 
@@ -103,12 +180,18 @@ describe("WikiStore", () => {
         },
       ],
       ["old.ts"],
-      { headSha: "sha-xyz" },
+      {
+        headSha: "sha-xyz",
+        sourceFingerprint: `sha256:${"a".repeat(64)}`,
+        coverageJson: JSON.stringify({ supportedTracked: 1 }),
+      },
     );
     expect(store.listFiles()).toEqual(["new.ts"]);
     expect(store.symbolsByName("gone")).toEqual([]);
     expect(store.symbolsByName("fresh")).toHaveLength(1);
     expect(store.getMeta("head_sha")).toBe("sha-xyz");
+    expect(store.getMeta("source_fingerprint")).toBe(`sha256:${"a".repeat(64)}`);
+    expect(store.getMeta("coverage")).toBe(JSON.stringify({ supportedTracked: 1 }));
   });
 
   it("recreates the database when schema version mismatches", () => {

@@ -19,9 +19,46 @@ export function querySymbols(
   };
 }
 
+export interface RepositoryMapResult {
+  map: string;
+  files: number;
+  renderable: number;
+  rendered: number;
+  matchedFiles: number;
+}
+
+export function buildRepositoryMap(
+  store: WikiStore,
+  options: { budgetTokens?: number; query?: string } = {},
+): RepositoryMapResult {
+  const query = options.query?.trim();
+  const searchHits = query === undefined || query.length === 0 ? [] : store.searchFiles(query);
+  const personalization = new Map(searchHits.map((hit) => [hit.file, hit.score]));
+  const ranked = rankFiles(store.allSymbols(), store.allRefs(), {
+    ...(personalization.size > 0 ? { personalization } : {}),
+  });
+  const map = renderRepoMap(ranked, options.budgetTokens ?? 1024);
+  const renderable = ranked.filter(
+    (entry) => entry.definedSymbols.length > 0 || (entry.taskRelevance ?? 0) > 0,
+  ).length;
+  const rendered =
+    map.length === 0
+      ? 0
+      : map.split("\n").filter((line) => !line.startsWith("  ") && line.length > 0).length;
+  return {
+    map,
+    files: ranked.length,
+    renderable,
+    rendered,
+    matchedFiles: personalization.size,
+  };
+}
+
 // budgetTokens defaults to 1024, matching the MCP tool's own prior default
 // (mcp.ts's `budgetTokens ?? 1024`).
-export function renderMap(store: WikiStore, budgetTokens = 1024): string {
-  const ranked = rankFiles(store.allSymbols(), store.allRefs());
-  return renderRepoMap(ranked, budgetTokens);
+export function renderMap(store: WikiStore, budgetTokens = 1024, query?: string): string {
+  return buildRepositoryMap(store, {
+    budgetTokens,
+    ...(query === undefined ? {} : { query }),
+  }).map;
 }

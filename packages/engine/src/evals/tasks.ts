@@ -7,7 +7,8 @@
 // documented as the pragmatic v1 default in
 // docs/research/2026-07-04-m6-pricing-eval-verification.md (Q2). Task 4's
 // report card runs on top of this: it drives an `EvalTask`'s `setup`, points
-// a worker/baseline session at the resulting directory, then calls
+// a worker/baseline session at the resulting directory, optionally invokes
+// evaluator-owned `prepareOracle` only after model sessions close, then calls
 // `runOracle` to get a pass/fail verdict.
 //
 // This module never shells out via `/bin/sh -c` -- every child process here
@@ -47,6 +48,15 @@ export interface EvalTask {
   // should be attempted from. Must be idempotent-safe to call once per fresh
   // directory (not required to be re-runnable against a dirty directory).
   setup: (worktreeRoot: string) => Promise<void>;
+  // Public deterministic commands that may run while compiling a candidate.
+  // These are part of the author-visible task environment and must never
+  // contain protected evaluator data.
+  verificationCommands?: string[][];
+  // Optional evaluator-owned materialization hook. runEvals invokes this
+  // only after the arm's author and independent reviewer sessions are closed,
+  // immediately before the protected oracle. It may add tests or fixtures to
+  // the disposable arm repository; those files are never exposed to models.
+  prepareOracle?: (worktreeRoot: string) => Promise<void>;
   // testCommand[0] is the program, the rest are args -- run with cwd set to
   // the worktree directory. Never a shell string (see module doc comment).
   testCommand: string[];
@@ -201,12 +211,12 @@ async function git(cwd: string, args: string[]): Promise<string> {
 // agent process cannot reach repoDir by another channel (e.g., a known
 // filesystem path + `git fetch <repoDir> <sha>`, since the target commit
 // is a live ref there; or a raw filesystem read of repoDir/.git). The
-// calling eval harness MUST place the eval directory away from repoDir
-// and rely on the worker/orchestrate sandbox (cwd-pinned bash; full
-// process isolation deferred to M7) to keep an adversarial worker from
-// reaching repoDir. This module guarantees only that it hands the agent
-// no pointer to repoDir in the returned task (id/prompt/testCommand carry
-// no such leak).
+// calling eval harness MUST place the eval directory away from repoDir and
+// enforce the fail-closed eval-v1 sandbox/certified-runtime contract. The
+// current runEvals path does both and also runs the protected oracle under
+// the native evaluator profile. This module guarantees only that it hands
+// the agent no pointer to repoDir in the returned task
+// (id/prompt/testCommand carry no such leak).
 export async function goldenTaskFromCommit(
   repoDir: string,
   commitSha: string,
@@ -219,6 +229,10 @@ export async function goldenTaskFromCommit(
     id: `golden-${commitSha}`,
     prompt: `Implement the following change: ${subject}`,
     testCommand,
+    // Golden v1 tasks deliberately use pre-existing fail-to-pass tests from
+    // the parent commit. They are public by construction and are therefore
+    // safe to reuse as deterministic candidate verification.
+    verificationCommands: [testCommand],
     setup: async (worktreeRoot: string) => {
       mkdirSync(worktreeRoot, { recursive: true });
       const scratch = mkdtempSync(path.join(os.tmpdir(), "of-golden-archive-"));
@@ -261,12 +275,11 @@ export interface SynthEvalTaskOptions {
 
 // Deterministic, no-real-model test fixture used both by this module's own
 // tests and by Task 4's report-card tests (exported for that reason). Its
-// `setup` writes a tiny CommonJS source file with a deliberately UNFINISHED
-// implementation, plus a Node `--test`-free assertion script (plain
-// `node <file>`, no test framework dependency) that FAILS against that
-// unfinished implementation and PASSES once the described change (finishing
-// the implementation) is applied -- a real fail-to-pass fixture, not a
-// pre-baked true/false toggle.
+// `setup` writes only the tiny CommonJS source file with a deliberately
+// UNFINISHED implementation. The Node assertion script is evaluator-owned and
+// is written by `prepareOracle` only after authoring/review stops. It FAILS
+// against the unfinished implementation and PASSES once the described change
+// is applied -- a real fail-to-pass fixture, not a pre-baked true/false toggle.
 export function synthEvalTask(opts: SynthEvalTaskOptions = {}): EvalTask {
   const id = opts.id ?? "synth-add";
   const sourceFile = opts.sourceFile ?? "source.js";
@@ -279,6 +292,7 @@ export function synthEvalTask(opts: SynthEvalTaskOptions = {}): EvalTask {
     id,
     prompt,
     testCommand: ["node", testFile],
+    verificationCommands: [],
     setup: async (worktreeRoot: string) => {
       mkdirSync(worktreeRoot, { recursive: true });
       writeFileSync(
@@ -293,6 +307,8 @@ export function synthEvalTask(opts: SynthEvalTaskOptions = {}): EvalTask {
           "",
         ].join("\n"),
       );
+    },
+    prepareOracle: async (worktreeRoot: string) => {
       writeFileSync(
         path.join(worktreeRoot, testFile),
         [

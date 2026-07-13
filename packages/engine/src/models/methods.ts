@@ -1,4 +1,4 @@
-import { APICallError, generateText, RetryError, type ModelMessage } from "ai";
+import { APICallError, generateText, RetryError, type LanguageModel, type ModelMessage } from "ai";
 import { z } from "zod";
 import { RpcErrorCodes } from "@openfusion/shared";
 import type { Engine } from "../engine.js";
@@ -10,6 +10,18 @@ import { estimateCostUsd, lookupPricing, normalizeUsage, type NormalizedUsage } 
 import { ProviderConfigSchema, ProviderRegistry } from "./providers.js";
 
 const EmptyParamsSchema = z.object({});
+
+const ProviderIdParamsSchema = z.object({
+  id: z.string().min(1),
+});
+
+const ConnectionCheckParamsSchema = ProviderConfigSchema.extend({
+  model: z.string().min(1),
+});
+
+type ConnectionCheckParams = z.infer<typeof ConnectionCheckParamsSchema>;
+
+const CONNECTION_CHECK_TIMEOUT_MS = 15_000;
 
 const MessageSchema = z.object({
   role: z.enum(["system", "user", "assistant"]),
@@ -149,6 +161,67 @@ function timeoutAttemptMessage(err: unknown, timeoutMs: number): string {
     : `model call timed out after ${timeoutMs}ms: ${raw}`;
 }
 
+function connectionCheckErrorMessage(err: unknown): string {
+  if (isTimeoutError(err)) {
+    return "Connection check timed out after 15 seconds.";
+  }
+  if (APICallError.isInstance(err)) {
+    switch (err.statusCode) {
+      case 401:
+      case 403:
+        return "Authentication failed. Check the API key and account access.";
+      case 404:
+        return "The endpoint or model was not found. Check the base URL and model.";
+      case 429:
+        return "The provider rate-limited the connection check. Try again shortly.";
+      default:
+        return err.statusCode === undefined
+          ? "The provider rejected the connection check. Check the API key, model, and endpoint."
+          : `The provider returned HTTP ${err.statusCode}. Check the API key, model, and endpoint.`;
+    }
+  }
+  if (err instanceof TypeError) {
+    return "Could not reach the provider. Check the base URL and network connection.";
+  }
+  return "The provider rejected the connection check. Check the API key, model, and endpoint.";
+}
+
+/** Make one minimal model request without registering the provider or
+ * recording usage. Exported so the network-free model seam can be tested
+ * with an AI SDK mock rather than real credentials. */
+export async function checkLanguageModelConnection(
+  model: LanguageModel,
+  timeoutMs = CONNECTION_CHECK_TIMEOUT_MS,
+  cancellationSignal?: AbortSignal,
+): Promise<void> {
+  const timeoutSignal = AbortSignal.timeout(timeoutMs);
+  await generateText({
+    model,
+    prompt: "Reply with OK.",
+    maxOutputTokens: 1,
+    maxRetries: 0,
+    abortSignal: cancellationSignal === undefined
+      ? timeoutSignal
+      : AbortSignal.any([cancellationSignal, timeoutSignal]),
+  });
+}
+
+async function runConnectionCheck(engine: Engine, params: ConnectionCheckParams): Promise<{ connected: true }> {
+  const { model, ...config } = params;
+  const scratchRegistry = new ProviderRegistry();
+  scratchRegistry.configure(config);
+
+  try {
+    await engine.providerGateway.execute(
+      { providerId: config.id, cacheStatus: "miss" },
+      (signal) => checkLanguageModelConnection(scratchRegistry.resolve(config.id, model), CONNECTION_CHECK_TIMEOUT_MS, signal),
+    );
+    return { connected: true };
+  } catch (err) {
+    throw new RpcMethodError(RpcErrorCodes.SERVER_ERROR, connectionCheckErrorMessage(err));
+  }
+}
+
 async function runComplete(
   engine: Engine,
   params: CompleteParams,
@@ -184,22 +257,25 @@ async function runComplete(
       const abortSignal =
         params.timeoutMs !== undefined ? AbortSignal.timeout(params.timeoutMs) : undefined;
 
-      const result = await generateText({
-        model: languageModel,
-        ...promptOptions,
-        maxOutputTokens: params.maxOutputTokens,
-        // The fallback chain is the single retry layer; SDK-internal retries
-        // would stack backoff under it (M2 final review, Important #2).
-        maxRetries: 0,
-        ...(abortSignal !== undefined ? { abortSignal } : {}),
-      });
+      const result = await engine.providerGateway.execute(
+        { providerId, ...(abortSignal === undefined ? {} : { signal: abortSignal }), cacheStatus: "unknown" },
+        (signal) => generateText({
+          model: languageModel,
+          ...promptOptions,
+          maxOutputTokens: params.maxOutputTokens,
+          // The fallback chain is the single retry layer; SDK-internal retries
+          // would stack backoff under it (M2 final review, Important #2).
+          maxRetries: 0,
+          abortSignal: signal,
+        }),
+      );
 
       const usage = normalizeUsage(result.usage);
       const pricing = lookupPricing(kind, model);
       const costUsd = pricing !== null ? estimateCostUsd(pricing, usage) : null;
       const pricingConfidence = pricing !== null ? pricing.confidence : "unpriced";
 
-      engine.models.meter.record({
+      engine.providerGateway.recordUsage({
         providerId,
         kind,
         model,
@@ -248,9 +324,24 @@ async function runComplete(
 }
 
 export function registerModelsMethods(engine: Engine): void {
+  registerMethod(engine.dispatcher, "engine.models.check", ConnectionCheckParamsSchema, async (params) => {
+    try {
+      const result = await runConnectionCheck(engine, params);
+      engine.log(`models.check ${params.kind}/${params.model} ok`);
+      return result;
+    } catch (err) {
+      engine.log(`models.check ${params.kind}/${params.model} failed`);
+      throw err;
+    }
+  });
+
   registerMethod(engine.dispatcher, "engine.models.configure", ProviderConfigSchema, (config) => {
     engine.models.registry.configure(config);
     return { configured: true };
+  });
+
+  registerMethod(engine.dispatcher, "engine.models.unconfigure", ProviderIdParamsSchema, ({ id }) => {
+    return { unconfigured: engine.models.registry.unconfigure(id) };
   });
 
   registerMethod(engine.dispatcher, "engine.models.list", EmptyParamsSchema, () => {

@@ -97,6 +97,35 @@ describe("wiki RPC methods", () => {
     expect(res.result.truncated).toBe(false);
   }, 30_000);
 
+  it("map uses the task query to prioritize matching files", async () => {
+    makeRepo();
+    writeFileSync(
+      path.join(dir, "payments.ts"),
+      "export function checkoutPayment() { return 'credit card'; }\n",
+    );
+    writeFileSync(
+      path.join(dir, "wiki-rebuild.ts"),
+      "export function rebuildRepositoryWiki() { return 'stale index refresh'; }\n",
+    );
+    execFileSync("git", ["-C", dir, "add", "-A"]);
+    execFileSync("git", ["-C", dir, "commit", "-qm", "more domains"]);
+
+    await call("engine.wiki.build", { projectDir: dir });
+    const res = await call("engine.wiki.map", {
+      projectDir: dir,
+      query: "fix stale repository wiki rebuild",
+      budgetTokens: 256,
+    });
+
+    expect(res.error).toBeUndefined();
+    expect(res.result.matchedFiles).toBeGreaterThan(0);
+    expect(res.result.map.indexOf("wiki-rebuild.ts")).toBeLessThan(
+      res.result.map.indexOf("payments.ts"),
+    );
+    expect(res.result.map).toContain("why: matches the task query");
+    expect(res.result.map).toContain("rebuildRepositoryWiki@L1");
+  }, 30_000);
+
   it("map on an unbuilt project returns SERVER_ERROR", async () => {
     makeRepo();
     const res = await call("engine.wiki.map", { projectDir: dir });

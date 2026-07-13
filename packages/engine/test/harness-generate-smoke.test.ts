@@ -58,7 +58,7 @@ describe("engine.harness.generate (real smoke)", () => {
         expect(res.error).toBeUndefined();
         expect(res.result.pages).toBe(5);
         expect(res.result.agents).toBeGreaterThanOrEqual(2);
-        expect(res.result.reportCard).toEqual({ structural: "pass", evals: "pending" });
+        expect(res.result.reportCard).toEqual({ structural: "pass", operational: "insufficient-evidence" });
 
         const bundle = loadHarness(dir);
         expect(bundle).not.toBeNull();

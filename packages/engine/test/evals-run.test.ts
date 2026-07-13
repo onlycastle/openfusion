@@ -4,16 +4,29 @@ import { existsSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "no
 import os from "node:os";
 import path from "node:path";
 import { MockLanguageModelV4 } from "ai/test";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { RpcErrorCodes } from "@openfusion/shared";
-import { createEngine, type Engine } from "../src/engine.js";
+import {
+  createEngine,
+  type Engine,
+  type EngineOptions,
+  type VerificationRunner,
+} from "../src/engine.js";
 import type { FrontierAdapter, FrontierEvent, FrontierPromptHandle, FrontierSession } from "../src/engines/types.js";
 import type { AgentDef, HarnessBundle, Routing, WikiPage } from "../src/harness/schema.js";
-import { harnessStatus, writeHarness } from "../src/harness/store.js";
+import { loadHarness, writeHarness } from "../src/harness/store.js";
 import type { CostMeter } from "../src/models/meter.js";
 import { goldenTaskFromCommit, synthEvalTask, type EvalTask } from "../src/evals/tasks.js";
 import { runEvals } from "../src/evals/run.js";
 import { RpcMethodError } from "../src/rpc/errors.js";
+import { runtimeCapabilities } from "../src/runtime/capabilities.js";
+import { MacOsSandboxBackend } from "../src/runtime/sandbox.js";
+import { createPassthroughSandboxRunner } from "./native-sandbox-fixture.js";
+
+// Protected oracles add two real process boundaries per task. Keep the
+// default wide enough for full-suite contention; large samples still carry
+// their own explicit ceilings below.
+vi.setConfig({ testTimeout: 30_000, hookTimeout: 30_000 });
 
 // Fixture literal only — must never appear outside test files (mirrors
 // orchestrate.test.ts's identical TEST_API_KEY constant/rationale).
@@ -21,10 +34,64 @@ const TEST_API_KEY = "sk-test-fixture-never-real-1234567890";
 
 let dir: string;
 let engine: Engine;
+const sandboxDirs = new Set<string>();
+
+const TEST_VERIFICATION_RUNNER: VerificationRunner = {
+  async status() {
+    return { available: true };
+  },
+  async run() {
+    return { exitCode: 0 };
+  },
+};
+
+function createTestEngine(options: EngineOptions = {}): Engine {
+  let sandboxBackend = options.sandboxBackend;
+  if (sandboxBackend === undefined) {
+    const sandboxDir = mkdtempSync(path.join(os.tmpdir(), "of-eval-test-sandbox-"));
+    sandboxDirs.add(sandboxDir);
+    sandboxBackend = new MacOsSandboxBackend({
+      platform: "darwin",
+      runnerExecutable: createPassthroughSandboxRunner(sandboxDir),
+      probe: async () => ({ ok: true }),
+    });
+  }
+  const testEngine = createEngine({
+    ...options,
+    sandboxBackend,
+    verificationRunner: TEST_VERIFICATION_RUNNER,
+  });
+  const register = testEngine.frontier.registerAdapter.bind(testEngine.frontier);
+  testEngine.frontier.registerAdapter = (adapter) => {
+    if (adapter.capabilities === undefined) {
+      adapter.capabilities = async () => testCapabilities(adapter.kind);
+    }
+    register(adapter);
+  };
+  return testEngine;
+}
+
+function testCapabilities(runtimeId: string) {
+  return runtimeCapabilities({
+    runtimeId,
+    runtimeVersion: "test",
+    protocolVersion: "test-v1",
+    structuredOutput: true,
+    toolCalls: true,
+    pathAwareApprovals: true,
+    mcp: false,
+    resume: false,
+    fork: false,
+    compaction: false,
+    sandboxCompatibility: "certified",
+  });
+}
 
 afterEach(async () => {
   if (engine !== undefined) await engine.close();
   if (dir !== undefined) rmSync(dir, { recursive: true, force: true });
+  for (const sandboxDir of sandboxDirs) rmSync(sandboxDir, { recursive: true, force: true });
+  sandboxDirs.clear();
 });
 
 function git(cwd: string, ...args: string[]): string {
@@ -121,6 +188,8 @@ interface FakeEvalsFrontierOptions {
   harnessCostUsd?: number | null;
   meter?: CostMeter;
   sourceFile?: string;
+  /** Every review call's verdict (both baseline's own review and the harness's). Defaults to "approve". */
+  reviewDecision?: "approve" | "request-changes";
 }
 
 // One fake frontier adapter serves BOTH roles this suite needs:
@@ -139,20 +208,37 @@ function makeFakeEvalsFrontierAdapter(opts: FakeEvalsFrontierOptions): FrontierA
     kind: "claude-code",
     async createSession({ projectDir, resultLabel }): Promise<FrontierSession> {
       const isBaseline = resultLabel === "eval-baseline";
+      const isReview = resultLabel === "frontier-review";
       const correct = isBaseline ? opts.baselineCorrect : opts.harnessCorrect;
       const configuredCost = isBaseline ? opts.baselineCostUsd : opts.harnessCostUsd;
-      const costUsd = configuredCost === undefined ? (isBaseline ? 0.5 : 0.05) : configuredCost;
+      const costUsd = isReview
+        ? 0
+        : configuredCost === undefined
+          ? (isBaseline ? 0.5 : 0.05)
+          : configuredCost;
       return {
         id: randomUUID(),
         projectDir,
         prompt(_text: string, _promptOpts?: { timeoutMs?: number }): FrontierPromptHandle {
           async function* gen(): AsyncGenerator<FrontierEvent> {
-            writeFileSync(path.join(projectDir, sourceFile), correct ? CORRECT_SOURCE : WRONG_SOURCE);
-            yield { type: "tool_use", name: "Write", summary: `wrote ${sourceFile}` };
-            yield { type: "text", text: "done" };
+            if (isReview) {
+              const decision = opts.reviewDecision ?? "approve";
+              yield {
+                type: "text",
+                text: "```json\n" + JSON.stringify({
+                  decision,
+                  reasons: decision === "approve" ? [] : ["fixture: reviewer rejects every diff"],
+                  severity: decision === "approve" ? "none" : "major",
+                }) + "\n```",
+              };
+            } else {
+              writeFileSync(path.join(projectDir, sourceFile), correct ? CORRECT_SOURCE : WRONG_SOURCE);
+              yield { type: "tool_use", name: "Write", summary: `wrote ${sourceFile}` };
+              yield { type: "text", text: "done" };
+            }
             const event: FrontierEvent = {
               type: "result",
-              resultText: "done",
+              resultText: isReview ? "approve" : "done",
               costUsd,
               usage: { inputTokens: 10, outputTokens: 5, cacheReadTokens: 0 },
               numTurns: 1,
@@ -197,22 +283,32 @@ function makePartialFailFrontierAdapter(opts: {
     kind: "claude-code",
     async createSession({ projectDir, resultLabel }): Promise<FrontierSession> {
       const isBaseline = resultLabel === "eval-baseline";
+      const isReview = resultLabel === "frontier-review";
       let correct: boolean;
       if (isBaseline) {
+        correct = true;
+      } else if (isReview) {
         correct = true;
       } else {
         harnessSeen += 1;
         correct = harnessSeen > opts.harnessFailCount; // first N harness runs fail
       }
-      const costUsd = isBaseline ? opts.baselineCostUsd : opts.harnessCostUsd;
+      const costUsd = isReview ? 0 : isBaseline ? opts.baselineCostUsd : opts.harnessCostUsd;
       return {
         id: randomUUID(),
         projectDir,
         prompt(_text: string, _promptOpts?: { timeoutMs?: number }): FrontierPromptHandle {
           async function* gen(): AsyncGenerator<FrontierEvent> {
-            writeFileSync(path.join(projectDir, "source.js"), correct ? CORRECT_SOURCE : WRONG_SOURCE);
-            yield { type: "tool_use", name: "Write", summary: "wrote source.js" };
-            yield { type: "text", text: "done" };
+            if (isReview) {
+              yield {
+                type: "text",
+                text: "```json\n" + JSON.stringify({ decision: "approve", reasons: [], severity: "none" }) + "\n```",
+              };
+            } else {
+              writeFileSync(path.join(projectDir, "source.js"), correct ? CORRECT_SOURCE : WRONG_SOURCE);
+              yield { type: "tool_use", name: "Write", summary: "wrote source.js" };
+              yield { type: "text", text: "done" };
+            }
             const event: FrontierEvent = {
               type: "result",
               resultText: "done",
@@ -443,10 +539,128 @@ function makeMixedPricingFrontierAdapter(meter: CostMeter): FrontierAdapter {
   };
 }
 
+function makeSelectedRoleAdapter(kind: string, calls: Array<string | undefined>): FrontierAdapter {
+  return {
+    kind,
+    async createSession({ projectDir, model, resultLabel }): Promise<FrontierSession> {
+      calls.push(model);
+      return {
+        id: randomUUID(),
+        projectDir,
+        prompt(): FrontierPromptHandle {
+          async function* gen(): AsyncGenerator<FrontierEvent> {
+            const isReview = resultLabel === "frontier-review";
+            if (isReview) {
+              yield {
+                type: "text",
+                text: "```json\n" + JSON.stringify({ decision: "approve", reasons: [], severity: "none" }) + "\n```",
+              };
+            } else {
+              writeFileSync(path.join(projectDir, "source.js"), CORRECT_SOURCE);
+            }
+            yield {
+              type: "result",
+              resultText: isReview ? "approve" : "done",
+              costUsd: isReview ? 0 : 0.1,
+              usage: { inputTokens: 10, outputTokens: 5, cacheReadTokens: 0 },
+              numTurns: 1,
+              durationMs: 1,
+              engineSessionId: null,
+            };
+          }
+          return { events: gen(), abort: () => {} };
+        },
+        async close(): Promise<void> {},
+      };
+    },
+  };
+}
+
+describe("runEvals — frontier role selections", () => {
+  it("uses independent selected models for the evaluation baseline and harness escalation", async () => {
+    dir = await makeHarnessFixture();
+    engine = createTestEngine();
+    const baselineCalls: Array<string | undefined> = [];
+    const escalationCalls: Array<string | undefined> = [];
+    engine.frontier.registerAdapter(makeSelectedRoleAdapter("baseline-runtime", baselineCalls));
+    engine.frontier.registerAdapter(makeSelectedRoleAdapter("escalation-runtime", escalationCalls));
+
+    const report = await runEvals(engine, {
+      projectDir: dir,
+      tasks: [synthEvalTask({ id: "t1" })],
+      frontier: {
+        baseline: { engine: "baseline-runtime", model: "baseline-model" },
+        review: { engine: "escalation-runtime", model: "review-model" },
+        escalation: { engine: "escalation-runtime", model: "escalation-model" },
+      },
+    });
+
+    expect(report.baseline.passed).toBe(1);
+    expect(report.harness.passed).toBe(1);
+    expect(baselineCalls).toEqual(["baseline-model"]);
+    expect(escalationCalls).toEqual(["review-model", "escalation-model", "review-model"]);
+    expect(report.harnessConfig?.frontierEngine).toContain("baseline=baseline-runtime");
+    expect(report.harnessConfig?.frontierEngine).toContain("escalation=escalation-runtime");
+    expect(report.harnessConfig?.frontierRoles.baseline).toEqual({
+      engine: "baseline-runtime",
+      model: "baseline-model",
+    });
+    expect(report.harnessConfig?.frontierRoles.escalation).toEqual({
+      engine: "escalation-runtime",
+      model: "escalation-model",
+    });
+  });
+});
+
+describe("runEvals — protected oracle isolation", () => {
+  it("materializes evaluator-only tests after every model session closes", async () => {
+    dir = await makeHarnessFixture();
+    engine = createTestEngine();
+    const protectedTestFile = "protected-oracle.js";
+    const baseTask = synthEvalTask({ id: "protected", testFile: protectedTestFile });
+    let oraclePreparations = 0;
+    const task: EvalTask = {
+      ...baseTask,
+      prepareOracle: async (projectDir) => {
+        oraclePreparations += 1;
+        await baseTask.prepareOracle?.(projectDir);
+      },
+    };
+    const modelPrompts: string[] = [];
+    const modelTreesContainedProtectedTest: boolean[] = [];
+    const adapter = makeFakeEvalsFrontierAdapter({
+      baselineCorrect: true,
+      harnessCorrect: true,
+      meter: engine.models.meter,
+    });
+    const createSession = adapter.createSession.bind(adapter);
+    adapter.createSession = async (options) => {
+      modelTreesContainedProtectedTest.push(existsSync(path.join(options.projectDir, protectedTestFile)));
+      const session = await createSession(options);
+      const prompt = session.prompt.bind(session);
+      session.prompt = (text, promptOptions) => {
+        modelPrompts.push(text);
+        return prompt(text, promptOptions);
+      };
+      return session;
+    };
+    engine.frontier.registerAdapter(adapter);
+
+    const report = await runEvals(engine, { projectDir: dir, tasks: [task] });
+
+    expect(report.baseline.passed).toBe(1);
+    expect(report.harness.passed).toBe(1);
+    expect(oraclePreparations).toBe(2);
+    expect(modelTreesContainedProtectedTest.length).toBeGreaterThanOrEqual(4);
+    expect(modelTreesContainedProtectedTest.every((value) => value === false)).toBe(true);
+    expect(modelPrompts.every((promptText) => !promptText.includes(protectedTestFile))).toBe(true);
+  }, 30_000);
+});
+
 describe("runEvals — C1: mixed pricing (unpriced worker cost must not overstate savings)", () => {
-  it("frontier priced, WORKER model unpriced -> verdict 'inconclusive' (never 'pass'); manifest not flipped; note names the unpriced count", async () => {
+  it("frontier priced, WORKER model unpriced -> verdict 'inconclusive' (never 'pass'); legacy manifest state stays untouched; note names the unpriced count", async () => {
     dir = await makeUnpricedWorkerHarnessFixture();
-    engine = createEngine();
+    engine = createTestEngine();
     engine.models.registry.configure({ id: "p1", kind: "deepseek", apiKey: TEST_API_KEY });
     engine.models.registry.setTestModel("p1", makeRepeatableWorkerMock("source.js", CORRECT_SOURCE, "wrote source.js"));
     engine.frontier.registerAdapter(makeMixedPricingFrontierAdapter(engine.models.meter));
@@ -462,29 +676,22 @@ describe("runEvals — C1: mixed pricing (unpriced worker cost must not overstat
     expect(report.qualityHeld).toBe(true);
     expect(report.perTask.every((t) => t.harnessOutcome === "worker-approved")).toBe(true);
 
-    // THE BUG (pre-fix): orchestrate.ts's own `cost.totalUsd` silently drops
-    // the unpriced worker cost (addCost's null-skip semantics), so
-    // harness.costUsd looks like a real, priced (review-only) number and
-    // savingsPct comes out positive -- looking exactly like a legitimate
-    // "pass".
-    expect(report.harness.costUsd).not.toBeNull();
-    expect(report.savingsPct).not.toBeNull();
-    expect(report.savingsPct!).toBeGreaterThan(0);
+    // A partial sum is never exposed as total cost or savings.
+    expect(report.harness.costUsd).toBeNull();
+    expect(report.savingsPct).toBeNull();
 
-    // THE FIX (C1): a run where ANY model call went unpriced must never be
-    // reported as "pass" -- the savings figure above rests on an
-    // undercounted cost, not a real measurement.
+    // A run where ANY model call went unpriced must never be promoted.
     expect(report.verdict).toBe("inconclusive");
     expect(report.note).toContain("unpriced");
     expect(report.note).toMatch(/\d+ model call\(s\) were unpriced/);
-    expect(harnessStatus(dir).evals).toBe("pending");
+    expect(loadHarness(dir)?.manifest.verification.evals).toBe("pending");
   }, 30_000);
 });
 
 describe("runEvals — sample-size gate", () => {
   it("harness matches baseline (both pass), priced -- but too few tasks -> inconclusive even on a good run", async () => {
     dir = await makeHarnessFixture();
-    engine = createEngine();
+    engine = createTestEngine();
     engine.frontier.registerAdapter(
       makeFakeEvalsFrontierAdapter({
         baselineCorrect: true,
@@ -509,12 +716,12 @@ describe("runEvals — sample-size gate", () => {
     expect(report.verdict).toBe("inconclusive");
     expect(report.note.toLowerCase()).toContain("demo, not a claim");
 
-    expect(harnessStatus(dir).evals).toBe("pending");
+    expect(loadHarness(dir)?.manifest.verification.evals).toBe("pending");
   });
 
   it("priced, quality held, positive savings, but between the low floor and the savings-pass floor -> inconclusive", async () => {
     dir = await makeHarnessFixture();
-    engine = createEngine();
+    engine = createTestEngine();
     engine.frontier.registerAdapter(
       makeFakeEvalsFrontierAdapter({
         baselineCorrect: true,
@@ -533,14 +740,55 @@ describe("runEvals — sample-size gate", () => {
     expect(report.qualityHeld).toBe(true);
     expect(report.savingsPct!).toBeGreaterThan(0);
     expect(report.verdict).toBe("inconclusive");
-    expect(harnessStatus(dir).evals).toBe("pending");
+    expect(loadHarness(dir)?.manifest.verification.evals).toBe("pending");
   }, 120_000);
+});
+
+describe("runEvals — transactional experiment resume", () => {
+  it("reuses completed SQLite trial rows without duplicate model calls", async () => {
+    dir = await makeHarnessFixture();
+    engine = createTestEngine();
+    const adapter = makeFakeEvalsFrontierAdapter({
+      baselineCorrect: true,
+      harnessCorrect: true,
+      baselineCostUsd: 0.5,
+      harnessCostUsd: 0.05,
+      meter: engine.models.meter,
+    });
+    const originalCreate = adapter.createSession.bind(adapter);
+    let modelSessions = 0;
+    adapter.createSession = async (options) => {
+      modelSessions += 1;
+      return originalCreate(options);
+    };
+    engine.frontier.registerAdapter(adapter);
+    const input = {
+      projectDir: dir,
+      tasks: [synthEvalTask({ id: "resume-task" })],
+      experiment: {
+        id: "experiment-resume",
+        variant: "dialect-pack" as const,
+        repeatIndex: 0,
+        seed: 42,
+      },
+    };
+
+    await runEvals(engine, input);
+    const afterFirst = modelSessions;
+    expect(afterFirst).toBeGreaterThan(0);
+    expect(engine.runtime.evidence.listTrials(engine.runtime.getStore(dir), "experiment-resume"))
+      .toHaveLength(2);
+
+    const resumed = await runEvals(engine, input);
+    expect(resumed.perTask).toHaveLength(1);
+    expect(modelSessions).toBe(afterFirst);
+  });
 });
 
 describe("runEvals — ETH hazard", () => {
   it("harness FAILS a task the baseline PASSES -> verdict 'fail' (a GENUINE quality failure, not a measurement artifact)", async () => {
     dir = await makeHarnessFixture();
-    engine = createEngine();
+    engine = createTestEngine();
     engine.frontier.registerAdapter(
       makeFakeEvalsFrontierAdapter({
         baselineCorrect: true,
@@ -571,14 +819,50 @@ describe("runEvals — ETH hazard", () => {
     // below baseline is an automatic "fail" -- savingsPct is never allowed
     // to paper over an ETH hazard.
     expect(report.verdict).toBe("fail");
-    expect(harnessStatus(dir).evals).toBe("fail");
+    expect(loadHarness(dir)?.manifest.verification.evals).toBe("pending");
+  });
+});
+
+describe("runEvals — reviewer-rejected non-empty harness diff is a quality failure, not a measurement error (final review Fix 1)", () => {
+  it("harness escalation produces a real diff the reviewer rejects -> harnessOutcome 'failed' (not 'error'), included in the clean subset", async () => {
+    dir = await makeHarnessFixture();
+    engine = createTestEngine();
+    engine.frontier.registerAdapter(
+      makeFakeEvalsFrontierAdapter({
+        baselineCorrect: true,
+        harnessCorrect: true,
+        reviewDecision: "request-changes", // every review (baseline's own + harness's) rejects
+        baselineCostUsd: 0.5,
+        harnessCostUsd: 0.05,
+        meter: engine.models.meter,
+      }),
+    );
+
+    const tasks: EvalTask[] = [synthEvalTask({ id: "t1" }), synthEvalTask({ id: "t2" })];
+    const report = await runEvals(engine, { projectDir: dir, tasks });
+
+    // Both arms wrote a real fix, then review rejected it -- oracle sees the
+    // ORIGINAL unfinished source on both sides, so both genuinely fail. This
+    // is real quality evidence (candidateRef stays null only because review
+    // rejected, not because of an infra/verification hiccup).
+    expect(report.baseline.passed).toBe(0);
+    expect(report.harness.passed).toBe(0);
+    expect(report.perTask.every((t) => t.harnessOutcome === "failed")).toBe(true);
+    expect(report.perTask.every((t) => t.baselineOutcome === "completed")).toBe(true);
+    // THE FIX: a reviewer-rejected non-empty diff must count as quality
+    // evidence -- never excluded from the clean subset as a measurement
+    // "error" (verdict.ts's isHarnessMeasurementFailure).
+    expect(report.measurementFailureCount).toBe(0);
+    expect(report.cleanTaskCount).toBe(report.taskCount);
+    expect(report.cleanHarnessPassed).toBe(0);
+    expect(loadHarness(dir)?.manifest.verification.evals).toBe("pending");
   });
 });
 
 describe("runEvals — quality-gap significance (noise band, research 2026-07-07 §3.3)", () => {
   it("small clean-subset gap within the noise band (1 of 20) -> NOT an ETH fail; quality treated as held", async () => {
     dir = await makeHarnessFixture();
-    engine = createEngine();
+    engine = createTestEngine();
     engine.frontier.registerAdapter(
       makePartialFailFrontierAdapter({
         harnessFailCount: 1, // 1/20 = 5pp; strictly at/below the 0.05 band -> not significant
@@ -596,12 +880,12 @@ describe("runEvals — quality-gap significance (noise band, research 2026-07-07
     // Not a fail: within noise, so quality "held"; priced + >=20 tasks +
     // positive savings -> pass.
     expect(report.verdict).toBe("pass");
-    expect(harnessStatus(dir).evals).toBe("pass");
+    expect(loadHarness(dir)?.manifest.verification.evals).toBe("pending");
   }, 120_000);
 
   it("clean-subset gap ABOVE the noise band (3 of 20 = 15pp) -> ETH fail", async () => {
     dir = await makeHarnessFixture();
-    engine = createEngine();
+    engine = createTestEngine();
     engine.frontier.registerAdapter(
       makePartialFailFrontierAdapter({
         harnessFailCount: 3, // 3/20 = 15pp > 0.05
@@ -616,14 +900,14 @@ describe("runEvals — quality-gap significance (noise band, research 2026-07-07
     expect(report.harness.passed).toBe(17);
     expect(report.qualityGapWithinNoise).toBe(false);
     expect(report.verdict).toBe("fail");
-    expect(harnessStatus(dir).evals).toBe("fail");
+    expect(loadHarness(dir)?.manifest.verification.evals).toBe("pending");
   }, 120_000);
 });
 
 describe("runEvals — cost-regression hazard (two-dimensional verdict, research 2026-07-07 §4.3)", () => {
   it("quality held but harness materially MORE expensive (>=10%) -> ETH cost-hazard fail (fires at the low floor)", async () => {
     dir = await makeHarnessFixture();
-    engine = createEngine();
+    engine = createTestEngine();
     engine.frontier.registerAdapter(
       makeFakeEvalsFrontierAdapter({
         baselineCorrect: true,
@@ -639,7 +923,7 @@ describe("runEvals — cost-regression hazard (two-dimensional verdict, research
     expect(report.qualityHeld).toBe(true);
     expect(report.savingsPct!).toBeLessThan(0);
     expect(report.verdict).toBe("fail");
-    expect(harnessStatus(dir).evals).toBe("fail");
+    expect(loadHarness(dir)?.manifest.verification.evals).toBe("pending");
     // Non-vacuous: every report note contains the boilerplate "Cost figures
     // are estimate-class..." sentence, so asserting just "cost" would pass
     // regardless of which branch fired. This substring is unique to the
@@ -651,7 +935,7 @@ describe("runEvals — cost-regression hazard (two-dimensional verdict, research
 
   it("quality held, harness only MILDLY more expensive (<10%) -> inconclusive, never a fail", async () => {
     dir = await makeHarnessFixture();
-    engine = createEngine();
+    engine = createTestEngine();
     engine.frontier.registerAdapter(
       makeFakeEvalsFrontierAdapter({
         baselineCorrect: true,
@@ -667,14 +951,14 @@ describe("runEvals — cost-regression hazard (two-dimensional verdict, research
     expect(report.qualityHeld).toBe(true);
     expect(report.savingsPct!).toBeLessThan(0);
     expect(report.verdict).toBe("inconclusive");
-    expect(harnessStatus(dir).evals).toBe("pending");
+    expect(loadHarness(dir)?.manifest.verification.evals).toBe("pending");
   }, 120_000);
 });
 
 describe("runEvals — cross-change interactions", () => {
   it("within-noise quality gap AND a material cost regression -> cost-hazard fail wins", async () => {
     dir = await makeHarnessFixture();
-    engine = createEngine();
+    engine = createTestEngine();
     engine.frontier.registerAdapter(
       makePartialFailFrontierAdapter({
         harnessFailCount: 1, // 1/20 = 5pp, within the 0.05 noise band -> quality treated as held
@@ -691,12 +975,12 @@ describe("runEvals — cross-change interactions", () => {
     // interaction between the significance gate and the cost-hazard gate.
     expect(report.qualityGapWithinNoise).toBe(true);
     expect(report.verdict).toBe("fail");
-    expect(harnessStatus(dir).evals).toBe("fail");
+    expect(loadHarness(dir)?.manifest.verification.evals).toBe("pending");
   }, 120_000);
 
   it("small-suite quality gap of 1-of-2 (50pp) still fails (noise band must not weaken small-N flagging)", async () => {
     dir = await makeHarnessFixture();
-    engine = createEngine();
+    engine = createTestEngine();
     engine.frontier.registerAdapter(
       makePartialFailFrontierAdapter({
         harnessFailCount: 1, // 1/2 = 50pp, well above the 0.05 noise band
@@ -712,14 +996,14 @@ describe("runEvals — cross-change interactions", () => {
     // suite's large fractional gap must never be absorbed by the noise band.
     expect(report.qualityGapWithinNoise).toBe(false);
     expect(report.verdict).toBe("fail");
-    expect(harnessStatus(dir).evals).toBe("fail");
+    expect(loadHarness(dir)?.manifest.verification.evals).toBe("pending");
   }, 120_000);
 });
 
 describe("runEvals — base identity (Task 4 Fix 1)", () => {
   it("engine.orchestrate works the harness side from harnessDir, never from the real project directory", async () => {
     dir = await makeHarnessFixture();
-    engine = createEngine();
+    engine = createTestEngine();
     const capturedEscalateProjectDirs: string[] = [];
     engine.frontier.registerAdapter({
       kind: "claude-code",
@@ -755,10 +1039,10 @@ describe("runEvals — base identity (Task 4 Fix 1)", () => {
     expect(capturedEscalateProjectDirs).toHaveLength(1);
     const escalateProjectDir = capturedEscalateProjectDirs[0]!;
     const realProjectDirResolved = realpathSync(path.resolve(dir));
-    // The escalation session's cwd is a worktree UNDER the harness eval
-    // scratch dir (this pipeline's own "of-eval-harness-" mkdtemp prefix —
-    // see run.ts), never under the real project directory.
-    expect(escalateProjectDir).toContain("of-eval-harness-");
+    // Author worktrees live in application storage, never inside either the
+    // selected project or its transient eval scratch repository.
+    expect(escalateProjectDir).toContain("openfusion-app-storage");
+    expect(escalateProjectDir).toContain(`${path.sep}worktrees${path.sep}`);
     expect(escalateProjectDir.startsWith(realProjectDirResolved)).toBe(false);
   });
 
@@ -806,7 +1090,7 @@ describe("runEvals — base identity (Task 4 Fix 1)", () => {
     // Task 4 Fix 1 exists to close: it must no longer happen.
     await writeFrontierOnlyHarness(dir);
 
-    engine = createEngine();
+    engine = createTestEngine();
     engine.frontier.registerAdapter(
       makeFakeEvalsFrontierAdapter({ baselineCorrect: true, harnessCorrect: true, meter: engine.models.meter }),
     );
@@ -824,9 +1108,9 @@ describe("runEvals — base identity (Task 4 Fix 1)", () => {
 });
 
 describe("runEvals — measurement failures are not quality evidence (Task 4 Fix 2)", () => {
-  it("harness-side infra errors on every task -> verdict 'inconclusive' (never 'fail'); manifest not flipped", async () => {
+  it("harness-side infra errors on every task -> verdict 'inconclusive' (never 'fail'); legacy manifest state stays untouched", async () => {
     dir = await makeHarnessFixture();
-    engine = createEngine();
+    engine = createTestEngine();
     engine.frontier.registerAdapter({
       kind: "claude-code",
       async createSession({ projectDir, resultLabel }): Promise<FrontierSession> {
@@ -841,13 +1125,21 @@ describe("runEvals — measurement failures are not quality evidence (Task 4 Fix
           projectDir,
           prompt(_text: string, _promptOpts?: { timeoutMs?: number }): FrontierPromptHandle {
             async function* gen(): AsyncGenerator<FrontierEvent> {
-              writeFileSync(path.join(projectDir, "source.js"), CORRECT_SOURCE);
-              yield { type: "tool_use", name: "Write", summary: "wrote source.js" };
-              yield { type: "text", text: "done" };
+              const isReview = resultLabel === "frontier-review";
+              if (isReview) {
+                yield {
+                  type: "text",
+                  text: "```json\n" + JSON.stringify({ decision: "approve", reasons: [], severity: "none" }) + "\n```",
+                };
+              } else {
+                writeFileSync(path.join(projectDir, "source.js"), CORRECT_SOURCE);
+                yield { type: "tool_use", name: "Write", summary: "wrote source.js" };
+                yield { type: "text", text: "done" };
+              }
               const event: FrontierEvent = {
                 type: "result",
-                resultText: "done",
-                costUsd: 0.5,
+                resultText: isReview ? "approve" : "done",
+                costUsd: isReview ? 0 : 0.5,
                 usage: { inputTokens: 10, outputTokens: 5, cacheReadTokens: 0 },
                 numTurns: 1,
                 durationMs: 1,
@@ -860,7 +1152,7 @@ describe("runEvals — measurement failures are not quality evidence (Task 4 Fix
                 usage: event.usage,
                 costUsd: event.costUsd,
                 at: Date.now(),
-                source: "frontier-review",
+                source: isReview ? "frontier-review" : "frontier-escalate",
                 pricingConfidence: "verified",
               });
               yield event;
@@ -888,14 +1180,14 @@ describe("runEvals — measurement failures are not quality evidence (Task 4 Fix
     expect(report.verdict).toBe("inconclusive");
     expect(report.note).toContain("2 of 2 task(s) hit a measurement failure");
     expect(report.note).toContain("2 error");
-    expect(harnessStatus(dir).evals).toBe("pending");
+    expect(loadHarness(dir)?.manifest.verification.evals).toBe("pending");
   });
 });
 
 describe("runEvals — measurement-failure gate applies symmetrically to pass and fail (review round 2)", () => {
   it("baseline errors inflate the harness's raw pass count over a genuine clean-subset quality gap -> verdict must be 'inconclusive', never 'pass'", async () => {
     dir = await makeHarnessFixture();
-    engine = createEngine();
+    engine = createTestEngine();
 
     // 5 tasks (t1..t5). Baseline ERRORS on t1/t2 (a measurement failure --
     // the frontier session itself throws, so baselineOutcome is "error" and
@@ -923,28 +1215,38 @@ describe("runEvals — measurement-failure gate applies symmetrically to pass an
       kind: "claude-code",
       async createSession({ projectDir, resultLabel }): Promise<FrontierSession> {
         const isBaseline = resultLabel === "eval-baseline";
+        const isReview = resultLabel === "frontier-review";
         let index: number;
         if (isBaseline) {
           index = baselineCallIndex++;
           if (baselineShouldError[index]) {
             throw new Error(`simulated baseline infra failure for task index ${index}`);
           }
+        } else if (isReview) {
+          index = Math.max(0, harnessCallIndex - 1);
         } else {
           index = harnessCallIndex++;
         }
         const correct = isBaseline ? true : harnessShouldBeCorrect[index]!;
-        const costUsd = isBaseline ? 0.5 : 0.05;
+        const costUsd = isReview ? 0 : isBaseline ? 0.5 : 0.05;
         return {
           id: randomUUID(),
           projectDir,
           prompt(_text: string, _promptOpts?: { timeoutMs?: number }): FrontierPromptHandle {
             async function* gen(): AsyncGenerator<FrontierEvent> {
-              writeFileSync(path.join(projectDir, "source.js"), correct ? CORRECT_SOURCE : WRONG_SOURCE);
-              yield { type: "tool_use", name: "Write", summary: "wrote source.js" };
-              yield { type: "text", text: "done" };
+              if (isReview) {
+                yield {
+                  type: "text",
+                  text: "```json\n" + JSON.stringify({ decision: "approve", reasons: [], severity: "none" }) + "\n```",
+                };
+              } else {
+                writeFileSync(path.join(projectDir, "source.js"), correct ? CORRECT_SOURCE : WRONG_SOURCE);
+                yield { type: "tool_use", name: "Write", summary: "wrote source.js" };
+                yield { type: "text", text: "done" };
+              }
               const event: FrontierEvent = {
                 type: "result",
-                resultText: "done",
+                resultText: isReview ? "approve" : "done",
                 costUsd,
                 usage: { inputTokens: 10, outputTokens: 5, cacheReadTokens: 0 },
                 numTurns: 1,
@@ -986,7 +1288,7 @@ describe("runEvals — measurement-failure gate applies symmetrically to pass an
     // exactly as it already does on the fail side.
     expect(report.verdict).toBe("inconclusive");
     expect(report.note).toContain("2 of 5 task(s) hit a measurement failure");
-    expect(harnessStatus(dir).evals).toBe("pending");
+    expect(loadHarness(dir)?.manifest.verification.evals).toBe("pending");
 
     // M7c Task 1: the structured clean-subset fields must match the EXACT
     // numbers the verdict above was computed from (see the "clean subset"
@@ -1010,7 +1312,7 @@ describe("runEvals — measurement-failure gate applies symmetrically to pass an
 describe("runEvals — 0-vs-0 baseline (Task 4 Fix 3)", () => {
   it("baseline solves 0 tasks -> verdict 'inconclusive' even with held quality and positive savings; never 'pass'", async () => {
     dir = await makeHarnessFixture();
-    engine = createEngine();
+    engine = createTestEngine();
     engine.frontier.registerAdapter(
       makeFakeEvalsFrontierAdapter({
         baselineCorrect: false,
@@ -1035,14 +1337,14 @@ describe("runEvals — 0-vs-0 baseline (Task 4 Fix 3)", () => {
     // against -- never a "pass", however good the savings arithmetic looks.
     expect(report.verdict).toBe("inconclusive");
     expect(report.note).toContain("baseline solved 0");
-    expect(harnessStatus(dir).evals).toBe("pending");
+    expect(loadHarness(dir)?.manifest.verification.evals).toBe("pending");
   }, 30_000);
 });
 
 describe("runEvals — unpriced costs", () => {
   it("unpriced baseline/harness costs -> savingsPct null -> inconclusive", async () => {
     dir = await makeHarnessFixture();
-    engine = createEngine();
+    engine = createTestEngine();
     engine.frontier.registerAdapter(
       makeFakeEvalsFrontierAdapter({
         baselineCorrect: true,
@@ -1070,14 +1372,14 @@ describe("runEvals — unpriced costs", () => {
     expect(report.qualityHeld).toBe(true);
     expect(report.verdict).toBe("inconclusive");
     expect(report.pricingConfidence).toBe("unpriced");
-    expect(harnessStatus(dir).evals).toBe("pending");
+    expect(loadHarness(dir)?.manifest.verification.evals).toBe("pending");
   });
 });
 
 describe("runEvals — genuine pass", () => {
-  it("enough tasks, priced, quality held, positive savings -> verdict 'pass' and the manifest flips", async () => {
+  it("enough tasks, priced, quality held, positive savings -> verdict 'pass' without certifying the project manifest", async () => {
     dir = await makeHarnessFixture();
-    engine = createEngine();
+    engine = createTestEngine();
     engine.frontier.registerAdapter(
       makeFakeEvalsFrontierAdapter({
         baselineCorrect: true,
@@ -1095,7 +1397,7 @@ describe("runEvals — genuine pass", () => {
     expect(report.qualityHeld).toBe(true);
     expect(report.savingsPct).toBeCloseTo(0.9, 5);
     expect(report.verdict).toBe("pass");
-    expect(harnessStatus(dir).evals).toBe("pass");
+    expect(loadHarness(dir)?.manifest.verification.evals).toBe("pending");
 
     // M7c Task 1: on a run with NO measurement failures, the clean-subset
     // structured fields equal the raw, all-task figures exactly.
@@ -1110,7 +1412,7 @@ describe("runEvals — genuine pass", () => {
 describe("runEvals — eval scratch dir placement + cleanup", () => {
   it("creates baseline+harness scratch dirs under os.tmpdir() (never under projectDir) and removes them after scoring", async () => {
     dir = await makeHarnessFixture();
-    engine = createEngine();
+    engine = createTestEngine();
     engine.frontier.registerAdapter(
       makeFakeEvalsFrontierAdapter({ baselineCorrect: true, harnessCorrect: true, meter: engine.models.meter }),
     );
@@ -1218,7 +1520,7 @@ function makeCancelEvalsFrontierAdapter(opts: CancelEvalsFrontierOptions): Front
 describe("runEvals — mid-batch cancel (M7b Task 2)", () => {
   it("cancels between/within tasks: in-flight scratch dirs are removed, remaining tasks never even start, and the registry empties", async () => {
     dir = await makeHarnessFixture();
-    engine = createEngine();
+    engine = createTestEngine();
     const blockReached = { count: 0 };
     engine.frontier.registerAdapter(
       makeCancelEvalsFrontierAdapter({ blockOnEscalateCallIndex: 2, blockReached }),
@@ -1298,7 +1600,7 @@ describe("runEvals — evals.progress notifications", () => {
   it("emits start, {baseline,harness,scored} per task (with taskId), then done", async () => {
     dir = await makeHarnessFixture();
     const notifications: Array<{ method: string; params: unknown }> = [];
-    engine = createEngine({ notify: (method, params) => notifications.push({ method, params }) });
+    engine = createTestEngine({ notify: (method, params) => notifications.push({ method, params }) });
     engine.frontier.registerAdapter(
       makeFakeEvalsFrontierAdapter({ baselineCorrect: true, harnessCorrect: true, meter: engine.models.meter }),
     );
@@ -1340,7 +1642,7 @@ describe("runEvals — evals.progress notifications", () => {
   it("carries the run's runId on every notification when one was supplied to runEvals", async () => {
     dir = await makeHarnessFixture();
     const notifications: Array<{ method: string; params: unknown }> = [];
-    engine = createEngine({ notify: (method, params) => notifications.push({ method, params }) });
+    engine = createTestEngine({ notify: (method, params) => notifications.push({ method, params }) });
     engine.frontier.registerAdapter(
       makeFakeEvalsFrontierAdapter({ baselineCorrect: true, harnessCorrect: true, meter: engine.models.meter }),
     );
@@ -1364,7 +1666,7 @@ describe("runEvals — evals.progress notifications", () => {
   it("omits runId entirely when none was supplied (backward compatible shape)", async () => {
     dir = await makeHarnessFixture();
     const notifications: Array<{ method: string; params: unknown }> = [];
-    engine = createEngine({ notify: (method, params) => notifications.push({ method, params }) });
+    engine = createTestEngine({ notify: (method, params) => notifications.push({ method, params }) });
     engine.frontier.registerAdapter(
       makeFakeEvalsFrontierAdapter({ baselineCorrect: true, harnessCorrect: true, meter: engine.models.meter }),
     );
@@ -1382,9 +1684,32 @@ describe("runEvals — evals.progress notifications", () => {
 });
 
 describe("runEvals — guard failures", () => {
+  it("fails closed before model work when eval-v1 containment is unavailable", async () => {
+    dir = await makeHarnessFixture();
+    engine = createTestEngine({
+      sandboxBackend: {
+        status: async () => ({
+          backend: "openfusion-sandbox" as const,
+          available: false,
+          provisional: false as const,
+          reason: "probe denied",
+        }),
+        run: async () => {
+          throw new Error("unavailable sandbox must never run");
+        },
+      },
+    });
+
+    await expect(runEvals(engine, { projectDir: dir, tasks: [synthEvalTask()] }))
+      .rejects.toMatchObject({
+        code: RpcErrorCodes.SERVER_ERROR,
+        data: { reasonCode: "eval-sandbox-unavailable", policyVersion: "eval-v1" },
+      });
+  });
+
   it("no harness -> throws SERVER_ERROR", async () => {
     dir = makeRepo();
-    engine = createEngine();
+    engine = createTestEngine();
 
     await expect(runEvals(engine, { projectDir: dir, tasks: [synthEvalTask()] })).rejects.toMatchObject({
       code: RpcErrorCodes.SERVER_ERROR,
@@ -1393,7 +1718,7 @@ describe("runEvals — guard failures", () => {
 
   it("non-git projectDir -> throws SERVER_ERROR", async () => {
     dir = mkdtempSync(path.join(os.tmpdir(), "of-evals-nogit-"));
-    engine = createEngine();
+    engine = createTestEngine();
 
     await expect(runEvals(engine, { projectDir: dir, tasks: [synthEvalTask()] })).rejects.toMatchObject({
       code: RpcErrorCodes.SERVER_ERROR,
@@ -1402,7 +1727,7 @@ describe("runEvals — guard failures", () => {
 
   it("an empty tasks array -> throws SERVER_ERROR", async () => {
     dir = await makeHarnessFixture();
-    engine = createEngine();
+    engine = createTestEngine();
 
     await expect(runEvals(engine, { projectDir: dir, tasks: [] })).rejects.toMatchObject({
       code: RpcErrorCodes.SERVER_ERROR,
@@ -1457,7 +1782,7 @@ describe("engine.evals.run (RPC wire layer) — golden task descriptors", () => 
     // state the real project's HEAD happens to be at.
     await writeFrontierOnlyHarness(dir);
 
-    engine = createEngine();
+    engine = createTestEngine();
     engine.frontier.registerAdapter(
       makeFakeEvalsFrontierAdapter({ baselineCorrect: true, harnessCorrect: true, meter: engine.models.meter }),
     );
@@ -1475,12 +1800,12 @@ describe("engine.evals.run (RPC wire layer) — golden task descriptors", () => 
     expect(report.perTask[0]!.harnessOutcome).toBe("escalated");
     // 1 task never clears the sample-size gate, regardless of quality.
     expect(report.verdict).toBe("inconclusive");
-    expect(harnessStatus(dir).evals).toBe("pending");
+    expect(loadHarness(dir)?.manifest.verification.evals).toBe("pending");
   });
 
   it("rejects an empty tasks array at the schema level", async () => {
     dir = await makeHarnessFixture();
-    engine = createEngine();
+    engine = createTestEngine();
 
     const res = await call(engine, "engine.evals.run", { projectDir: dir, tasks: [] });
     expect(res.result).toBeUndefined();
@@ -1536,7 +1861,7 @@ describe("engine.evals.run (RPC wire layer) — cancellation via engine.cancel (
 
     await writeFrontierOnlyHarness(dir);
 
-    engine = createEngine();
+    engine = createTestEngine();
     const blockReached = { count: 0 };
     // Only one task -> its own (only) harness escalation call is call #1.
     engine.frontier.registerAdapter(makeCancelEvalsFrontierAdapter({ blockOnEscalateCallIndex: 1, blockReached }));

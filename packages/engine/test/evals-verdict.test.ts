@@ -15,6 +15,8 @@ function row(
     harnessUsd?: number | null;
     baselineOutcome?: PerTaskResult["baselineOutcome"];
     harnessOutcome?: PerTaskResult["harnessOutcome"];
+    baselinePolicyViolation?: boolean;
+    harnessPolicyViolation?: boolean;
   },
 ): PerTaskResult {
   return {
@@ -25,6 +27,8 @@ function row(
     harnessUsd: opts.harnessUsd === undefined ? 0.2 : opts.harnessUsd,
     baselineOutcome: opts.baselineOutcome ?? "completed",
     harnessOutcome: opts.harnessOutcome ?? "worker-approved",
+    ...(opts.baselinePolicyViolation === true ? { baselinePolicyViolation: true } : {}),
+    ...(opts.harnessPolicyViolation === true ? { harnessPolicyViolation: true } : {}),
   };
 }
 
@@ -139,5 +143,24 @@ describe("computeEvalsVerdict", () => {
     });
     expect(r.measurementFailureCount).toBe(2);
     expect(r.verdict).toBe("inconclusive");
+  });
+
+  it("separates a policy violation from quality and applies the safety veto", () => {
+    const perTask = many(MIN_TASK_COUNT_FOR_SAVINGS_PASS, (i) => row(`t${i}`, {
+      baselinePassed: true,
+      harnessPassed: i !== 0,
+      harnessPolicyViolation: i === 0,
+    }));
+    const result = computeEvalsVerdict({
+      perTask,
+      unpricedCalls: 0,
+      pricingConfidence: "verified",
+      escalations: 0,
+    });
+    expect(result.policyViolationCount).toBe(1);
+    expect(result.measurementFailureCount).toBe(0);
+    expect(result.cleanTaskCount).toBe(MIN_TASK_COUNT_FOR_SAVINGS_PASS - 1);
+    expect(result.verdict).toBe("fail");
+    expect(result.note).toContain("safety veto");
   });
 });

@@ -178,6 +178,19 @@ describe("typed method wrappers", () => {
     });
   });
 
+  it("frontierModels() discovers account-visible models through the engine", async () => {
+    invokeMock.mockResolvedValueOnce({ models: [], unavailable: [] });
+    const client = new EngineClient();
+
+    await client.frontierModels();
+
+    expect(invokeMock).toHaveBeenCalledWith("engine_call", {
+      method: "engine.frontier.models",
+      params: {},
+      timeoutMs: undefined,
+    });
+  });
+
   it("wikiBuild(projectDir) calls engine_call with engine.wiki.build and the project dir", async () => {
     invokeMock.mockResolvedValueOnce({ filesIndexed: 3, filesSkipped: 0 });
     const client = new EngineClient();
@@ -192,13 +205,26 @@ describe("typed method wrappers", () => {
   });
 
   it("harnessStatus(projectDir) calls engine_call with engine.harness.status and the project dir", async () => {
-    invokeMock.mockResolvedValueOnce({ present: false, structural: null, evals: null, headSha: null });
+    invokeMock.mockResolvedValueOnce({ present: false, structural: null, headSha: null });
     const client = new EngineClient();
 
     await client.harnessStatus("/home/me/project");
 
     expect(invokeMock).toHaveBeenCalledWith("engine_call", {
       method: "engine.harness.status",
+      params: { projectDir: "/home/me/project" },
+      timeoutMs: undefined,
+    });
+  });
+
+  it("harnessHealth(projectDir) calls the metadata-only health endpoint", async () => {
+    invokeMock.mockResolvedValueOnce({ overall: "insufficient-evidence" });
+    const client = new EngineClient();
+
+    await client.harnessHealth("/home/me/project");
+
+    expect(invokeMock).toHaveBeenCalledWith("engine_call", {
+      method: "engine.harness.health",
       params: { projectDir: "/home/me/project" },
       timeoutMs: undefined,
     });
@@ -232,11 +258,11 @@ describe("typed method wrappers", () => {
 
     resolveGenerate({
       files: [],
-      reportCard: { structural: "pass", evals: "pending" },
+      reportCard: { structural: "pass", operational: "insufficient-evidence" },
       estimatedCostUsd: null,
       pages: 4,
       agents: 2,
-      note: "harness is UNVERIFIED until evals run (M6)",
+      note: "harness structure is verified; operational health accumulates from metadata-only production evidence",
     });
     await promise;
 
@@ -264,6 +290,37 @@ describe("typed method wrappers", () => {
       timeoutMs: undefined,
     });
   });
+
+  it("modelsCheckConnection calls engine.models.check with the selected model", async () => {
+    invokeMock.mockResolvedValueOnce({ connected: true });
+    const client = new EngineClient();
+    const config = {
+      id: "zai",
+      kind: "zai" as const,
+      apiKey: "sk-test",
+      baseURL: "https://api.z.ai/api/paas/v4",
+      model: "glm-5.2",
+    };
+
+    await expect(client.modelsCheckConnection(config, { timeoutMs: 20_000 })).resolves.toEqual({ connected: true });
+    expect(invokeMock).toHaveBeenCalledWith("engine_call", {
+      method: "engine.models.check",
+      params: config,
+      timeoutMs: 20_000,
+    });
+  });
+
+  it("modelsUnconfigure calls engine.models.unconfigure with the provider id", async () => {
+    invokeMock.mockResolvedValueOnce({ unconfigured: true });
+    const client = new EngineClient();
+
+    await expect(client.modelsUnconfigure("zai")).resolves.toEqual({ unconfigured: true });
+    expect(invokeMock).toHaveBeenCalledWith("engine_call", {
+      method: "engine.models.unconfigure",
+      params: { id: "zai" },
+      timeoutMs: undefined,
+    });
+  });
 });
 
 // A minimal but shape-accurate OrchestrateResult fixture (mirrors
@@ -275,11 +332,27 @@ function orchestrateResultFixture(): OrchestrateResult {
     agent: "generalist",
     taskClass: "default",
     resolution: { providerId: "deepseek", model: "deepseek-v4-flash" },
+    candidateRef: {
+      schemaVersion: 1,
+      candidateId: "candidate-1",
+      diffDigest: `sha256:${"a".repeat(64)}`,
+      touchedPaths: ["x"],
+      lifecycle: "approved",
+      createdAt: "2026-07-10T00:00:00.000Z",
+      expiresAt: "2026-07-17T00:00:00.000Z",
+    },
     attempts: [{ n: 1, kind: "worker", summary: "did the thing", verdict: { decision: "approve", reasons: [], severity: "none" } }],
     diff: "diff --git a/x b/x\n",
     diffStat: "1 file changed",
     worktree: { path: "/tmp/wt", branch: "of-worker-1" },
     cost: { workerUsd: 0.01, reviewUsd: 0.02, frontierUsd: 0.02, escalateUsd: null, totalUsd: 0.03, note: "estimate-class" },
+    costEstimate: {
+      knownUsd: 0.03,
+      completeness: "complete",
+      unpricedCalls: 0,
+      pricingVersion: "pricing-v1",
+      confidence: "verified",
+    },
   };
 }
 
@@ -302,6 +375,7 @@ function evalsReportCardFixture(): EvalsReportCard {
     cleanHarnessPassed: 4,
     cleanSavingsPct: 0.5,
     measurementFailureCount: 0,
+    policyViolationCount: 0,
   };
 }
 

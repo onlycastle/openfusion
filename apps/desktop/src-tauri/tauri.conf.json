@@ -44,7 +44,7 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
-    "externalBin": ["binaries/openfusion-engine"],
+    "externalBin": ["binaries/openfusion-engine", "binaries/openfusion-sandbox"],
     "resources": {
       "binaries/openfusion-engine.assets": "assets"
     },

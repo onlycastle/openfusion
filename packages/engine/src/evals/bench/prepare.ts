@@ -7,6 +7,7 @@ import { existsSync, mkdirSync, readFileSync, cpSync, writeFileSync } from "node
 import path from "node:path";
 import { promisify } from "node:util";
 import type { Engine } from "../../engine.js";
+import type { FrontierSelection } from "../../engines/selection.js";
 import { generateHarness } from "../../harness/generate.js";
 import { CARD_SLUG } from "../../harness/schema.js";
 import { loadHarness, setCardState, writeHarness } from "../../harness/store.js";
@@ -37,6 +38,7 @@ export interface PrepareOptions {
   promptYes?: (question: string) => Promise<boolean>;
   /** When true, only clone + record; do not call generateHarness. */
   clonesOnly?: boolean;
+  planningFrontier?: FrontierSelection;
 }
 
 export interface PrepareResult {
@@ -169,7 +171,7 @@ export async function prepareBench(
     try {
       await materializeBaseCommit(dest, baseCommit, scratch);
       requireGitRepo(scratch);
-      await generateHarness(engine, scratch);
+      await generateHarness(engine, scratch, opts.planningFrontier);
       const digest = cardDigest(scratch);
       log(`draft card digest for ${repo}:\n${digest ?? "(no card page)"}\n`);
       const ok = await promptYes(`Approve harness card for ${repo}? [y/N] `);

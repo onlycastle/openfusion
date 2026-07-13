@@ -6,7 +6,7 @@ import { MockLanguageModelV4 } from "ai/test";
 import { describe, expect, it } from "vitest";
 import { RpcErrorCodes } from "@openfusion/shared";
 import { createEngine, type Engine } from "../src/engine.js";
-import { isRetryableModelError } from "../src/models/methods.js";
+import { checkLanguageModelConnection, isRetryableModelError } from "../src/models/methods.js";
 import { estimateCostUsd, lookupPricing } from "../src/models/pricing.js";
 
 // Fixture literal only — must never appear outside test files (see task
@@ -43,6 +43,29 @@ function hungFetch(): typeof fetch {
       signal.addEventListener("abort", () => reject(signal.reason), { once: true });
     })) as typeof fetch;
 }
+
+describe("provider connection check", () => {
+  it("makes one minimal model request without requiring live credentials", async () => {
+    let calls = 0;
+    const model = new MockLanguageModelV4({
+      doGenerate: async () => {
+        calls += 1;
+        return {
+          content: [{ type: "text", text: "OK" }],
+          finishReason: { unified: "stop", raw: "stop" },
+          usage: {
+            inputTokens: { total: 2, noCache: 2, cacheRead: undefined, cacheWrite: undefined },
+            outputTokens: { total: 1, text: 1, reasoning: undefined },
+          },
+          warnings: [],
+        };
+      },
+    });
+
+    await expect(checkLanguageModelConnection(model, 1_000)).resolves.toBeUndefined();
+    expect(calls).toBe(1);
+  });
+});
 
 describe("engine.models.complete", () => {
   it("happy path: records usage + cost from a priced model", async () => {

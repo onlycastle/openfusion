@@ -19,8 +19,20 @@ export interface FileUpdate {
   path: string;
   hash: string;
   lang: string;
+  searchText?: string;
   symbols: SymbolEntry[];
   refs: SymbolEntry[];
+}
+
+export interface FileSearchHit {
+  file: string;
+  score: number;
+}
+
+export interface IndexedFileRecord {
+  path: string;
+  hash: string;
+  lang: string;
 }
 
 const SCHEMA = `
@@ -40,15 +52,31 @@ CREATE INDEX IF NOT EXISTS idx_symbols_name ON symbols(name);
 CREATE INDEX IF NOT EXISTS idx_symbols_file ON symbols(file);
 CREATE INDEX IF NOT EXISTS idx_refs_name ON refs(name);
 CREATE INDEX IF NOT EXISTS idx_refs_file ON refs(file);
+CREATE VIRTUAL TABLE IF NOT EXISTS file_search USING fts5(path, content);
 `;
 
-const SCHEMA_VERSION = 1;
+const SCHEMA_VERSION = 2;
+const SQLITE_HEADER = Buffer.from("SQLite format 3\0", "ascii");
+const SQLITE_WRITE_VERSION_OFFSET = 18;
+const SQLITE_READ_VERSION_OFFSET = 19;
+const SQLITE_ROLLBACK_JOURNAL_VERSION = 1;
+
+function ftsQuery(raw: string): string | null {
+  const tokens = raw.normalize("NFKC").match(/[\p{L}\p{N}_]+/gu) ?? [];
+  const unique = [...new Set(tokens.map((token) => token.toLowerCase()))].slice(0, 24);
+  if (unique.length === 0) return null;
+  return unique.map((token) => `"${token.replaceAll('"', '""')}"*`).join(" OR ");
+}
 
 export class WikiStore {
   #db: Database.Database;
+  // better-sqlite3 opens serialized databases over the caller-owned Buffer;
+  // retain it for the lifetime of an in-memory snapshot.
+  readonly #serializedOwner?: Buffer;
 
-  constructor(db: Database.Database) {
+  constructor(db: Database.Database, serializedOwner?: Buffer) {
     this.#db = db;
+    this.#serializedOwner = serializedOwner;
   }
 
   #applyFileTx(
@@ -57,6 +85,7 @@ export class WikiStore {
     lang: string,
     symbols: SymbolEntry[],
     refs: SymbolEntry[],
+    searchText?: string,
   ): void {
     const insertFile = this.#db.prepare(
       `INSERT INTO files (path, hash, lang, indexed_at) VALUES (?, ?, ?, ?)
@@ -65,6 +94,7 @@ export class WikiStore {
     );
     const delSymbols = this.#db.prepare("DELETE FROM symbols WHERE file = ?");
     const delRefs = this.#db.prepare("DELETE FROM refs WHERE file = ?");
+    const delSearch = this.#db.prepare("DELETE FROM file_search WHERE path = ?");
     const insSymbol = this.#db.prepare(
       "INSERT INTO symbols (file, name, kind, row, col) VALUES (?, ?, ?, ?, ?)",
     );
@@ -74,8 +104,15 @@ export class WikiStore {
     insertFile.run(filePath, hash, lang, Date.now());
     delSymbols.run(filePath);
     delRefs.run(filePath);
+    delSearch.run(filePath);
     for (const s of symbols) insSymbol.run(filePath, s.name, s.kind, s.row, s.col);
     for (const r of refs) insRef.run(filePath, r.name, r.kind, r.row, r.col);
+    this.#db
+      .prepare("INSERT INTO file_search (path, content) VALUES (?, ?)")
+      .run(
+        filePath,
+        searchText ?? [...symbols, ...refs].map((entry) => entry.name).join(" "),
+      );
   }
 
   upsertFile(
@@ -84,9 +121,10 @@ export class WikiStore {
     lang: string,
     symbols: SymbolEntry[],
     refs: SymbolEntry[],
+    searchText?: string,
   ): void {
     this.#db.transaction(() => {
-      this.#applyFileTx(filePath, hash, lang, symbols, refs);
+      this.#applyFileTx(filePath, hash, lang, symbols, refs, searchText);
     })();
   }
 
@@ -94,6 +132,7 @@ export class WikiStore {
     this.#db.prepare("DELETE FROM symbols WHERE file = ?").run(filePath);
     this.#db.prepare("DELETE FROM refs WHERE file = ?").run(filePath);
     this.#db.prepare("DELETE FROM files WHERE path = ?").run(filePath);
+    this.#db.prepare("DELETE FROM file_search WHERE path = ?").run(filePath);
   }
 
   removeFile(filePath: string): void {
@@ -105,15 +144,21 @@ export class WikiStore {
   applyBuild(
     updates: FileUpdate[],
     removals: string[],
-    meta: { headSha: string },
+    meta: { headSha: string; sourceFingerprint?: string; coverageJson?: string },
   ): void {
     this.#db.transaction(() => {
       for (const u of updates) {
-        this.#applyFileTx(u.path, u.hash, u.lang, u.symbols, u.refs);
+        this.#applyFileTx(u.path, u.hash, u.lang, u.symbols, u.refs, u.searchText);
       }
       for (const r of removals) this.#removeFileTx(r);
       this.#setMetaTx("head_sha", meta.headSha);
       this.#setMetaTx("indexed_at", String(Date.now()));
+      if (meta.sourceFingerprint !== undefined) {
+        this.#setMetaTx("source_fingerprint", meta.sourceFingerprint);
+      }
+      if (meta.coverageJson !== undefined) {
+        this.#setMetaTx("coverage", meta.coverageJson);
+      }
     })();
   }
 
@@ -131,6 +176,18 @@ export class WikiStore {
     return rows.map((r) => r.path);
   }
 
+  listFileRecords(): IndexedFileRecord[] {
+    return this.#db
+      .prepare("SELECT path, hash, lang FROM files ORDER BY path")
+      .all() as IndexedFileRecord[];
+  }
+
+  integrityCheck(): { ok: boolean; messages: string[] } {
+    const rows = this.#db.pragma("quick_check") as Array<{ quick_check: string }>;
+    const messages = rows.map((row) => row.quick_check);
+    return { ok: messages.length === 1 && messages[0] === "ok", messages };
+  }
+
   symbolsByName(name: string): SymbolHit[] {
     return this.#db
       .prepare(
@@ -145,6 +202,21 @@ export class WikiStore {
         "SELECT file, name, kind, row, col FROM refs WHERE name = ? ORDER BY file, row",
       )
       .all(name) as SymbolHit[];
+  }
+
+  searchFiles(query: string, limit = 64): FileSearchHit[] {
+    const match = ftsQuery(query);
+    if (match === null) return [];
+    const boundedLimit = Math.max(1, Math.min(256, Math.trunc(limit)));
+    const rows = this.#db
+      .prepare(
+        `SELECT path FROM file_search
+         WHERE file_search MATCH ?
+         ORDER BY bm25(file_search), path
+         LIMIT ?`,
+      )
+      .all(match, boundedLimit) as Array<{ path: string }>;
+    return rows.map((row, index) => ({ file: row.path, score: 1 / (index + 1) }));
   }
 
   allSymbols(): SymbolHit[] {
@@ -191,6 +263,38 @@ export class WikiStore {
       .prepare("SELECT value FROM meta WHERE key = ?")
       .get(key) as { value: string } | undefined;
     return row?.value ?? null;
+  }
+
+  /** Read the load-bearing source identity from one SQLite statement snapshot. */
+  getSourceIdentity(): { headSha: string | null; sourceFingerprint: string | null } {
+    const rows = this.#db
+      .prepare("SELECT key, value FROM meta WHERE key IN ('head_sha', 'source_fingerprint')")
+      .all() as Array<{ key: string; value: string }>;
+    const values = new Map(rows.map((row) => [row.key, row.value]));
+    return {
+      headSha: values.get("head_sha") ?? null,
+      sourceFingerprint: values.get("source_fingerprint") ?? null,
+    };
+  }
+
+  /** Immutable in-memory copy used by one task snapshot while the live index may rebuild. */
+  snapshot(): WikiStore {
+    const serialized = Buffer.from(this.#db.serialize());
+    if (!serialized.subarray(0, SQLITE_HEADER.length).equals(SQLITE_HEADER)) {
+      throw new Error("cannot snapshot wiki: SQLite serialization has an invalid header");
+    }
+
+    // sqlite3_serialize() preserves the source database's WAL read/write
+    // version bytes. An anonymous deserialized database cannot open a WAL or
+    // SHM file, so SQLite reports SQLITE_CANTOPEN on its first statement.
+    // Normalize the standard SQLite header to rollback-journal format before
+    // opening the isolated in-memory image. The serialized bytes already
+    // contain the committed WAL pages; only the journal mechanism changes.
+    serialized[SQLITE_WRITE_VERSION_OFFSET] = SQLITE_ROLLBACK_JOURNAL_VERSION;
+    serialized[SQLITE_READ_VERSION_OFFSET] = SQLITE_ROLLBACK_JOURNAL_VERSION;
+    const db = new Database(serialized, nativeBindingOption());
+    db.pragma("query_only = ON");
+    return new WikiStore(db, serialized);
   }
 
   close(): void {

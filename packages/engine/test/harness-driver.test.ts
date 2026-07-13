@@ -1,7 +1,12 @@
 import { describe, expect, it } from "vitest";
 import { z } from "zod";
 import { HarnessGenError, promptForJson, type DriverNotice } from "../src/harness/driver.js";
-import type { FrontierEvent, FrontierPromptHandle, FrontierSession } from "../src/engines/types.js";
+import type {
+  FrontierEvent,
+  FrontierPromptHandle,
+  FrontierPromptOptions,
+  FrontierSession,
+} from "../src/engines/types.js";
 
 // A minimal FrontierResultEvent builder — every test that wants to end a
 // turn "cleanly" (as any real adapter always does) appends one of these to
@@ -33,14 +38,17 @@ function textEvent(text: string): FrontierEvent {
 function makeScriptedSession(scripts: FrontierEvent[][]): {
   session: FrontierSession;
   prompts: string[];
+  promptOptions: Array<FrontierPromptOptions | undefined>;
 } {
   const prompts: string[] = [];
+  const promptOptions: Array<FrontierPromptOptions | undefined> = [];
   let callIndex = 0;
   const session: FrontierSession = {
     id: "fake-session",
     projectDir: "/fake/project",
-    prompt(text: string): FrontierPromptHandle {
+    prompt(text: string, opts?: FrontierPromptOptions): FrontierPromptHandle {
       prompts.push(text);
+      promptOptions.push(opts);
       const events = scripts[Math.min(callIndex, scripts.length - 1)] ?? [];
       callIndex += 1;
       async function* gen(): AsyncGenerator<FrontierEvent> {
@@ -50,12 +58,23 @@ function makeScriptedSession(scripts: FrontierEvent[][]): {
     },
     async close(): Promise<void> {},
   };
-  return { session, prompts };
+  return { session, prompts, promptOptions };
 }
 
 const PointSchema = z.object({ a: z.number() });
 
 describe("promptForJson — happy path extraction", () => {
+  it("prefers schema-valid structured output over malformed streamed text", async () => {
+    const { session } = makeScriptedSession([
+      [textEvent("not valid JSON"), resultEvent({ structuredOutput: { a: 8 } })],
+    ]);
+
+    const result = await promptForJson(session, "give me a point", PointSchema);
+
+    expect(result.value).toEqual({ a: 8 });
+    expect(result.attempts).toBe(1);
+  });
+
   it("extracts a JSON code block on the first attempt", async () => {
     const { session, prompts } = makeScriptedSession([
       [textEvent('```json\n{"a": 1}\n```'), resultEvent({ costUsd: 0.01 })],
@@ -111,6 +130,49 @@ describe("promptForJson — happy path extraction", () => {
 });
 
 describe("promptForJson — validation-feedback retry", () => {
+  it("reserves the owning budget before each prompt attempt", async () => {
+    const { session } = makeScriptedSession([
+      [textEvent('{"a":"wrong"}'), resultEvent()],
+      [textEvent('{"a":2}'), resultEvent()],
+    ]);
+    let reservations = 0;
+
+    const result = await promptForJson(session, "give point", PointSchema, {
+      beforePrompt: () => { reservations += 1; },
+    });
+
+    expect(result.attempts).toBe(2);
+    expect(reservations).toBe(2);
+  });
+
+  it("reports pricing completeness per attempt so a priced retry cannot hide an unpriced call", async () => {
+    const { session } = makeScriptedSession([
+      [textEvent('{"a":"wrong"}'), resultEvent({ costUsd: null })],
+      [textEvent('{"a":2}'), resultEvent({ costUsd: 0.25 })],
+    ]);
+    const attemptCosts: Array<number | null> = [];
+
+    const result = await promptForJson(session, "give point", PointSchema, {
+      onAttemptCost: (cost) => attemptCosts.push(cost),
+    });
+
+    expect(attemptCosts).toEqual([null, 0.25]);
+    expect(result).toMatchObject({ pricedCalls: 1, unpricedCalls: 1 });
+  });
+
+  it("retries schema-invalid structured output instead of falling back to valid streamed text", async () => {
+    const { session, prompts } = makeScriptedSession([
+      [textEvent('{"a": 1}'), resultEvent({ structuredOutput: { a: "wrong" } })],
+      [textEvent("ignored"), resultEvent({ structuredOutput: { a: 5 } })],
+    ]);
+
+    const result = await promptForJson(session, "give me a point", PointSchema);
+
+    expect(result.value).toEqual({ a: 5 });
+    expect(result.attempts).toBe(2);
+    expect(prompts[1]).toContain("Invalid input: expected number, received string");
+  });
+
   it("retries with an issue-describing prompt and succeeds on the corrected attempt", async () => {
     const { session, prompts } = makeScriptedSession([
       [textEvent('```json\n{"a": "not-a-number"}\n```'), resultEvent()],
@@ -248,6 +310,9 @@ describe("promptForJson — notify callback", () => {
     ).rejects.toBeInstanceOf(HarnessGenError);
 
     expect(notices.filter((n) => n.kind === "validation-retry")).toHaveLength(0);
+    const failures = notices.filter((n) => n.kind === "validation-failure");
+    expect(failures).toHaveLength(1);
+    expect(failures[0]!.detail).toContain("response did not contain valid JSON");
     expect(notices.filter((n) => n.kind === "attempt")).toHaveLength(1);
   });
 });
@@ -340,12 +405,12 @@ describe("promptForJson — timeoutMs threading (M5b Task 4)", () => {
     // must receive the SAME per-attempt timeoutMs — see PromptForJsonOpts's
     // doc comment for why this is per-attempt rather than a shared budget.
     expect(capturedOpts).toHaveLength(2);
-    expect(capturedOpts[0]).toEqual({ timeoutMs: 5000 });
-    expect(capturedOpts[1]).toEqual({ timeoutMs: 5000 });
+    expect(capturedOpts[0]).toMatchObject({ timeoutMs: 5000, outputSchema: { type: "object" } });
+    expect(capturedOpts[1]).toMatchObject({ timeoutMs: 5000, outputSchema: { type: "object" } });
   });
 
-  it("omitting timeoutMs forwards { timeoutMs: undefined } — matches pre-Task-4 callers", async () => {
-    const capturedOpts: Array<{ timeoutMs?: number } | undefined> = [];
+  it("passes JSON schema even when timeoutMs is omitted", async () => {
+    const capturedOpts: Array<FrontierPromptOptions | undefined> = [];
     const session: FrontierSession = {
       id: "fake-session",
       projectDir: "/fake/project",
@@ -362,7 +427,9 @@ describe("promptForJson — timeoutMs threading (M5b Task 4)", () => {
 
     await promptForJson(session, "p", PointSchema);
 
-    expect(capturedOpts).toEqual([{ timeoutMs: undefined }]);
+    expect(capturedOpts).toHaveLength(1);
+    expect(capturedOpts[0]).toMatchObject({ timeoutMs: undefined, outputSchema: { type: "object" } });
+    expect(capturedOpts[0]?.outputSchema?.properties).toMatchObject({ a: { type: "number" } });
   });
 });
 

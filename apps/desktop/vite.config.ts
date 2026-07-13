@@ -6,6 +6,7 @@
 // tsconfig.json's `include`), so it's exercised at runtime only.
 import { defineConfig } from "vitest/config";
 import react from "@vitejs/plugin-react";
+import { fileURLToPath, URL } from "node:url";
 
 // @ts-expect-error process is a nodejs global
 const host = process.env.TAURI_DEV_HOST;
@@ -13,6 +14,16 @@ const host = process.env.TAURI_DEV_HOST;
 // https://vite.dev/config/
 export default defineConfig(async () => ({
   plugins: [react()],
+  resolve:
+    // @ts-expect-error process is a nodejs global
+    process.env.OPENFUSION_UI_MOCK === "1"
+      ? {
+          alias: {
+            "@tauri-apps/api/core": fileURLToPath(new URL("./src/dev/tauriCoreMock.ts", import.meta.url)),
+            "@tauri-apps/plugin-dialog": fileURLToPath(new URL("./src/dev/tauriDialogMock.ts", import.meta.url)),
+          },
+        }
+      : undefined,
   // Vite options tailored for Tauri development and only applied in `tauri dev` or `tauri build`
   //
   // 1. prevent Vite from obscuring rust errors

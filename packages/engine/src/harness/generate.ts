@@ -20,6 +20,7 @@ import path from "node:path";
 import { z } from "zod";
 import { RpcErrorCodes } from "@openfusion/shared";
 import type { Engine } from "../engine.js";
+import { resolveFrontierSelection, type FrontierSelection } from "../engines/selection.js";
 import { RpcMethodError } from "../rpc/errors.js";
 import { requireGitRepo } from "../rpc/guards.js";
 import { wikiDbPath } from "../wiki/store.js";
@@ -38,6 +39,7 @@ import {
   type StrippedItem,
 } from "./card.js";
 import { HarnessGenError, promptForJson } from "./driver.js";
+import type { RunSupervisor } from "../runtime/supervisor.js";
 import { mineCommands, type MinedCommand } from "./mine.js";
 import {
   AgentDefSchema,
@@ -51,15 +53,9 @@ import {
 import { harnessStatus, writeHarness } from "./store.js";
 import { upgradeRouting } from "./upgrade.js";
 
-// The only frontier engine kind generation drives today — mirrors
-// engines/methods.ts's own `params.engine ?? "claude-code"` default. Not
-// exposed as an engine.harness.generate RPC param (out of scope per the
-// task brief's interface: `{ projectDir }` only).
-const FRONTIER_KIND = "claude-code";
-
 export interface GenerateHarnessResult {
   files: string[];
-  reportCard: { structural: "pass"; evals: "pending" };
+  reportCard: { structural: "pass"; operational: "insufficient-evidence" };
   estimatedCostUsd: number | null;
   pages: number;
   agents: number;
@@ -72,7 +68,8 @@ export interface GenerateHarnessResult {
 }
 
 const NOTE =
-  "harness is UNVERIFIED until evals run (M6)";
+  "harness structure is verified; operational health accumulates from metadata-only production evidence";
+const HARNESS_PROMPT_TIMEOUT_MS = 600_000;
 
 const OverviewSchema = z.object({
   summary: z.string().min(1),
@@ -350,12 +347,18 @@ function addCost(total: number | null, next: number | null): number | null {
 // The pipeline itself. Stateless and re-entrant per call — HarnessService
 // (./methods.ts) is what coalesces concurrent calls for the same project;
 // this function always runs a full generation from scratch.
-export async function generateHarness(engine: Engine, projectDir: string): Promise<GenerateHarnessResult> {
+export async function generateHarness(
+  engine: Engine,
+  projectDir: string,
+  frontierSelection?: FrontierSelection,
+  supervisor?: RunSupervisor,
+): Promise<GenerateHarnessResult> {
   const headSha = requireGitRepo(projectDir);
+  const frontier = resolveFrontierSelection(frontierSelection);
 
-  const adapter = engine.frontier.getAdapter(FRONTIER_KIND);
+  const adapter = engine.frontier.getAdapter(frontier.engine);
   if (adapter === undefined) {
-    throw new RpcMethodError(RpcErrorCodes.SERVER_ERROR, `unknown frontier engine: ${FRONTIER_KIND}`);
+    throw new RpcMethodError(RpcErrorCodes.SERVER_ERROR, `unknown frontier engine: ${frontier.engine}`);
   }
 
   const notify = (stage: string, detail: string): void => {
@@ -371,10 +374,12 @@ export async function generateHarness(engine: Engine, projectDir: string): Promi
 
   // READ-ONLY: no toolPolicy — generation sessions only ever propose JSON;
   // this pipeline is the sole writer (see writeHarness below).
-  const session = await adapter.createSession({
+  const session = await engine.providerGateway.createFrontierSession(adapter, {
     projectDir,
     wikiMcpUrl: mcpServer.url,
+    wikiMcpBearerToken: mcpServer.bearerToken,
     log: engine.log,
+    model: frontier.model,
     // Final review Fix 2: an hour-long, ONE-TIME harness-generation run is
     // not per-task review overhead — tag it distinctly so
     // engines/methods.ts's onResult hook meters it under source
@@ -398,6 +403,9 @@ export async function generateHarness(engine: Engine, projectDir: string): Promi
     notify("overview", "exploring repository structure via the wiki");
     const overviewResult = await promptForJson(session, buildOverviewPrompt(), OverviewSchema, {
       stage: "overview",
+      timeoutMs: HARNESS_PROMPT_TIMEOUT_MS,
+      beforePrompt: () => supervisor?.reserveModelCall(),
+      onAttemptCost: (cost) => supervisor?.recordCost(cost, cost === null ? "unpriced" : "verified"),
       notify: (n) => notify("overview", `${n.kind}: ${n.detail}`),
     });
     costUsd = addCost(costUsd, overviewResult.costUsd);
@@ -409,6 +417,9 @@ export async function generateHarness(engine: Engine, projectDir: string): Promi
       notify(stage, `generating the "${slug}" wiki page`);
       const pageResult = await promptForJson(session, buildPagePrompt(slug, overview), PageContentSchema, {
         stage,
+        timeoutMs: HARNESS_PROMPT_TIMEOUT_MS,
+        beforePrompt: () => supervisor?.reserveModelCall(),
+        onAttemptCost: (cost) => supervisor?.recordCost(cost, cost === null ? "unpriced" : "verified"),
         notify: (n) => notify(stage, `${n.kind}: ${n.detail}`),
       });
       costUsd = addCost(costUsd, pageResult.costUsd);
@@ -420,6 +431,9 @@ export async function generateHarness(engine: Engine, projectDir: string): Promi
     notify(`page:${CARD_SLUG}`, "generating the project card (draft)");
     const cardResult = await promptForJson(session, buildCardPrompt(overview, mined), CardContentSchema, {
       stage: `page:${CARD_SLUG}`,
+      timeoutMs: HARNESS_PROMPT_TIMEOUT_MS,
+      beforePrompt: () => supervisor?.reserveModelCall(),
+      onAttemptCost: (cost) => supervisor?.recordCost(cost, cost === null ? "unpriced" : "verified"),
       notify: (n) => notify(`page:${CARD_SLUG}`, `${n.kind}: ${n.detail}`),
     });
     costUsd = addCost(costUsd, cardResult.costUsd);
@@ -444,6 +458,9 @@ export async function generateHarness(engine: Engine, projectDir: string): Promi
       AgentsRoutingSchema,
       {
         stage: "agents-routing",
+        timeoutMs: HARNESS_PROMPT_TIMEOUT_MS,
+        beforePrompt: () => supervisor?.reserveModelCall(),
+        onAttemptCost: (cost) => supervisor?.recordCost(cost, cost === null ? "unpriced" : "verified"),
         notify: (n) => notify("agents-routing", `${n.kind}: ${n.detail}`),
       },
     );
@@ -456,10 +473,11 @@ export async function generateHarness(engine: Engine, projectDir: string): Promi
       manifest: {
         schemaVersion: 2 as const,
         generatorVersion: ENGINE_VERSION,
-        engine: FRONTIER_KIND,
+        engine: frontier.engine,
+        planningFrontier: frontier,
         headSha,
         generatedAt: new Date().toISOString(),
-        verification: { structural: "pass" as const, evals: "pending" as const, card: "draft" as const },
+        verification: { structural: "pass" as const, card: "draft" as const },
         artifacts: [],
         harnessProfile: "openfusion-native" as const,
         familyCatalogVersion: FAMILY_CATALOG_VERSION,
@@ -499,6 +517,10 @@ export async function generateHarness(engine: Engine, projectDir: string): Promi
       );
     }
 
+    supervisor?.throwIfAborted();
+    if (supervisor !== undefined && requireGitRepo(projectDir) !== supervisor.taskSnapshot.baseSha) {
+      throw new HarnessGenError("project HEAD changed during harness generation", 1, [], "write");
+    }
     const { files } = await writeHarness(projectDir, parsed.data);
 
     notify("verify", "confirming the harness bundle on disk");
@@ -513,7 +535,7 @@ export async function generateHarness(engine: Engine, projectDir: string): Promi
 
     return {
       files,
-      reportCard: { structural: "pass", evals: "pending" },
+      reportCard: { structural: "pass", operational: "insufficient-evidence" },
       estimatedCostUsd: costUsd,
       pages: pages.length,
       agents: agents.length,
@@ -521,11 +543,7 @@ export async function generateHarness(engine: Engine, projectDir: string): Promi
       cardStripped: stripped,
     };
   } finally {
-    await session.close().catch(() => {
-      // Best-effort — mirrors FrontierService's own per-session close()
-      // isolation (engines/methods.ts): a throwing adapter close() must
-      // never mask the pipeline's actual success/failure outcome.
-    });
+    await engine.frontier.closeSession(session);
     untrackSession();
   }
 }

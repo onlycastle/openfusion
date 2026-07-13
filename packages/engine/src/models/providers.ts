@@ -41,6 +41,14 @@ export class ProviderRegistry {
     this.#providers.set(config.id, { config, fetchImpl });
   }
 
+  /** Remove a provider from the live registry. This is intentionally
+   * separate from the desktop's key/config stores: callers coordinate all
+   * three so a removed provider can no longer be selected in this session. */
+  unconfigure(id: string): boolean {
+    this.#testModels.delete(id);
+    return this.#providers.delete(id);
+  }
+
   list(): Array<Omit<ProviderConfig, "apiKey">> {
     return [...this.#providers.values()].map(({ config }) => ({
       id: config.id,

@@ -10,7 +10,7 @@ import { Buffer } from "node:buffer";
  * (the OOM-via-giant-line DoS this cap exists to close). Exported so callers
  * (and tests) can reference the exact number rather than a magic constant.
  */
-export const MAX_NDJSON_LINE_BYTES = 32 * 1024 * 1024; // 32 MiB
+export const MAX_NDJSON_LINE_BYTES = 8 * 1024 * 1024; // 8 MiB
 
 export interface NdjsonDecoderOptions {
   /** Overrides MAX_NDJSON_LINE_BYTES — tests use a small value to exercise the cap cheaply. */

@@ -1,7 +1,7 @@
 import { createContext, useCallback, useContext, useEffect, useState, type ReactNode } from "react";
 import { addProject, listProjects, removeProject, type ProjectMeta } from "./engineClient";
 
-export type Section = "chat" | "harness" | "evals";
+export type Section = "chat" | "harness" | "health";
 
 /** Last path segment, or the raw string when it has none (e.g. "/"). */
 export function baseName(dir: string): string {

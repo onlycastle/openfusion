@@ -45,6 +45,15 @@ describe("buildIndex", () => {
     expect(stats.filesIndexed).toBe(2);
     expect(stats.filesSkipped).toBe(0);
     expect(stats.filesFailed).toBe(0);
+    expect(stats.coverage).toMatchObject({
+      supportedTracked: 2,
+      currentEntries: 2,
+      unchanged: 0,
+      oversized: 0,
+      unreadable: 0,
+      parseFailed: 0,
+    });
+    expect(stats.sourceFingerprint).toMatch(/^sha256:[a-f0-9]{64}$/);
     expect(stats.symbols).toBeGreaterThanOrEqual(2);
     expect(stats.headSha).toBe(getHeadSha(dir));
     expect(store.getMeta("head_sha")).toBe(stats.headSha);
@@ -59,6 +68,7 @@ describe("buildIndex", () => {
     git("commit", "-qm", "edit b");
     const stats = await buildIndex(dir, store, parser);
     expect(stats.filesSkipped).toBe(1);
+    expect(stats.coverage.unchanged).toBe(1);
     expect(stats.filesIndexed).toBe(1);
     expect(store.symbolsByName("beta")).toEqual([]);
     expect(store.symbolsByName("betaTwo")).toHaveLength(1);
@@ -74,7 +84,7 @@ describe("buildIndex", () => {
     expect(store.listFiles()).toEqual(["a.ts"]);
   });
 
-  it("keeps entries for tracked files that become oversized (skip, not removal)", async () => {
+  it("removes stale entries for tracked files that become oversized", async () => {
     makeRepo();
     await buildIndex(dir, store, parser);
     expect(store.symbolsByName("alpha")).toHaveLength(1);
@@ -85,9 +95,19 @@ describe("buildIndex", () => {
     git("add", "-A");
     git("commit", "-qm", "grow a");
     const stats = await buildIndex(dir, store, parser);
-    expect(stats.filesRemoved).toBe(0);
-    expect(store.listFiles()).toContain("a.ts");
+    expect(stats.filesRemoved).toBe(1);
+    expect(store.listFiles()).not.toContain("a.ts");
+    expect(store.symbolsByName("alpha")).toEqual([]);
+  });
+
+  it("indexes the exact committed HEAD and ignores dirty tracked edits", async () => {
+    makeRepo();
+    writeFileSync(path.join(dir, "a.ts"), "export function dirtyOnly() {}\n");
+    const stats = await buildIndex(dir, store, parser);
+    expect(stats.headSha).toBe(git("rev-parse", "HEAD"));
     expect(store.symbolsByName("alpha")).toHaveLength(1);
+    expect(store.symbolsByName("dirtyOnly")).toEqual([]);
+    expect(store.searchFiles("dirtyOnly")).toEqual([]);
   });
 
   it("yields the event loop during large builds (concurrent timer fires mid-build)", async () => {
@@ -132,6 +152,29 @@ describe("buildIndex", () => {
     expect(stats.filesSkipped).toBe(60);
     expect(stats.filesIndexed).toBe(0);
     expect(timerFired).toBe(true);
+  }, 30_000);
+
+  it("rejects a build when HEAD changes during indexing", async () => {
+    dir = mkdtempSync(path.join(os.tmpdir(), "of-idx-drift-"));
+    execFileSync("git", ["init", "-q", dir]);
+    execFileSync("git", ["-C", dir, "config", "user.email", "t@t"]);
+    execFileSync("git", ["-C", dir, "config", "user.name", "t"]);
+    for (let i = 0; i < 30; i += 1) {
+      writeFileSync(path.join(dir, `d${i}.ts`), `export function drift${i}() {}\n`);
+    }
+    execFileSync("git", ["-C", dir, "add", "-A"]);
+    execFileSync("git", ["-C", dir, "commit", "-qm", "many"]);
+    store = openWikiStore(dir);
+    const mutation = setImmediate(() => {
+      writeFileSync(path.join(dir, "d0.ts"), "export function changedDuringBuild() {}\n");
+      execFileSync("git", ["-C", dir, "add", "d0.ts"]);
+      execFileSync("git", ["-C", dir, "commit", "-qm", "move head"]);
+    });
+    await expect(buildIndex(dir, store, parser)).rejects.toThrow(
+      "wiki source HEAD changed during indexing",
+    );
+    clearImmediate(mutation);
+    expect(store.getMeta("head_sha")).toBeNull();
   }, 30_000);
 });
 

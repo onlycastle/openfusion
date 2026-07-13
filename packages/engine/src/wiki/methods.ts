@@ -8,14 +8,16 @@ import { registerMethod } from "../rpc/register.js";
 import { buildIndex, type BuildIndexProgress, type IndexStats } from "./indexer.js";
 import { McpWikiServer } from "./mcp.js";
 import { WikiParser } from "./parser.js";
-import { rankFiles, renderRepoMap } from "./rank.js";
+import { buildRepositoryMap } from "./query.js";
 import { openWikiStore, wikiDbPath, type WikiStore } from "./store.js";
+import { verifyWiki } from "./verify.js";
 
 const ProjectParamsSchema = z.object({ projectDir: z.string().min(1) });
 const QueryParamsSchema = ProjectParamsSchema.extend({
   symbol: z.string().min(1),
 });
 const MapParamsSchema = ProjectParamsSchema.extend({
+  query: z.string().min(1).max(2_000).optional(),
   budgetTokens: z.number().int().min(64).max(32768).optional(),
 });
 const EmptyParamsSchema = z.object({});
@@ -93,6 +95,25 @@ export class WikiService {
     this.#mcpServers.delete(key);
     await server.stop();
     return true;
+  }
+
+  /** Releases transient project state such as an evaluation scratch arm. */
+  async releaseProject(projectDir: string): Promise<void> {
+    const key = resolveProjectKey(projectDir);
+    const server = this.#mcpServers.get(key);
+    if (server !== undefined) {
+      this.#mcpServers.delete(key);
+      await server.stop().catch(() => {});
+    }
+    const store = this.#stores.get(key);
+    if (store !== undefined) {
+      this.#stores.delete(key);
+      try {
+        store.close();
+      } catch {
+        // The scratch directory may already be partially removed.
+      }
+    }
   }
 
   getParser(): Promise<WikiParser> {
@@ -219,6 +240,16 @@ export function registerWikiMethods(engine: Engine): void {
 
   registerMethod(
     engine.dispatcher,
+    "engine.wiki.verify",
+    ProjectParamsSchema,
+    async ({ projectDir }) => {
+      requireGitRepo(projectDir);
+      return verifyWiki(engine, projectDir);
+    },
+  );
+
+  registerMethod(
+    engine.dispatcher,
     "engine.wiki.query",
     QueryParamsSchema,
     ({ projectDir, symbol }) => {
@@ -235,7 +266,7 @@ export function registerWikiMethods(engine: Engine): void {
     engine.dispatcher,
     "engine.wiki.map",
     MapParamsSchema,
-    ({ projectDir, budgetTokens }) => {
+    ({ projectDir, query, budgetTokens }) => {
       requireGitRepo(projectDir);
       const store = engine.wiki.getStore(projectDir);
       if (store.getMeta("head_sha") === null) {
@@ -244,12 +275,16 @@ export function registerWikiMethods(engine: Engine): void {
           "wiki not built — run engine.wiki.build first",
         );
       }
-      const ranked = rankFiles(store.allSymbols(), store.allRefs());
-      const renderable = ranked.filter((r) => r.definedSymbols.length > 0).length;
-      const map = renderRepoMap(ranked, budgetTokens ?? 1024);
-      // each rendered block is exactly two lines (file + symbols)
-      const rendered = map.length === 0 ? 0 : map.trimEnd().split("\n").length / 2;
-      return { map, files: ranked.length, truncated: rendered < renderable };
+      const result = buildRepositoryMap(store, {
+        budgetTokens: budgetTokens ?? 1024,
+        ...(query === undefined ? {} : { query }),
+      });
+      return {
+        map: result.map,
+        files: result.files,
+        matchedFiles: result.matchedFiles,
+        truncated: result.rendered < result.renderable,
+      };
     },
   );
 
@@ -260,7 +295,7 @@ export function registerWikiMethods(engine: Engine): void {
     async ({ projectDir }) => {
       requireGitRepo(projectDir);
       const server = await engine.wiki.startMcpServer(engine, projectDir);
-      return { url: server.url };
+      return { url: server.url, bearerToken: server.bearerToken };
     },
   );
 

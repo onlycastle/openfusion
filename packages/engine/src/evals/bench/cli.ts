@@ -17,13 +17,14 @@ import { scorePredictions } from "./score.js";
 import { buildBenchReport, writeBenchReport } from "./report.js";
 import { configureBenchProviders } from "./providerConfig.js";
 import type { PricingConfidence } from "../../models/meter.js";
+import type { FrontierSelection } from "../../engines/selection.js";
 
 function usage(): string {
   return `openfusion-bench — SWE-bench Verified Mini paired harness eval
 
 Usage:
-  openfusion-bench prepare [--clones-only] [--approve-from <path>] [--bench-root <dir>] [--providers <path>]
-  openfusion-bench run [--limit N] [--instance <id>] [--run-id <id>] [--bench-root <dir>] [--providers <path>]
+  openfusion-bench prepare [--clones-only] [--approve-from <path>] [--planning-engine <kind>] [--planning-model <id>] [--bench-root <dir>] [--providers <path>]
+  openfusion-bench run [--limit N] [--instance <id>] [--run-id <id>] [--baseline-engine <kind>] [--baseline-model <id>] [--review-engine <kind>] [--review-model <id>] [--escalation-engine <kind>] [--escalation-model <id>] [--bench-root <dir>] [--providers <path>]
   openfusion-bench score --run-id <id> [--fixture-baseline <path>] [--fixture-harness <path>]
   openfusion-bench report --run-id <id>
   openfusion-bench help
@@ -79,6 +80,17 @@ function providersPathFrom(flags: Record<string, string | boolean>): string | un
   return process.env.OPENFUSION_BENCH_PROVIDERS;
 }
 
+function frontierSelectionFromFlags(
+  flags: Record<string, string | boolean>,
+  role: "planning" | "baseline" | "review" | "escalation",
+): FrontierSelection | undefined {
+  const engine = flags[`${role}Engine`];
+  const model = flags[`${role}Model`];
+  if (engine === undefined && model === undefined) return undefined;
+  if (typeof engine !== "string") throw new Error(`--${role}-engine is required when selecting a ${role} model`);
+  return { engine, ...(typeof model === "string" ? { model } : {}) };
+}
+
 async function main(): Promise<void> {
   const { cmd, flags } = parseArgs(process.argv.slice(2));
   const log = (m: string) => process.stderr.write(`${m}\n`);
@@ -99,6 +111,7 @@ async function main(): Promise<void> {
         benchRoot: benchRootFrom(flags),
         clonesOnly: flags.clonesOnly === true,
         approveFrom: typeof flags.approveFrom === "string" ? flags.approveFrom : undefined,
+        planningFrontier: frontierSelectionFromFlags(flags, "planning"),
         log,
       });
       process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
@@ -117,6 +130,11 @@ async function main(): Promise<void> {
         limit: typeof flags.limit === "string" ? Number(flags.limit) : undefined,
         instanceId: typeof flags.instance === "string" ? flags.instance : undefined,
         runId: typeof flags.runId === "string" ? flags.runId : undefined,
+        frontier: {
+          baseline: frontierSelectionFromFlags(flags, "baseline"),
+          review: frontierSelectionFromFlags(flags, "review"),
+          escalation: frontierSelectionFromFlags(flags, "escalation"),
+        },
         log,
       });
       process.stdout.write(

@@ -9,6 +9,7 @@ export const RpcErrorCodes = {
   INVALID_PARAMS: -32602,
   INTERNAL_ERROR: -32603,
   SERVER_ERROR: -32000,
+  BUSY: -32001,
 } as const;
 
 export const RpcIdSchema = z.union([z.string(), z.number().int()]);

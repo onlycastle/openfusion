@@ -132,6 +132,7 @@ pub fn run() {
             secrets::delete_secret,
             secrets::list_secret_ids,
             secrets::load_persisted_secrets,
+            secrets::ensure_runtime_key,
             providers::list_provider_configs,
             providers::save_provider_config,
             providers::delete_provider_config,

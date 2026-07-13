@@ -6,7 +6,7 @@ import { readRuns } from "./ledger.js";
 
 const ListParamsSchema = z.object({
   projectDir: z.string().min(1),
-  kind: z.enum(["orchestrate", "evals", "generate", "card"]).optional(),
+  kind: z.enum(["orchestrate", "apply", "evals", "generate", "card"]).optional(),
   limit: z.number().int().min(1).max(200).optional(),
 });
 

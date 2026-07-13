@@ -37,15 +37,20 @@ case "$cmd" in
 
 # ---- Tier 1 : headless -------------------------------------------------------
   test)
+    bold "Rust native sandbox suite…"
+    cargo test --manifest-path native/sandbox-runner/Cargo.toml
+    bold "Build and stage the native sandbox runner…"
+    pnpm --filter @openfusion/desktop stage-sandbox-runner
     bold "TypeScript suites (engine + shared + desktop)…"
     pnpm test
     bold "Rust host suite (needs the test-mocks feature — plain 'cargo test' fails)…"
     pnpm --filter @openfusion/desktop test:rust
     bold "✓ all headless suites passed" ;;
 
-  check)   # local full check: build + typecheck + TS + Rust tests
+  check)   # local full check: build + typecheck + docs + TS + Rust tests
     bold "build…";     pnpm build
     bold "typecheck…"; pnpm typecheck
+    bold "docs…";      pnpm docs:check
     "$0" test ;;
 
 # ---- Tier 2 : build the engine binary + run the app --------------------------
@@ -112,8 +117,8 @@ case "$cmd" in
 OpenFusion dev.sh — testing & local run
 
   Tier 1 (no setup):
-    ./dev.sh test        headless suites: TS (712) + Rust (59)
-    ./dev.sh check       build + typecheck + TS + Rust tests
+    ./dev.sh test        headless TypeScript, native sandbox, and Rust host suites
+    ./dev.sh check       build + typecheck + docs + TS + Rust tests
 
   Tier 2 (toolchain only, no keys):
     ./dev.sh sidecar     compile the engine binary, stage it, ping it

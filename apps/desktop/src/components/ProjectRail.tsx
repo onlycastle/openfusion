@@ -3,7 +3,7 @@ import { baseName, useProject, type Section } from "../ProjectContext";
 const SECTIONS: Array<{ id: Section; label: string }> = [
   { id: "chat", label: "Chat" },
   { id: "harness", label: "Harness setting" },
-  { id: "evals", label: "Evals" },
+  { id: "health", label: "Health" },
 ];
 
 export function ProjectRail() {

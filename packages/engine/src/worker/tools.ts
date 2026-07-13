@@ -1,4 +1,4 @@
-// Path-scoped worker toolset: bash + read_file + write_file + edit as AI SDK
+// Path-scoped worker toolset: sandboxed bash + read_file + write_file + edit as AI SDK
 // v7 `tool()` definitions (verified shape: `tool({ description, inputSchema,
 // execute })` -- `inputSchema`, NOT `parameters`; see
 // docs/research/2026-07-04-m5-api-verification.md). The SDK provides NO
@@ -9,15 +9,39 @@
 // ../engines/path-scope.ts's `isPathContained` + `canonicalizePath`, the
 // single helper M4 hardened over three review rounds plus one M5a round;
 // this module does not re-implement or fork that logic.
-import { execFile } from "node:child_process";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { tool, type Tool } from "ai";
 import { z } from "zod";
 import { canonicalizePath, isPathContained } from "../engines/path-scope.js";
 import type { WikiPage } from "../harness/schema.js";
+import { projectWorkerTool } from "../tools/projections.js";
+import {
+  APPLY_PATCH_TOOL_SPEC,
+  BASH_TOOL_SPEC,
+  EDIT_TOOL_SPEC,
+  READ_FILE_TOOL_SPEC,
+  READ_TOOL_OUTPUT_SPEC,
+  WIKI_MAP_TOOL_SPEC,
+  WIKI_QUERY_TOOL_SPEC,
+  WRITE_FILE_TOOL_SPEC,
+} from "../tools/registry.js";
+import {
+  createToolInvocationClaim,
+  ToolGateway,
+  type ToolResourceClaim,
+} from "../tools/gateway.js";
 import { querySymbols, renderMap } from "../wiki/query.js";
 import type { SymbolHit, WikiStore } from "../wiki/store.js";
+import {
+  TOOL_OUTPUT_MAX_BYTES,
+  type SandboxBackend,
+  type SandboxProfile,
+} from "../runtime/sandbox.js";
+import type { RuntimeStore } from "../runtime/store.js";
+import type { PolicyEvaluator } from "../runtime/policy.js";
+import type { RuntimeReadCache } from "../runtime/read-cache.js";
 import { applyPatchToWorktree } from "./apply-patch.js";
 
 // Phase 1 dialect-pack telemetry: expected tool failures (model mistakes)
@@ -30,8 +54,23 @@ export type ToolErrorKind =
   | "invalid_args"
   | "io"
   | "timeout"
+  | "output_limit"
+  | "policy_denied"
   | "aborted"
   | "unknown";
+
+const ToolErrorKindSchema = z.enum([
+  "not_found",
+  "not_unique",
+  "containment",
+  "invalid_args",
+  "io",
+  "timeout",
+  "output_limit",
+  "policy_denied",
+  "aborted",
+  "unknown",
+]);
 
 export interface ToolEvent {
   tool: string;
@@ -40,10 +79,24 @@ export interface ToolEvent {
   errorKind?: ToolErrorKind;
 }
 
+export type ToolLifecycleEvent =
+  | { phase: "started"; tool: string }
+  | {
+      phase: "finished" | "failed";
+      tool: string;
+      durationMs: number;
+      resultBytes: number;
+      truncated: boolean;
+      errorKind?: ToolErrorKind;
+    };
+
 export interface ToolContext {
   root: string;
   bashTimeoutMs?: number;
   onToolEvent?: (e: ToolEvent) => void;
+  onToolLifecycleEvent?: (e: ToolLifecycleEvent) => void;
+  /** Model-facing recovery guidance supplied by the active dialect pack. */
+  retryHintFor?: (tool: string, errorKind: ToolErrorKind) => string | undefined;
   // Task 7: present only once worker/methods.ts has confirmed the project's
   // wiki is actually built (never triggers a build itself — see that
   // module's wiring). When set, createWorkerTools additionally registers
@@ -60,6 +113,26 @@ export interface ToolContext {
   includeEdit?: boolean;
   editDescription?: string;
   includeBash?: boolean;
+  /** Bash is exposed only when a native sandbox backend was certified. */
+  sandboxCertified?: boolean;
+  sandbox?: {
+    backend: SandboxBackend;
+    store: RuntimeStore;
+    sessionId: string;
+    privateTempRoot?: string;
+    readablePaths?: string[];
+    executablePaths?: string[];
+    networkGranted?: boolean;
+    environment?: Record<string, string>;
+    profile?: SandboxProfile;
+  };
+  policy?: {
+    evaluator: PolicyEvaluator;
+    interactive: boolean;
+  };
+  /** Central dynamic-claim enforcement. Tests may inject an observer-enabled gateway. */
+  toolGateway?: ToolGateway;
+  readCache?: RuntimeReadCache;
   includeWikiTools?: boolean;
   /** When true, register apply_patch and omit string-replace edit. */
   includeApplyPatch?: boolean;
@@ -80,15 +153,26 @@ interface BashResult {
   stdout: string;
   stderr: string;
   exitCode: number;
+  artifactId?: string;
+  outputBytes?: number;
   error?: string;
+  errorKind?: ToolErrorKind;
+  truncated?: boolean;
 }
 
 interface FileErrorResult {
   error: string;
+  errorKind: ToolErrorKind;
+  recovery?: string;
 }
 
 interface ReadResult {
   content: string;
+  startLine: number;
+  endLine: number;
+  totalLines: number;
+  truncated: boolean;
+  nextOffset?: number;
 }
 
 interface WriteResult {
@@ -101,14 +185,29 @@ interface EditResult {
 }
 
 const DEFAULT_BASH_TIMEOUT_MS = 30_000;
-const BASH_MAX_BUFFER = 1024 * 1024; // 1MB -- the research doc's example cap
-const OUTPUT_TRUNCATE_CHARS = 10 * 1024; // ~10KB, for bash stdout/stderr
 const READ_TRUNCATE_CHARS = 50 * 1024; // ~50KB, for read_file content
+const DEFAULT_READ_LIMIT_LINES = 2_000;
 const DETAIL_TRUNCATE_CHARS = 80;
 
 function truncate(s: string, max: number): string {
   if (s.length <= max) return s;
   return `${s.slice(0, max)}\n...[truncated, ${s.length - max} more chars]`;
+}
+
+// Shell failures and test summaries commonly appear at the end of output.
+// Preserve both ends, following Codex's output-truncation utility, instead
+// of retaining only the prefix and discarding the most actionable lines.
+function truncateMiddle(s: string, max: number): string {
+  if (s.length <= max) return s;
+  const head = Math.ceil(max / 2);
+  const tail = Math.floor(max / 2);
+  const omitted = s.length - head - tail;
+  const totalLines = s.split("\n").length;
+  return (
+    `${s.slice(0, head)}\n` +
+    `...[truncated ${omitted} chars from middle; original output ${totalLines} lines]...\n` +
+    s.slice(s.length - tail)
+  );
 }
 
 // Detail strings passed to onToolEvent are observability metadata ONLY
@@ -121,65 +220,6 @@ function truncate(s: string, max: number): string {
 // path).
 function detail(s: string): string {
   return truncate(s.replace(/[\x00-\x1f]/g, " "), DETAIL_TRUNCATE_CHARS);
-}
-
-function runBash(
-  command: string,
-  cwd: string,
-  timeoutMs: number,
-  abortSignal: AbortSignal | undefined,
-): Promise<BashResult> {
-  return new Promise((resolve) => {
-    execFile(
-      "/bin/sh",
-      ["-c", command],
-      { cwd, timeout: timeoutMs, maxBuffer: BASH_MAX_BUFFER, signal: abortSignal },
-      (error, stdout, stderr) => {
-        const out = truncate(stdout, OUTPUT_TRUNCATE_CHARS);
-        const err = truncate(stderr, OUTPUT_TRUNCATE_CHARS);
-        if (!error) {
-          resolve({ stdout: out, stderr: err, exitCode: 0 });
-          return;
-        }
-        // Node overloads `error.code` here: a NUMBER means the process ran
-        // to completion and exited nonzero (the normal case a worker reads,
-        // e.g. `exit 3` -> code 3 -- returned below with no `error` field,
-        // since a nonzero exit is not itself a tool failure). Anything else
-        // (a signal-kill from our own timeout, an abort from the AI SDK's
-        // merged options.abortSignal, ENOENT from a bad interpreter, an
-        // over-maxBuffer abort) means there is no real exit code to report
-        // -- normalize to -1 and attach an explanatory message so the model
-        // can tell the difference.
-        const e = error as NodeJS.ErrnoException & {
-          killed?: boolean;
-          signal?: NodeJS.Signals | null;
-        };
-        if (typeof e.code === "number") {
-          resolve({ stdout: out, stderr: err, exitCode: e.code });
-          return;
-        }
-        // execFile's `signal` option kills the child and rejects/errors with
-        // an AbortError (name === "AbortError") when the passed AbortSignal
-        // fires -- distinct from our own `timeout` option's SIGTERM kill
-        // (which sets `e.killed` but not this name). Surfacing "aborted"
-        // here (rather than folding it into the generic message branch)
-        // lets a caller distinguish "the deadline/abort fired" from
-        // "bashTimeoutMs itself elapsed", even though both are reported the
-        // same way to the model (a normal tool result, not a throw) --
-        // whichever aborted the child, generateText's own abort handling is
-        // what actually ends the run; this is just a clean result in the
-        // meantime.
-        if (e.name === "AbortError" || abortSignal?.aborted) {
-          resolve({ stdout: out, stderr: err, exitCode: -1, error: "aborted" });
-          return;
-        }
-        const message = e.killed
-          ? `command timed out after ${timeoutMs}ms`
-          : (e.message ?? String(e));
-        resolve({ stdout: out, stderr: err, exitCode: -1, error: message });
-      },
-    );
-  });
 }
 
 type Gate = { ok: true; resolved: string } | { ok: false; error: string };
@@ -199,6 +239,11 @@ function containmentGate(root: string, canonicalRoot: string, rawPath: string): 
   if (!isPathContained(canonical, canonicalRoot)) {
     return { ok: false, error: `path outside worktree: ${rawPath}` };
   }
+  const relative = path.relative(canonicalRoot, canonical);
+  const first = relative.split(path.sep)[0]?.toLowerCase();
+  if (first === ".git" || first === ".gitmodules" || first === ".openfusion") {
+    return { ok: false, error: "path is reserved for OpenFusion control state" };
+  }
   return { ok: true, resolved: canonical };
 }
 
@@ -207,25 +252,8 @@ function containmentGate(root: string, canonicalRoot: string, rawPath: string): 
 // (Task 7) when `ctx.wiki` is present — see ToolContext's own doc comment
 // on `wiki`.
 //
-// Trust model (v1, accepted for this milestone): the worker operates on the
-// user's OWN repository, already isolated into its own git worktree (see
-// worker/worktree.ts) -- these tools bound the worker's blast radius to
-// that worktree; they do not attempt full process sandboxing.
-//
-// `bash`'s boundary is cwd-pinning ONLY: a command can still `cd ..` and
-// touch anything outside the worktree, or address absolute paths directly
-// (e.g. `rm -rf /somewhere`) -- there is no seccomp/container/VM layer
-// here, and none of that is caught or blocked. `read_file`/`write_file`/
-// `edit`, by contrast, DO enforce real path containment on every single
-// call, because the model's most likely and most consequential mistake is
-// a relative-path typo or a stale path from prior context, not a
-// deliberately adversarial shell one-liner. Real isolation (containers/VMs)
-// is out of scope for this milestone -- see spec §7 / M7. Separately, `bash`
-// inherits the engine process's own environment and can read any file the
-// engine's OS user can read -- not just paths under the worktree -- and
-// whatever it prints flows straight into a third-party model provider's
-// context, so the boundary this milestone provides is blast-radius/
-// isolation of WRITES (deferred fully to M7), not data confidentiality.
+// Bash is included only with a probed native SandboxBackend. There is no
+// cwd-only fallback: missing/failed isolation removes the tool entirely.
 const DEFAULT_EDIT_DESCRIPTION =
   "Replace a single, EXACT, unique occurrence of `find` with `replace` " +
   "in a file at a path relative to the worktree root. Fails if `find` " +
@@ -242,120 +270,349 @@ function emit(
   ctx.onToolEvent?.({ tool: toolName, detail: detailStr, ok, errorKind });
 }
 
+function emitLifecycle(ctx: ToolContext, event: ToolLifecycleEvent): void {
+  try {
+    ctx.onToolLifecycleEvent?.(event);
+  } catch {
+    // Lifecycle observation must never affect tool execution.
+  }
+}
+
+type ObservedToolExecute = (
+  input: unknown,
+  options: { abortSignal?: AbortSignal },
+) => Promise<unknown>;
+
+function resultBytes(result: unknown): number {
+  try {
+    const serialized = typeof result === "string" ? result : JSON.stringify(result);
+    return Buffer.byteLength(serialized ?? "", "utf8");
+  } catch {
+    return 0;
+  }
+}
+
+function observeTool(
+  ctx: ToolContext,
+  toolName: string,
+  execute: ObservedToolExecute,
+): ObservedToolExecute {
+  return async (input, options) => {
+    const startedAt = Date.now();
+    emitLifecycle(ctx, { phase: "started", tool: toolName });
+    try {
+      const result = await execute(input, options);
+      const metadata =
+        typeof result === "object" && result !== null
+          ? (result as { error?: unknown; errorKind?: unknown; truncated?: unknown })
+          : undefined;
+      const failed = typeof metadata?.error === "string";
+      const errorKind = ToolErrorKindSchema.safeParse(metadata?.errorKind);
+      emitLifecycle(ctx, {
+        phase: failed ? "failed" : "finished",
+        tool: toolName,
+        durationMs: Math.max(0, Date.now() - startedAt),
+        resultBytes: resultBytes(result),
+        truncated: metadata?.truncated === true,
+        ...(failed
+          ? { errorKind: errorKind.success ? errorKind.data : "unknown" }
+          : {}),
+      });
+      return result;
+    } catch (error) {
+      emitLifecycle(ctx, {
+        phase: "failed",
+        tool: toolName,
+        durationMs: Math.max(0, Date.now() - startedAt),
+        resultBytes: 0,
+        truncated: false,
+        errorKind: "unknown",
+      });
+      throw error;
+    }
+  };
+}
+
+function failure(
+  ctx: ToolContext,
+  toolName: string,
+  detailStr: string,
+  errorKind: ToolErrorKind,
+  error: string,
+): FileErrorResult {
+  emit(ctx, toolName, detailStr, false, errorKind);
+  const recovery = ctx.retryHintFor?.(toolName, errorKind);
+  return recovery === undefined ? { error, errorKind } : { error, errorKind, recovery };
+}
+
 export function createWorkerTools(ctx: ToolContext): Record<string, Tool> {
   const canonicalRoot = fs.realpathSync(ctx.root);
   const bashTimeoutMs = ctx.bashTimeoutMs ?? DEFAULT_BASH_TIMEOUT_MS;
-  const includeBash = ctx.includeBash !== false;
+  const includeBash =
+    ctx.includeBash === true && ctx.sandboxCertified === true && ctx.sandbox !== undefined;
   const includeApplyPatch = ctx.includeApplyPatch === true;
   const includeEdit = !includeApplyPatch && ctx.includeEdit !== false;
   const includeWiki = ctx.includeWikiTools !== false && ctx.wiki !== undefined;
   const editDescription = ctx.editDescription ?? DEFAULT_EDIT_DESCRIPTION;
+  const toolGateway = ctx.toolGateway ?? new ToolGateway({
+    evaluator: ctx.policy?.evaluator,
+    interactive: ctx.policy?.interactive,
+  });
+  const rolePolicy = {
+    policyId: "worker-author-v1",
+    claims: [
+      { kind: "filesystem-read", resource: canonicalRoot },
+      { kind: "filesystem-write", resource: canonicalRoot },
+      { kind: "process", resource: "/bin/sh" },
+      { kind: "network", resource: "tool:bash" },
+    ] satisfies ToolResourceClaim[],
+  };
+  const authorize = (
+    toolId: string,
+    claims: ToolResourceClaim[],
+    approvalSatisfied = false,
+  ) => toolGateway.authorize({
+    invocation: createToolInvocationClaim(toolId, claims),
+    policies: [rolePolicy, { policyId: `tool:${toolId}`, claims }],
+    sandboxed: ctx.sandboxCertified === true,
+    approvalSatisfied,
+  });
+  const bashClaims = (network: boolean): ToolResourceClaim[] => [
+    { kind: "filesystem-read", resource: canonicalRoot },
+    { kind: "filesystem-write", resource: canonicalRoot },
+    { kind: "process", resource: "/bin/sh" },
+    ...(network ? [{ kind: "network" as const, resource: "tool:bash" }] : []),
+  ];
 
   const tools: Record<string, Tool> = {};
 
   if (includeBash) {
+    const sandbox = ctx.sandbox!;
     tools.bash = tool({
-      description:
-        "Run a shell command via /bin/sh, with cwd pinned to the worktree root. " +
-        "NOTE: this does not prevent the command from `cd`-ing out of the " +
-        "worktree or touching absolute paths outside it -- unlike the file " +
-        "tools, bash does not enforce path containment. A nonzero exit code " +
-        "is a normal result, not a failure of this tool.",
-      inputSchema: z.object({ command: z.string().min(1) }),
-      execute: async ({ command }, { abortSignal }): Promise<BashResult> => {
-        const result = await runBash(command, ctx.root, bashTimeoutMs, abortSignal);
-        const timedOut = result.error?.includes("timed out") === true;
-        const aborted = result.error === "aborted";
-        const ok = result.error === undefined;
+      ...projectWorkerTool(BASH_TOOL_SPEC),
+      needsApproval: ({ network }) => {
+        if (network !== true) return false;
+        return authorize(BASH_TOOL_SPEC.id, bashClaims(true)).decision === "approval-required";
+      },
+      execute: async ({ command, network = false }, { abortSignal }): Promise<BashResult> => {
+        // A shell can mutate any contained path in ways that are opaque to
+        // the tool layer, so it conservatively advances the mutation epoch.
+        ctx.readCache?.invalidateAll();
+        const decision = authorize(
+          BASH_TOOL_SPEC.id,
+          bashClaims(network),
+          network && ctx.policy?.interactive === true,
+        );
+        if (decision.decision !== "allow") {
+          const denied: BashResult = {
+            stdout: "",
+            stderr: "",
+            exitCode: -1,
+            error: "tool invocation denied by policy",
+            errorKind: "policy_denied",
+          };
+          emit(ctx, "bash", detail(command), false, denied.errorKind);
+          return denied;
+        }
+        const privateTempDir = fs.mkdtempSync(
+          path.join(sandbox.privateTempRoot ?? os.tmpdir(), "openfusion-tool-"),
+        );
+        const writer = sandbox.store.beginArtifact(sandbox.sessionId, "tool-output", {
+          maxBytes: TOOL_OUTPUT_MAX_BYTES,
+        });
+        let result: Awaited<ReturnType<SandboxBackend["run"]>>;
+        try {
+          result = await sandbox.backend.run({
+            executable: "/bin/sh",
+            args: ["-c", command],
+            cwd: ctx.root,
+            privateTempDir,
+            readablePaths: sandbox.readablePaths,
+            executablePaths: sandbox.executablePaths,
+            networkGranted: sandbox.networkGranted === true || network,
+            environment: sandbox.environment,
+            profile: sandbox.profile,
+            timeoutMs: bashTimeoutMs,
+            abortSignal,
+            output: writer,
+          });
+        } catch (error) {
+          writer.abort();
+          const message = error instanceof Error ? error.message : String(error);
+          const failed: BashResult = {
+            stdout: "",
+            stderr: "",
+            exitCode: -1,
+            error: message,
+            errorKind: abortSignal?.aborted === true ? "aborted" : "unknown",
+          };
+          emit(ctx, "bash", detail(command), false, failed.errorKind);
+          return failed;
+        } finally {
+          fs.rmSync(privateTempDir, { recursive: true, force: true });
+        }
+        const errorKind: ToolErrorKind | undefined =
+          result.failure === "timeout"
+            ? "timeout"
+            : result.failure === "cancelled"
+              ? "aborted"
+              : result.failure === "output-limit"
+                ? "output_limit"
+                : result.failure === "spawn"
+                  ? "unknown"
+                  : undefined;
+        const error =
+          result.failure === "output-limit"
+            ? `output limit exceeded after ${result.outputBytes} bytes`
+            : result.failure === "timeout"
+              ? `command timed out after ${bashTimeoutMs}ms`
+              : result.failure === "cancelled"
+                ? "aborted"
+                : result.failure === "spawn"
+                  ? "sandboxed process failed to start"
+                  : undefined;
+        const modelResult: BashResult = {
+          stdout: result.preview,
+          stderr: "",
+          exitCode: result.exitCode ?? -1,
+          artifactId: result.artifact.id,
+          outputBytes: result.outputBytes,
+          ...(error === undefined ? {} : { error }),
+          ...(errorKind === undefined ? {} : { errorKind }),
+          ...(result.previewTruncated ? { truncated: true } : {}),
+        };
         emit(
           ctx,
           "bash",
           detail(command),
-          ok,
-          ok ? undefined : aborted ? "aborted" : timedOut ? "timeout" : "unknown",
+          error === undefined,
+          errorKind,
         );
-        return result;
+        return modelResult;
+      },
+    });
+
+    tools.read_tool_output = tool({
+      ...projectWorkerTool(READ_TOOL_OUTPUT_SPEC),
+      execute: async ({ artifactId, offset, limit }) => {
+        if (authorize(READ_TOOL_OUTPUT_SPEC.id, []).decision !== "allow") {
+          return failure(ctx, "read_tool_output", detail(artifactId), "policy_denied", "tool invocation denied by policy");
+        }
+        const artifact = sandbox.store.getArtifact(artifactId);
+        if (artifact === null || artifact.sessionId !== sandbox.sessionId) {
+          return failure(ctx, "read_tool_output", detail(artifactId), "not_found", "artifact not found");
+        }
+        emit(ctx, "read_tool_output", detail(artifactId), true);
+        return sandbox.store.readArtifactPage(artifactId, { offset, limit });
       },
     });
   }
 
   tools.read_file = tool({
-    description: "Read a UTF-8 text file at a path relative to the worktree root.",
-    inputSchema: z.object({ path: z.string().min(1) }),
-    execute: async ({ path: rawPath }, { abortSignal }): Promise<ReadResult | FileErrorResult> => {
+    ...projectWorkerTool(READ_FILE_TOOL_SPEC),
+    execute: async (
+      { path: rawPath, offset = 1, limit = DEFAULT_READ_LIMIT_LINES },
+      { abortSignal },
+    ): Promise<ReadResult | FileErrorResult> => {
       if (abortSignal?.aborted) {
-        emit(ctx, "read_file", detail(rawPath), false, "aborted");
-        return { error: "aborted" };
+        return failure(ctx, "read_file", detail(rawPath), "aborted", "aborted");
       }
       const gate = containmentGate(ctx.root, canonicalRoot, rawPath);
       if (!gate.ok) {
-        emit(ctx, "read_file", detail(rawPath), false, "containment");
-        return { error: gate.error };
+        return failure(ctx, "read_file", detail(rawPath), "containment", gate.error);
+      }
+      if (authorize(READ_FILE_TOOL_SPEC.id, [{ kind: "filesystem-read", resource: gate.resolved }]).decision !== "allow") {
+        return failure(ctx, "read_file", detail(rawPath), "policy_denied", "tool invocation denied by policy");
       }
       if (!fs.existsSync(gate.resolved)) {
-        emit(ctx, "read_file", detail(rawPath), false, "not_found");
-        return { error: "not found" };
+        return failure(ctx, "read_file", detail(rawPath), "not_found", "not found");
       }
       try {
-        const content = fs.readFileSync(gate.resolved, "utf8");
+        const content = (ctx.readCache?.read(gate.resolved, `${offset}:${limit}`).bytes
+          ?? fs.readFileSync(gate.resolved)).toString("utf8");
+        const lines = content.split("\n");
+        const totalLines = lines.length;
+        const startIndex = Math.min(offset - 1, totalLines);
+        const selected = lines.slice(startIndex, startIndex + limit).join("\n");
+        const bounded = truncateMiddle(selected, READ_TRUNCATE_CHARS);
+        const selectedEnd = Math.min(startIndex + limit, totalLines);
+        const truncated = startIndex > 0 || selectedEnd < totalLines || bounded !== selected;
         emit(ctx, "read_file", detail(rawPath), true);
-        return { content: truncate(content, READ_TRUNCATE_CHARS) };
+        return {
+          content: bounded,
+          startLine: startIndex + 1,
+          endLine: selectedEnd,
+          totalLines,
+          truncated,
+          ...(selectedEnd < totalLines ? { nextOffset: selectedEnd + 1 } : {}),
+        };
       } catch (e) {
-        emit(ctx, "read_file", detail(rawPath), false, "io");
-        return { error: `read failed: ${(e as Error).message}` };
+        return failure(
+          ctx,
+          "read_file",
+          detail(rawPath),
+          "io",
+          `read failed: ${(e as Error).message}`,
+        );
       }
     },
   });
 
   tools.write_file = tool({
-    description:
-      "Write (create or overwrite) a UTF-8 text file at a path relative to " +
-      "the worktree root, creating parent directories as needed.",
-    inputSchema: z.object({ path: z.string().min(1), content: z.string() }),
+    ...projectWorkerTool(WRITE_FILE_TOOL_SPEC),
     execute: async (
       { path: rawPath, content },
       { abortSignal },
     ): Promise<WriteResult | FileErrorResult> => {
       if (abortSignal?.aborted) {
-        emit(ctx, "write_file", detail(rawPath), false, "aborted");
-        return { error: "aborted" };
+        return failure(ctx, "write_file", detail(rawPath), "aborted", "aborted");
       }
       const gate = containmentGate(ctx.root, canonicalRoot, rawPath);
       if (!gate.ok) {
-        emit(ctx, "write_file", detail(rawPath), false, "containment");
-        return { error: gate.error };
+        return failure(ctx, "write_file", detail(rawPath), "containment", gate.error);
+      }
+      if (authorize(WRITE_FILE_TOOL_SPEC.id, [{ kind: "filesystem-write", resource: gate.resolved }]).decision !== "allow") {
+        return failure(ctx, "write_file", detail(rawPath), "policy_denied", "tool invocation denied by policy");
       }
       try {
         fs.mkdirSync(path.dirname(gate.resolved), { recursive: true });
         fs.writeFileSync(gate.resolved, content, "utf8");
+        ctx.readCache?.invalidateAll();
         emit(ctx, "write_file", detail(rawPath), true);
         return { ok: true, bytes: Buffer.byteLength(content, "utf8") };
       } catch (e) {
-        emit(ctx, "write_file", detail(rawPath), false, "io");
-        return { error: `write failed: ${(e as Error).message}` };
+        return failure(
+          ctx,
+          "write_file",
+          detail(rawPath),
+          "io",
+          `write failed: ${(e as Error).message}`,
+        );
       }
     },
   });
 
   if (includeApplyPatch) {
     tools.apply_patch = tool({
-      description:
-        "Apply a multi-file patch in Codex-style freeform format. Wrap with " +
-        "`*** Begin Patch` / `*** End Patch`. File ops: " +
-        "`*** Update File: rel/path`, `*** Add File: rel/path`, " +
-        "`*** Delete File: rel/path`. Hunk lines use leading space (context), " +
-        "`-` (remove), `+` (add). Prefer this over sed/echo for edits.",
-      inputSchema: z.object({ patch: z.string().min(1) }),
+      ...projectWorkerTool(APPLY_PATCH_TOOL_SPEC),
       execute: async ({ patch }, { abortSignal }): Promise<{ ok: true; filesTouched: string[] } | FileErrorResult> => {
         if (abortSignal?.aborted) {
-          emit(ctx, "apply_patch", detail("patch"), false, "aborted");
-          return { error: "aborted" };
+          return failure(ctx, "apply_patch", detail("patch"), "aborted", "aborted");
+        }
+        if (authorize(APPLY_PATCH_TOOL_SPEC.id, [{ kind: "filesystem-write", resource: canonicalRoot }]).decision !== "allow") {
+          return failure(ctx, "apply_patch", detail("patch"), "policy_denied", "tool invocation denied by policy");
         }
         const result = applyPatchToWorktree(ctx.root, patch);
         if (!result.ok) {
-          emit(ctx, "apply_patch", detail(result.error), false, result.errorKind);
-          return { error: result.error };
+          return failure(
+            ctx,
+            "apply_patch",
+            detail(result.error),
+            result.errorKind,
+            result.error,
+          );
         }
+        ctx.readCache?.invalidateAll();
         emit(ctx, "apply_patch", detail(result.filesTouched.join(",")), true);
         return { ok: true, filesTouched: result.filesTouched };
       },
@@ -364,54 +621,65 @@ export function createWorkerTools(ctx: ToolContext): Record<string, Tool> {
 
   if (includeEdit) {
     tools.edit = tool({
+      ...projectWorkerTool(EDIT_TOOL_SPEC),
       description: editDescription,
-      inputSchema: z.object({
-        path: z.string().min(1),
-        find: z.string().min(1),
-        replace: z.string(),
-      }),
       execute: async (
         { path: rawPath, find, replace },
         { abortSignal },
       ): Promise<EditResult | FileErrorResult> => {
         if (abortSignal?.aborted) {
-          emit(ctx, "edit", detail(rawPath), false, "aborted");
-          return { error: "aborted" };
+          return failure(ctx, "edit", detail(rawPath), "aborted", "aborted");
         }
         const gate = containmentGate(ctx.root, canonicalRoot, rawPath);
         if (!gate.ok) {
-          emit(ctx, "edit", detail(rawPath), false, "containment");
-          return { error: gate.error };
+          return failure(ctx, "edit", detail(rawPath), "containment", gate.error);
+        }
+        if (authorize(EDIT_TOOL_SPEC.id, [{ kind: "filesystem-write", resource: gate.resolved }]).decision !== "allow") {
+          return failure(ctx, "edit", detail(rawPath), "policy_denied", "tool invocation denied by policy");
         }
         if (!fs.existsSync(gate.resolved)) {
-          emit(ctx, "edit", detail(rawPath), false, "not_found");
-          return { error: "not found" };
+          return failure(ctx, "edit", detail(rawPath), "not_found", "not found");
         }
         let content: string;
         try {
           content = fs.readFileSync(gate.resolved, "utf8");
         } catch (e) {
-          emit(ctx, "edit", detail(rawPath), false, "io");
-          return { error: `read failed: ${(e as Error).message}` };
+          return failure(
+            ctx,
+            "edit",
+            detail(rawPath),
+            "io",
+            `read failed: ${(e as Error).message}`,
+          );
         }
         const occurrences = content.split(find).length - 1;
         if (occurrences === 0) {
-          emit(ctx, "edit", detail(rawPath), false, "not_found");
-          return { error: "find not found" };
+          return failure(ctx, "edit", detail(rawPath), "not_found", "find not found");
         }
         if (occurrences > 1) {
-          emit(ctx, "edit", detail(rawPath), false, "not_unique");
-          return { error: `find matched ${occurrences} times, must be unique` };
+          return failure(
+            ctx,
+            "edit",
+            detail(rawPath),
+            "not_unique",
+            `find matched ${occurrences} times, must be unique`,
+          );
         }
         const idx = content.indexOf(find);
         const next = content.slice(0, idx) + replace + content.slice(idx + find.length);
         try {
           fs.writeFileSync(gate.resolved, next, "utf8");
+          ctx.readCache?.invalidateAll();
           emit(ctx, "edit", detail(rawPath), true);
           return { ok: true };
         } catch (e) {
-          emit(ctx, "edit", detail(rawPath), false, "io");
-          return { error: `write failed: ${(e as Error).message}` };
+          return failure(
+            ctx,
+            "edit",
+            detail(rawPath),
+            "io",
+            `write failed: ${(e as Error).message}`,
+          );
         }
       },
     });
@@ -423,14 +691,15 @@ export function createWorkerTools(ctx: ToolContext): Record<string, Tool> {
     // need to survive into a nested arrow function.
     const { store, pages } = ctx.wiki;
 
-    tools.wiki_query = tool({
-      description:
-        "Look up a SYMBOL (function/class/type name): returns where it is defined and referenced (file:line) in this project's code index, plus matching project wiki pages. For exact strings, regex, or file contents use bash grep / read_file instead.",
-      inputSchema: z.object({ query: z.string().min(1) }),
-      execute: async ({ query }): Promise<WikiQueryResult> => {
-        emit(ctx, "wiki_query", detail(query), true);
-        const { definitions, references } = querySymbols(store, query);
-        const q = query.toLowerCase();
+    tools[WIKI_QUERY_TOOL_SPEC.id] = tool({
+      ...projectWorkerTool(WIKI_QUERY_TOOL_SPEC),
+      execute: async ({ symbol }): Promise<WikiQueryResult> => {
+        if (authorize(WIKI_QUERY_TOOL_SPEC.id, []).decision !== "allow") {
+          return { definitions: [], references: [], pages: [] };
+        }
+        emit(ctx, WIKI_QUERY_TOOL_SPEC.id, detail(symbol), true);
+        const { definitions, references } = querySymbols(store, symbol);
+        const q = symbol.toLowerCase();
         const pageHits = pages
           .filter((p) => p.title.toLowerCase().includes(q) || p.digest.toLowerCase().includes(q))
           .map((p) => ({
@@ -442,18 +711,31 @@ export function createWorkerTools(ctx: ToolContext): Record<string, Tool> {
       },
     });
 
-    tools.wiki_map = tool({
-      description:
-        "Get a token-budgeted map of this project's most important files and symbols — use for whole-repo orientation before diving in.",
-      inputSchema: z.object({
-        budgetTokens: z.number().int().min(64).max(32768).optional(),
-      }),
-      execute: async ({ budgetTokens }): Promise<string> => {
-        emit(ctx, "wiki_map", detail(String(budgetTokens ?? 1024)), true);
-        return renderMap(store, budgetTokens);
+    tools[WIKI_MAP_TOOL_SPEC.id] = tool({
+      ...projectWorkerTool(WIKI_MAP_TOOL_SPEC),
+      execute: async ({ query, budgetTokens }): Promise<string> => {
+        if (authorize(WIKI_MAP_TOOL_SPEC.id, []).decision !== "allow") {
+          return "tool invocation denied by policy";
+        }
+        emit(
+          ctx,
+          WIKI_MAP_TOOL_SPEC.id,
+          detail(query ?? String(budgetTokens ?? 1024)),
+          true,
+        );
+        return renderMap(store, budgetTokens, query);
       },
     });
   }
 
-  return tools;
+  return Object.fromEntries(
+    Object.entries(tools).map(([toolName, definition]) => {
+      const execute = (definition as { execute?: ObservedToolExecute }).execute;
+      if (execute === undefined) return [toolName, definition];
+      return [
+        toolName,
+        { ...definition, execute: observeTool(ctx, toolName, execute) } as Tool,
+      ];
+    }),
+  );
 }
